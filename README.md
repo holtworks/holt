@@ -45,6 +45,9 @@ Burrito wraps the OTP release into a standalone executable:
 MIX_ENV=prod mix release
 ```
 
+Local Burrito builds require `zig` and `xz` in `PATH`. The GitHub Actions
+release workflow installs Zig automatically.
+
 Per-target binaries are written to `burrito_out/`.
 
 ## Release
