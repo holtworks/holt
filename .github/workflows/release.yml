@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write
-  attestations: write
 
 env:
   MIX_ENV: prod
@@ -78,11 +76,6 @@ jobs:
           name: binary-${{ matrix.id }}
           path: _tinfoil/*
           if-no-files-found: error
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: _tinfoil/*.tar.gz, _tinfoil/*.zip
 
 
   release:

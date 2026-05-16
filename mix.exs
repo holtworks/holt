@@ -57,6 +57,7 @@ defmodule HoltWorks.MixProject do
         install_dir: "~/.local/bin"
       ],
       checksums: :sha256,
+      attestations: false,
       ci: [
         provider: :github_actions,
         elixir_version: "1.19",
