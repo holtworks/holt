@@ -1439,16 +1439,16 @@ defmodule HoltWorks.Actions do
     |> Map.merge(%{
       "record" => %{"type" => "boolean"},
       "payload" => %{"type" => "object"},
-      "proof_commands" => %{"type" => "array"},
-      "manual_check_results" => %{"type" => "array"},
-      "tool_check_results" => %{"type" => "array"},
+      "proof_commands" => array_of(%{"type" => "object"}),
+      "manual_check_results" => array_of(%{"type" => "object"}),
+      "tool_check_results" => array_of(%{"type" => "object"}),
       "goal_check" => %{"type" => "object"},
-      "changed_files" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "risk_flags" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "affected_domains" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "protected_flows" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "write_scope" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "verification_matrix" => %{"type" => "array"},
+      "changed_files" => array_of(%{"type" => "string"}),
+      "risk_flags" => array_of(%{"type" => "string"}),
+      "affected_domains" => array_of(%{"type" => "string"}),
+      "protected_flows" => array_of(%{"type" => "string"}),
+      "write_scope" => array_of(%{"type" => "string"}),
+      "verification_matrix" => array_of(%{"type" => "object"}),
       "impact_waiver" => %{"type" => "object"},
       "notes" => %{"type" => "string"}
     })
@@ -1747,7 +1747,7 @@ defmodule HoltWorks.Actions do
       "tool_name" => %{"type" => "string"},
       "action" => %{"type" => "string"},
       "toolkit" => %{"type" => "string"},
-      "todos" => %{"type" => "array"}
+      "todos" => array_of(%{"type" => "object"})
     }
   end
 
@@ -1790,7 +1790,7 @@ defmodule HoltWorks.Actions do
         "items" => %{"type" => "string", "enum" => HoltWorks.Agents.work_roles()}
       },
       "work_role" => %{"type" => "string", "enum" => HoltWorks.Agents.work_roles()},
-      "skills" => %{"type" => "array"},
+      "skills" => array_of(%{"type" => "object"}),
       "skill" => %{"type" => "string"},
       "model" => %{"type" => "string"},
       "provider" => %{"type" => "string"},
@@ -1803,6 +1803,8 @@ defmodule HoltWorks.Actions do
 
   defp maybe_put_opt(opts, _key, value) when value in [nil, "", []], do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp array_of(items), do: %{"type" => "array", "items" => items}
 
   defp option(opts, key) when is_list(opts), do: Keyword.get(opts, key)
   defp option(_opts, _key), do: nil

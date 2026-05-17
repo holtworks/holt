@@ -21,7 +21,7 @@ defmodule HoltWorksTest do
   alias HoltWorks.Runtime.{AgentEvents, Runs, Session, StateMachine}
 
   test "version is available" do
-    assert HoltWorks.version() == "0.1.1"
+    assert HoltWorks.version() == "0.1.2"
   end
 
   test "cli help succeeds" do
@@ -616,6 +616,18 @@ defmodule HoltWorksTest do
              )
 
     assert Enum.any?(bridge_catalog, &(&1["name"] == "read_file"))
+  end
+
+  test "agent tool definitions use provider-compatible array schemas" do
+    %{workspace: workspace} = tmp_env()
+    Workspace.init(workspace)
+
+    errors =
+      %{"task_tool_session" => HoltWorks.Tasks.TaskToolSession.build(%{})}
+      |> Tasks.agent_tool_definitions(workspace: workspace)
+      |> Enum.flat_map(&array_schema_errors/1)
+
+    assert errors == []
   end
 
   test "search_web action records structured research claims" do
@@ -5551,6 +5563,33 @@ defmodule HoltWorksTest do
     actual = MapSet.new(actual_events)
     missing = Enum.reject(expected_events, &MapSet.member?(actual, &1))
     assert missing == []
+  end
+
+  defp array_schema_errors(value, path \\ [])
+
+  defp array_schema_errors(%{"type" => "array"} = schema, path) do
+    current =
+      if Map.has_key?(schema, "items") do
+        []
+      else
+        [Enum.join(Enum.reverse(path), ".")]
+      end
+
+    current ++ nested_array_schema_errors(schema, path)
+  end
+
+  defp array_schema_errors(map, path) when is_map(map), do: nested_array_schema_errors(map, path)
+
+  defp array_schema_errors(list, path) when is_list(list) do
+    list
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {item, index} -> array_schema_errors(item, [to_string(index) | path]) end)
+  end
+
+  defp array_schema_errors(_value, _path), do: []
+
+  defp nested_array_schema_errors(map, path) do
+    Enum.flat_map(map, fn {key, value} -> array_schema_errors(value, [to_string(key) | path]) end)
   end
 
   defp flatten_agent_event_tree(nil), do: []
