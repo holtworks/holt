@@ -21,7 +21,7 @@ defmodule HoltWorksTest do
   alias HoltWorks.Runtime.{AgentEvents, Runs, Session, StateMachine}
 
   test "version is available" do
-    assert HoltWorks.version() == "0.1.0"
+    assert HoltWorks.version() == "0.1.1"
   end
 
   test "cli help succeeds" do
