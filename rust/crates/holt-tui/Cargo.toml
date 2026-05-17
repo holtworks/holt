@@ -1,0 +1,9 @@
+[package]
+name = "holt-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+holt-protocol.workspace = true
+

@@ -1,0 +1,11 @@
+[package]
+name = "holt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+holt-protocol.workspace = true
+holt-workspace.workspace = true
+

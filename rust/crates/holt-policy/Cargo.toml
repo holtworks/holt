@@ -1,0 +1,10 @@
+[package]
+name = "holt-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+holt-protocol.workspace = true
+serde.workspace = true
+

@@ -1,0 +1,16 @@
+[package]
+name = "holt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "holt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+crossterm.workspace = true
+holt-core.workspace = true
+serde_json.workspace = true

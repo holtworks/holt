@@ -26,3 +26,8 @@ holtworks-*.tar
 /burrito_out/
 /_tinfoil/
 /artifacts/
+/.holtworks/
+/NEXT_STEPS.md
+
+# Rust CLI build artifacts.
+/rust/target/
