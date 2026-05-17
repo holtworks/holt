@@ -25,6 +25,8 @@ defmodule HoltWorks.MixProject do
   defp deps do
     [
       {:burrito, "~> 1.5"},
+      {:jason, "~> 1.4"},
+      {:req, "~> 0.5"},
       {:tinfoil, "~> 0.2", runtime: false}
     ]
   end

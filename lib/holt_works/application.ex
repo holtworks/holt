@@ -7,12 +7,21 @@ defmodule HoltWorks.Application do
 
   @impl true
   def start(_type, _args) do
-    maybe_run_cli()
-
-    children = []
+    children = [
+      HoltWorks.Gateway,
+      {Registry, keys: :unique, name: HoltWorks.Runtime.SessionRegistry},
+      {DynamicSupervisor, strategy: :one_for_one, name: HoltWorks.Runtime.SessionSupervisor},
+      {Task.Supervisor, name: HoltWorks.Runtime.SessionTaskSupervisor},
+      HoltWorks.Tasks.ProcessWakeScheduler
+    ]
 
     opts = [strategy: :one_for_one, name: HoltWorks.Supervisor]
-    Supervisor.start_link(children, opts)
+    HoltWorks.Actions.ProviderRegistry.init()
+    result = Supervisor.start_link(children, opts)
+
+    maybe_run_cli()
+
+    result
   end
 
   defp maybe_run_cli do
