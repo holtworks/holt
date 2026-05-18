@@ -3,13 +3,25 @@ defmodule Holt.Runtime.Runs do
   Durable run folders and append-only event logs.
   """
 
-  alias Holt.{Clock, JSON, Paths}
+  alias Holt.{Clock, Paths}
+  alias Holt.Runtime.RunStore
 
   def start(objective, opts \\ []) do
     root = Paths.workspace_root(opts)
+    start_in_dir(objective, opts, root, Paths.runs_dir(root), "workspace")
+  end
+
+  def start_ephemeral(objective, opts \\ []) do
+    root = Paths.workspace_root(opts)
+    runs_dir = ephemeral_runs_dir(opts)
+
+    start_in_dir(objective, opts, root, runs_dir, "ephemeral")
+  end
+
+  defp start_in_dir(objective, opts, root, runs_dir, workspace_persistence) do
     run_id = Clock.id("run")
-    slug = run_slug(objective)
-    run_dir = Path.join(Paths.runs_dir(root), slug)
+    slug = run_slug(objective, run_id)
+    run_dir = Path.join(runs_dir, slug)
     artifacts_dir = Path.join(run_dir, "artifacts")
     now = Clock.iso_now()
 
@@ -17,23 +29,43 @@ defmodule Holt.Runtime.Runs do
 
     run =
       %{
-        "schema_version" => "holtworks_run/v1",
+        "schema_version" => "holt_run/v1",
         "id" => run_id,
         "status" => "created",
         "objective" => objective,
-        "agent" => opts[:agent] || "default",
-        "model" => opts[:model] || "local:local-planner",
+        "agent_id" => run_agent_id(opts),
+        "model" => run_model(opts),
         "started_at" => now,
         "completed_at" => nil,
         "workspace" => root,
-        "safety_mode" => opts[:safety_mode] || "approval_required",
+        "safety_mode" => run_safety_mode(opts),
+        "permission_mode" => run_permission_mode(opts),
         "run_dir" => run_dir,
-        "resumed_from" => opts[:resumed_from]
+        "workspace_persistence" => workspace_persistence,
+        "workspace_discovery" => opts[:workspace_discovery],
+        "pre_task_plan" => opts[:pre_task_plan],
+        "resumed_from" => opts[:resumed_from],
+        "forked_from" => opts[:forked_from]
       }
       |> reject_empty()
 
-    JSON.write(run_path(run_dir), run)
-    append_event(run_dir, "run.created", %{"objective" => objective, "status" => "created"})
+    RunStore.write_run(run_dir, run)
+
+    append_event(
+      run_dir,
+      "run.created",
+      %{
+        "objective" => objective,
+        "status" => "created",
+        "permission_mode" => run["permission_mode"],
+        "workspace_persistence" => run["workspace_persistence"],
+        "workspace_discovery" => run["workspace_discovery"],
+        "resumed_from" => run["resumed_from"],
+        "forked_from" => run["forked_from"]
+      }
+      |> reject_empty()
+    )
+
     transition(run_dir, "queued")
 
     {:ok, Map.put(run, "status", "queued")}
@@ -50,7 +82,7 @@ defmodule Holt.Runtime.Runs do
         |> maybe_complete(next)
         |> Map.merge(attrs)
 
-      JSON.write(run_path(run_dir), updated)
+      RunStore.write_run(run_dir, updated)
       append_event(run_dir, "run.transitioned", %{"from" => current, "to" => next})
       {:ok, updated}
     end
@@ -68,25 +100,12 @@ defmodule Holt.Runtime.Runs do
     transition(run_dir, "failed", Map.merge(%{"failure_reason" => inspect(reason)}, attrs))
   end
 
-  def load_run!(run_dir), do: JSON.read(run_path(run_dir))
+  def load_run!(run_dir), do: RunStore.read_run(run_dir)
 
-  def append_event(run_dir, type, data \\ %{}) do
-    event =
-      data
-      |> Map.put("type", type)
-      |> Map.put_new("at", Clock.iso_now())
+  def append_event(run_dir, type, data \\ %{}), do: RunStore.append_event(run_dir, type, data)
 
-    JSON.append_jsonl(events_path(run_dir), event)
-    event
-  end
-
-  def append_transcript(run_dir, role, content) do
-    File.write!(
-      transcript_path(run_dir),
-      ["\n\n## ", role, "\n\n", content, "\n"],
-      [:append]
-    )
-  end
+  def append_transcript(run_dir, role, content),
+    do: RunStore.append_transcript(run_dir, role, content)
 
   def latest(root) do
     runs_dir = Paths.runs_dir(root)
@@ -107,7 +126,7 @@ defmodule Holt.Runtime.Runs do
   def find(root, id) do
     root
     |> list()
-    |> Enum.find(fn run -> run["id"] == id or Path.basename(run["run_dir"]) == id end)
+    |> Enum.find(&run_matches_ref?(&1, id))
   end
 
   def list(root) do
@@ -118,11 +137,13 @@ defmodule Holt.Runtime.Runs do
     |> Enum.map(&load_run!/1)
   end
 
-  def events(run_dir), do: JSON.read_jsonl(events_path(run_dir))
+  def events(run_dir), do: RunStore.events(run_dir)
+  def transcript_entries(run_dir), do: RunStore.transcript_entries(run_dir)
 
-  def run_path(run_dir), do: Path.join(run_dir, "run.json")
-  def events_path(run_dir), do: Path.join(run_dir, "events.jsonl")
-  def transcript_path(run_dir), do: Path.join(run_dir, "transcript.md")
+  def run_path(run_dir), do: RunStore.run_path(run_dir)
+  def events_path(run_dir), do: RunStore.events_path(run_dir)
+  def transcript_events_path(run_dir), do: RunStore.transcript_events_path(run_dir)
+  def transcript_path(run_dir), do: RunStore.transcript_path(run_dir)
 
   defp maybe_complete(run, status)
        when status in ["completed", "blocked", "failed", "canceled"] do
@@ -131,7 +152,30 @@ defmodule Holt.Runtime.Runs do
 
   defp maybe_complete(run, _status), do: run
 
-  defp run_slug(objective) do
+  defp ephemeral_runs_dir(opts) do
+    case opts[:ephemeral_runs_dir] do
+      value when value in [nil, ""] -> Path.join(System.tmp_dir!(), "holtworks-runs")
+      value -> value
+    end
+  end
+
+  defp run_agent_id(opts), do: run_option(opts, :agent_id, "default")
+  defp run_model(opts), do: run_option(opts, :model, "local:local-planner")
+  defp run_safety_mode(opts), do: run_option(opts, :safety_mode, "approval_required")
+  defp run_permission_mode(opts), do: run_option(opts, :permission_mode, "review")
+
+  defp run_option(opts, key, default) do
+    case opts[key] do
+      value when value in [nil, ""] -> default
+      value -> value
+    end
+  end
+
+  defp run_matches_ref?(run, id) do
+    Enum.any?([run["id"] == id, Path.basename(run["run_dir"]) == id], & &1)
+  end
+
+  defp run_slug(objective, run_id) do
     words =
       objective
       |> to_string()
@@ -140,7 +184,12 @@ defmodule Holt.Runtime.Runs do
       |> String.trim("-")
       |> String.slice(0, 48)
 
-    "#{Clock.timestamp_slug()}-#{if words == "", do: "run", else: words}"
+    run_ref =
+      run_id
+      |> String.downcase()
+      |> String.replace("_", "-")
+
+    "#{Clock.timestamp_slug()}-#{run_ref}-#{if words == "", do: "run", else: words}"
   end
 
   defp slugify(text) do

@@ -2,12 +2,10 @@ defmodule Holt.Actions.ProviderRegistry do
   @moduledoc """
   Structured provider metadata for Holt action catalogs.
 
-  The registry describes tool providers independently from transport-specific
-  schemas. Tool visibility and prompt sections are driven by explicit provider
+  The registry describes action providers independently from transport-specific
+  schemas. Action visibility and prompt sections are driven by explicit provider
   ids, disabled ids, and definition metadata.
   """
-
-  alias Holt.Tasks.RuntimeContracts
 
   @table :holt_action_providers
 
@@ -15,38 +13,39 @@ defmodule Holt.Actions.ProviderRegistry do
     %{
       "id" => "workspace",
       "name" => "Workspace",
-      "description" => "Local workspace file, shell, network, memory, and user-input tools.",
+      "description" => "Local workspace file, shell, network, memory, and user-input actions.",
       "prompt_section" =>
-        "Workspace tools operate on the configured local workspace and must respect approval policy."
+        "Workspace actions operate on the configured local workspace and must respect approval policy."
     },
     %{
       "id" => "tasks",
       "name" => "Tasks",
-      "description" => "Task records, comments, specs, memory artifacts, and verification tools.",
+      "description" =>
+        "Task records, comments, specs, memory artifacts, and verification actions.",
       "prompt_section" =>
-        "Task tools require an explicit task reference unless the tool is globally scoped."
+        "Task actions require an explicit task reference unless the action is globally scoped."
     },
     %{
       "id" => "agent_orchestration",
       "name" => "Agent orchestration",
       "description" =>
-        "Agent dispatch, child-agent contracts, team orchestration, and continuation tools.",
+        "Agent dispatch, child-agent contracts, team orchestration, and continuation actions.",
       "prompt_section" =>
-        "Agent orchestration tools must persist structured handoff and verification metadata."
+        "Agent orchestration actions must persist structured handoff and verification metadata."
     },
     %{
       "id" => "router",
       "name" => "Router",
-      "description" => "Meta-tools that route, inspect, or execute other task-scoped tools.",
+      "description" => "Meta-actions that route, inspect, or execute other task-scoped actions.",
       "prompt_section" =>
-        "Router tools expose tool metadata and execute safe routed actions through explicit schemas."
+        "Router actions expose action metadata and execute safe routed actions through explicit schemas."
     },
     %{
-      "id" => "task_tool_session",
-      "name" => "Task tool session",
-      "description" => "Session-scoped connected-account and workbench context tools.",
+      "id" => "action_session",
+      "name" => "Task action session",
+      "description" => "Session-scoped connected-account and workbench context actions.",
       "prompt_section" =>
-        "Task tool session providers expose only the tools declared for the current session."
+        "Task action session providers expose only the actions declared for the current session."
     }
   ]
 
@@ -58,19 +57,29 @@ defmodule Holt.Actions.ProviderRegistry do
 
   def register(provider) when is_map(provider) do
     ensure_table()
-    provider = normalize_provider(provider)
-    :ets.insert(@table, {provider["id"], provider})
+
+    case normalize_provider(provider) do
+      {:ok, normalized_provider} ->
+        :ets.insert(@table, {normalized_provider["id"], normalized_provider})
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def register(_provider), do: {:error, :invalid_provider}
+
+  def unregister(provider_id) when is_binary(provider_id) and provider_id != "" do
+    ensure_table()
+    :ets.delete(@table, provider_id)
     :ok
   end
 
-  def unregister(provider_id) do
-    ensure_table()
-    :ets.delete(@table, to_string(provider_id))
-    :ok
-  end
+  def unregister(_provider_id), do: {:error, :invalid_provider_id}
 
   def all do
-    init()
+    ensure_table()
 
     @table
     |> :ets.tab2list()
@@ -78,133 +87,235 @@ defmodule Holt.Actions.ProviderRegistry do
     |> Enum.sort_by(& &1["id"])
   end
 
-  def get(provider_id) do
-    init()
+  def get(provider_id) when is_binary(provider_id) and provider_id != "" do
+    ensure_table()
 
-    case :ets.lookup(@table, to_string(provider_id)) do
+    case :ets.lookup(@table, provider_id) do
       [{_id, provider}] -> {:ok, provider}
       [] -> {:error, :not_found}
     end
   end
 
+  def get(_provider_id), do: {:error, :invalid_provider_id}
+
   def for_context(context \\ %{}, opts \\ []) do
-    context = RuntimeContracts.string_keys(context || %{})
-    explicit = provider_filter(context, opts)
-    excluded = provider_exclusions(context, opts)
+    with {:ok, context} <- canonical_context(context),
+         {:ok, explicit} <- provider_filter(context, opts),
+         {:ok, excluded} <- provider_exclusions(context, opts) do
+      all()
+      |> Enum.filter(fn provider ->
+        id = provider["id"]
 
-    all()
-    |> Enum.filter(fn provider ->
-      id = provider["id"]
-
-      (MapSet.size(explicit) == 0 or MapSet.member?(explicit, id)) and
-        not MapSet.member?(excluded, id)
-    end)
+        provider_selected?(explicit, id) and not MapSet.member?(excluded, id)
+      end)
+    end
   end
 
   def provider_allowed?(provider_id, context \\ %{}, opts \\ []) do
-    provider_id = to_string(provider_id)
+    case for_context(context, opts) do
+      providers when is_list(providers) and is_binary(provider_id) ->
+        Enum.any?(providers, &(&1["id"] == provider_id))
 
-    Enum.any?(for_context(context, opts), &(&1["id"] == provider_id))
+      _result ->
+        false
+    end
   end
 
   def metadata(definitions, context \\ %{}, opts \\ [])
 
   def metadata(definitions, context, opts) when is_list(definitions) do
-    context = RuntimeContracts.string_keys(context || %{})
-    provider_map = Map.new(for_context(context, opts), &{&1["id"], &1})
+    with {:ok, context} <- canonical_context(context),
+         providers when is_list(providers) <- for_context(context, opts) do
+      provider_map = Map.new(providers, &{&1["id"], &1})
 
-    definitions
-    |> Enum.group_by(&(&1["provider"] || "unknown"))
-    |> Enum.map(fn {provider_id, rows} ->
-      provider = Map.get(provider_map, provider_id, fallback_provider(provider_id))
-
-      provider
-      |> Map.take(["id", "name", "description"])
-      |> Map.put("schema_version", "holtworks_action_provider/v1")
-      |> Map.put("tool_count", length(rows))
-      |> Map.put("tools", rows |> Enum.map(& &1["name"]) |> Enum.sort())
-    end)
-    |> Enum.filter(&provider_allowed?(&1["id"], context, opts))
-    |> Enum.sort_by(& &1["name"])
+      definitions
+      |> Enum.filter(&canonical_definition?/1)
+      |> Enum.group_by(& &1["provider"])
+      |> Enum.flat_map(fn {provider_id, rows} ->
+        case Map.fetch(provider_map, provider_id) do
+          {:ok, provider} -> [provider_metadata(provider, rows)]
+          :error -> []
+        end
+      end)
+      |> Enum.sort_by(& &1["name"])
+    end
   end
 
   def metadata(_definitions, _context, _opts), do: []
 
   def prompt_sections(context \\ %{}, opts \\ []) do
-    context
-    |> for_context(opts)
-    |> Enum.map(fn provider ->
-      %{
-        "provider_id" => provider["id"],
-        "title" => provider["name"],
-        "content" => provider["prompt_section"] || provider["description"]
-      }
-    end)
-    |> Enum.reject(&(&1["content"] in [nil, ""]))
+    case for_context(context, opts) do
+      providers when is_list(providers) ->
+        providers
+        |> Enum.map(fn provider ->
+          %{
+            "provider_id" => provider["id"],
+            "title" => provider["name"],
+            "content" => provider["prompt_section"]
+          }
+        end)
+        |> Enum.reject(&(&1["content"] in [nil, ""]))
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   def provider_name(provider_id) do
     case get(provider_id) do
       {:ok, provider} -> provider["name"]
-      {:error, :not_found} -> fallback_provider(provider_id)["name"]
+      {:error, _reason} -> nil
     end
   end
 
   def provider_description(provider_id) do
     case get(provider_id) do
       {:ok, provider} -> provider["description"]
-      {:error, :not_found} -> fallback_provider(provider_id)["description"]
+      {:error, _reason} -> nil
     end
   end
 
   defp provider_filter(context, opts) do
-    context
-    |> Map.get(
-      "action_provider_ids",
-      Map.get(context, "providers", Keyword.get(opts, :action_provider_ids, []))
-    )
-    |> string_set()
+    case Map.fetch(context, "providers") do
+      {:ok, _value} ->
+        {:error, {:obsolete_provider_context_key, "providers", "action_provider_ids"}}
+
+      :error ->
+        provider_set(context, opts, "action_provider_ids", :action_provider_ids)
+    end
   end
 
   defp provider_exclusions(context, opts) do
-    context
-    |> Map.get(
-      "excluded_action_providers",
-      Keyword.get(opts, :excluded_action_providers, [])
-    )
-    |> string_set()
+    provider_set(context, opts, "excluded_action_providers", :excluded_action_providers)
   end
 
-  defp string_set(values) do
-    values
-    |> List.wrap()
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.map(&to_string/1)
-    |> MapSet.new()
+  defp provider_set(context, opts, key, option_key) do
+    case Map.fetch(context, key) do
+      {:ok, values} -> string_set(values, key)
+      :error -> option_set(opts, option_key, key)
+    end
+  end
+
+  defp option_set(opts, option_key, key) do
+    case Keyword.fetch(opts, option_key) do
+      {:ok, values} -> string_set(values, key)
+      :error -> {:ok, MapSet.new()}
+    end
   end
 
   defp normalize_provider(provider) do
+    with :ok <- canonical_provider(provider),
+         {:ok, id} <- required_text(provider, "id"),
+         {:ok, name} <- required_text(provider, "name"),
+         {:ok, description} <- required_text(provider, "description"),
+         {:ok, prompt_section} <- optional_text(provider, "prompt_section") do
+      provider =
+        %{
+          "id" => id,
+          "name" => name,
+          "description" => description,
+          "prompt_section" => prompt_section
+        }
+        |> reject_empty()
+
+      {:ok, provider}
+    end
+  end
+
+  defp canonical_provider(provider) do
+    if canonical_value?(provider) do
+      :ok
+    else
+      {:error, :invalid_provider}
+    end
+  end
+
+  defp canonical_context(context) when is_map(context) do
+    if canonical_value?(context) do
+      {:ok, context}
+    else
+      {:error, :invalid_provider_context}
+    end
+  end
+
+  defp canonical_context(_context), do: {:error, :invalid_provider_context}
+
+  defp canonical_definition?(definition) when is_map(definition) do
+    canonical_value?(definition) and binary_present?(definition["provider"]) and
+      binary_present?(definition["name"])
+  end
+
+  defp canonical_definition?(_definition), do: false
+
+  defp provider_selected?(explicit, id) do
+    if MapSet.size(explicit) == 0 do
+      true
+    else
+      MapSet.member?(explicit, id)
+    end
+  end
+
+  defp provider_metadata(provider, rows) do
     provider
-    |> RuntimeContracts.string_keys()
-    |> Map.update("id", nil, &to_string/1)
-    |> RuntimeContracts.reject_empty()
+    |> Map.take(["id", "name", "description"])
+    |> Map.put("schema_version", "holt_action_provider/v1")
+    |> Map.put("action_count", length(rows))
+    |> Map.put("actions", rows |> Enum.map(& &1["name"]) |> Enum.sort())
   end
 
-  defp fallback_provider(provider_id) do
-    id = to_string(provider_id || "unknown")
-
-    %{
-      "id" => id,
-      "name" => humanize_provider_id(id),
-      "description" => "Holt action provider #{id}."
-    }
+  defp string_set(values, key) when is_list(values) do
+    if Enum.all?(values, &binary_present?/1) do
+      {:ok, MapSet.new(values)}
+    else
+      {:error, {:invalid_provider_context_field, key}}
+    end
   end
 
-  defp humanize_provider_id(provider_id) do
-    provider_id
-    |> String.replace("_", " ")
-    |> String.split(" ", trim: true)
-    |> Enum.map_join(" ", &String.capitalize/1)
+  defp string_set(_values, key), do: {:error, {:invalid_provider_context_field, key}}
+
+  defp required_text(map, key) do
+    case optional_text(map, key) do
+      {:ok, nil} -> {:error, {:missing_required, key}}
+      {:ok, value} -> {:ok, value}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp optional_text(map, key) do
+    case Map.fetch(map, key) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, value} when is_binary(value) ->
+        value = String.trim(value)
+
+        case value do
+          "" -> {:ok, nil}
+          trimmed -> {:ok, trimmed}
+        end
+
+      {:ok, _value} ->
+        {:error, {:invalid_provider_field, key}}
+    end
+  end
+
+  defp binary_present?(value) when is_binary(value), do: String.trim(value) != ""
+  defp binary_present?(_value), do: false
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      {_key, _nested} -> false
+    end)
+  end
+
+  defp canonical_value?(values) when is_list(values), do: Enum.all?(values, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp reject_empty(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
   end
 
   defp ensure_table do

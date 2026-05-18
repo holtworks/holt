@@ -4,15 +4,17 @@ defmodule Holt.Paths do
   """
 
   def home(opts \\ []) do
-    opts[:home] ||
-      System.get_env("HOLTWORKS_HOME") ||
-      Path.join(System.user_home!(), ".holtworks")
+    case opts[:home] do
+      value when value in [nil, ""] -> home_from_env()
+      value -> value
+    end
   end
 
   def workspace_root(opts \\ []) do
-    opts[:workspace] ||
-      System.get_env("HOLTWORKS_WORKSPACE") ||
-      File.cwd!()
+    case opts[:workspace] do
+      value when value in [nil, ""] -> workspace_from_env()
+      value -> value
+    end
   end
 
   def workspace_dir(root), do: Path.join(root, ".holtworks")
@@ -69,5 +71,19 @@ defmodule Holt.Paths do
     |> Enum.each(&File.mkdir_p!/1)
 
     :ok
+  end
+
+  defp home_from_env do
+    case System.get_env("HOLTWORKS_HOME") do
+      value when value in [nil, ""] -> Path.join(System.user_home!(), ".holtworks")
+      value -> value
+    end
+  end
+
+  defp workspace_from_env do
+    case System.get_env("HOLTWORKS_WORKSPACE") do
+      value when value in [nil, ""] -> File.cwd!()
+      value -> value
+    end
   end
 end

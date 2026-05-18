@@ -9,7 +9,7 @@ defmodule Holt.Tasks.AgentRunFailureClassifier do
     case run["status"] do
       "completed" ->
         %{
-          "schema_version" => "holtworks_run_failure_classification/v1",
+          "schema_version" => "holt_run_failure_classification/v1",
           "status" => "completed",
           "failure_class" => nil,
           "blocker_code" => nil,
@@ -19,38 +19,38 @@ defmodule Holt.Tasks.AgentRunFailureClassifier do
 
       "blocked" ->
         %{
-          "schema_version" => "holtworks_run_failure_classification/v1",
+          "schema_version" => "holt_run_failure_classification/v1",
           "status" => "blocked",
-          "failure_class" => run["failure_class"] || "blocked",
-          "blocker_code" => run["blocker_code"] || "external_blocker",
+          "failure_class" => text(run, "failure_class", "blocked"),
+          "blocker_code" => text(run, "blocker_code", "external_blocker"),
           "retryable" => false,
-          "reason" => run["blocked_reason"] || inspect(reason)
+          "reason" => text(run, "blocked_reason", inspect(reason))
         }
 
       "canceled" ->
         %{
-          "schema_version" => "holtworks_run_failure_classification/v1",
+          "schema_version" => "holt_run_failure_classification/v1",
           "status" => "canceled",
           "failure_class" => "canceled",
           "blocker_code" => "canceled",
           "retryable" => false,
-          "reason" => run["failure_reason"] || inspect(reason)
+          "reason" => text(run, "failure_reason", inspect(reason))
         }
 
       "failed" ->
         %{
-          "schema_version" => "holtworks_run_failure_classification/v1",
+          "schema_version" => "holt_run_failure_classification/v1",
           "status" => "failed",
-          "failure_class" => run["failure_class"] || "runtime_failure",
+          "failure_class" => text(run, "failure_class", "runtime_failure"),
           "blocker_code" => run["blocker_code"],
           "retryable" => true,
-          "reason" => run["failure_reason"] || inspect(reason)
+          "reason" => text(run, "failure_reason", inspect(reason))
         }
 
       status ->
         %{
-          "schema_version" => "holtworks_run_failure_classification/v1",
-          "status" => status || "unknown",
+          "schema_version" => "holt_run_failure_classification/v1",
+          "status" => status(status),
           "failure_class" => "unknown",
           "blocker_code" => "unknown",
           "retryable" => false,
@@ -61,7 +61,7 @@ defmodule Holt.Tasks.AgentRunFailureClassifier do
 
   def classify(_run, reason) do
     %{
-      "schema_version" => "holtworks_run_failure_classification/v1",
+      "schema_version" => "holt_run_failure_classification/v1",
       "status" => "error",
       "failure_class" => "runtime_exception",
       "blocker_code" => nil,
@@ -69,4 +69,14 @@ defmodule Holt.Tasks.AgentRunFailureClassifier do
       "reason" => inspect(reason)
     }
   end
+
+  defp text(map, key, default) do
+    case map[key] do
+      value when is_binary(value) and value != "" -> value
+      _missing -> default
+    end
+  end
+
+  defp status(value) when is_binary(value) and value != "", do: value
+  defp status(_value), do: "unknown"
 end

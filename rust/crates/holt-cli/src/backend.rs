@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{Map, Value};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 pub struct BackendOutput {
     pub code: i32,
@@ -17,6 +18,12 @@ pub struct BackendOutput {
 pub enum StreamLine {
     Stdout(String),
     Stderr(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StreamInput {
+    Line(String),
+    Cancel,
 }
 
 pub fn run_passthrough(args: &[String]) -> Result<i32> {
@@ -45,13 +52,43 @@ pub fn stream_jsonl<F>(args: &[String], mut on_line: F) -> Result<BackendOutput>
 where
     F: FnMut(StreamLine) -> Result<()>,
 {
-    let mut child = command(args, true)?
+    let child = command(args, true)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to start Holt")?;
 
+    stream_child_jsonl(child, &mut on_line, None)
+}
+
+pub fn stream_jsonl_with_input<F>(
+    args: &[String],
+    mut on_line: F,
+    input_rx: mpsc::Receiver<StreamInput>,
+) -> Result<BackendOutput>
+where
+    F: FnMut(StreamLine) -> Result<()>,
+{
+    let child = command(args, true)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start Holt")?;
+
+    stream_child_jsonl(child, &mut on_line, Some(input_rx))
+}
+
+fn stream_child_jsonl<F>(
+    mut child: Child,
+    on_line: &mut F,
+    mut input_rx: Option<mpsc::Receiver<StreamInput>>,
+) -> Result<BackendOutput>
+where
+    F: FnMut(StreamLine) -> Result<()>,
+{
+    let mut stdin = child.stdin.take();
     let stdout = child
         .stdout
         .take()
@@ -68,15 +105,33 @@ where
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
 
-    for line in rx {
-        match &line {
-            StreamLine::Stdout(text) => stdout_lines.push(text.clone()),
-            StreamLine::Stderr(text) => stderr_lines.push(text.clone()),
+    loop {
+        if drain_stream_input(&mut input_rx, &mut stdin)? == StreamDrain::Cancel {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(BackendOutput {
+                code: 130,
+                stdout: stdout_lines.join("\n"),
+                stderr: stderr_lines.join("\n"),
+            });
         }
 
-        on_line(line)?;
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                match &line {
+                    StreamLine::Stdout(text) => stdout_lines.push(text.clone()),
+                    StreamLine::Stderr(text) => stderr_lines.push(text.clone()),
+                }
+
+                on_line(line)?;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
 
+    drop(stdin);
     let status = child.wait().context("failed to wait for Holt")?;
 
     Ok(BackendOutput {
@@ -84,6 +139,41 @@ where
         stdout: stdout_lines.join("\n"),
         stderr: stderr_lines.join("\n"),
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamDrain {
+    Continue,
+    Cancel,
+}
+
+fn drain_stream_input(
+    input_rx: &mut Option<mpsc::Receiver<StreamInput>>,
+    stdin: &mut Option<ChildStdin>,
+) -> Result<StreamDrain> {
+    let Some(rx) = input_rx else {
+        return Ok(StreamDrain::Continue);
+    };
+
+    loop {
+        match rx.try_recv() {
+            Ok(StreamInput::Line(line)) => {
+                let input = stdin
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("Holt stdin is not available"))?;
+                input
+                    .write_all(line.as_bytes())
+                    .context("failed to write to Holt stdin")?;
+                input.flush().context("failed to flush Holt stdin")?;
+            }
+            Ok(StreamInput::Cancel) => return Ok(StreamDrain::Cancel),
+            Err(mpsc::TryRecvError::Empty) => return Ok(StreamDrain::Continue),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                *input_rx = None;
+                return Ok(StreamDrain::Continue);
+            }
+        }
+    }
 }
 
 fn spawn_reader<R>(reader: R, tx: mpsc::Sender<StreamLine>, stderr: bool)
@@ -155,7 +245,19 @@ impl NativeRequest {
             .as_str();
 
         match command {
-            "doctor" | "onboard" | "status" | "logs" => {
+            "diff" => {
+                let (params, rest) = parse_flags(&args[1..], &["view"])?;
+
+                if !rest.is_empty() {
+                    return Err(anyhow!("unexpected arguments for `{command}`"));
+                }
+
+                Ok(Self {
+                    command: command.to_string(),
+                    params,
+                })
+            }
+            "doctor" | "model" | "onboard" | "runs" | "status" => {
                 let (params, rest) = parse_flags(&args[1..], &[])?;
 
                 if !rest.is_empty() {
@@ -167,12 +269,41 @@ impl NativeRequest {
                     params,
                 })
             }
+            "logs" => {
+                let (mut params, rest) = parse_flags(&args[1..], &["view"])?;
+
+                if rest.len() > 1 {
+                    return Err(anyhow!("unexpected arguments for `logs`"));
+                }
+
+                if let Some(run_ref) = rest.first() {
+                    params.insert("run_ref".to_string(), Value::String(run_ref.clone()));
+                }
+
+                Ok(Self {
+                    command: "logs".to_string(),
+                    params,
+                })
+            }
             "run" => {
                 let (mut params, rest) = parse_flags(&args[1..], &[])?;
                 params.insert("objective".to_string(), Value::String(rest.join(" ")));
 
                 Ok(Self {
                     command: "run".to_string(),
+                    params,
+                })
+            }
+            "goal" => {
+                let (mut params, rest) = parse_flags(&args[1..], &[])?;
+                params.insert("objective".to_string(), Value::String(rest.join(" ")));
+                params.insert(
+                    "runtime_contract".to_string(),
+                    Value::String("goal".to_string()),
+                );
+
+                Ok(Self {
+                    command: "goal".to_string(),
                     params,
                 })
             }
@@ -193,6 +324,27 @@ impl NativeRequest {
 
                 Ok(Self {
                     command: "resume".to_string(),
+                    params,
+                })
+            }
+            "fork" => {
+                let (mut params, rest) = parse_flags(&args[1..], &[])?;
+
+                match rest.as_slice() {
+                    [] => {
+                        params.insert("run_ref".to_string(), Value::String("latest".to_string()));
+                    }
+                    [run_ref] => {
+                        params.insert("run_ref".to_string(), Value::String(run_ref.clone()));
+                    }
+                    [run_ref, objective @ ..] => {
+                        params.insert("run_ref".to_string(), Value::String(run_ref.clone()));
+                        params.insert("objective".to_string(), Value::String(objective.join(" ")));
+                    }
+                }
+
+                Ok(Self {
+                    command: "fork".to_string(),
                     params,
                 })
             }
@@ -262,8 +414,19 @@ fn parse_flags(
                 params.insert("api_key_stdin".to_string(), Value::Bool(true));
                 index += 1;
             }
-            "--home" | "--workspace" | "--provider" | "--model" | "--mode" | "--base-url"
-            | "--api-key-env" | "--env-file" | "--chat-context" => {
+            "--home"
+            | "--workspace"
+            | "--provider"
+            | "--model"
+            | "--mode"
+            | "--runtime-contract"
+            | "--workspace-persistence"
+            | "--workspace-intent"
+            | "--base-url"
+            | "--api-key-env"
+            | "--env-file"
+            | "--chat-messages"
+            | "--permission-mode" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| anyhow!("{arg} needs a value"))?;
@@ -335,7 +498,8 @@ fn looks_like_holt_root(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{native_entrypoint, NativeRequest};
+    use super::{drain_stream_input, native_entrypoint, NativeRequest, StreamDrain, StreamInput};
+    use std::sync::mpsc;
 
     #[test]
     fn run_request_preserves_prompt_and_flags() {
@@ -353,6 +517,207 @@ mod tests {
         assert_eq!(request.params["yes"], true);
         assert_eq!(request.params["workspace"], "/tmp/work");
         assert_eq!(request.params["objective"], "hello world");
+    }
+
+    #[test]
+    fn run_request_preserves_structured_chat_messages() {
+        let messages = r#"[{"role":"assistant","content":"1. Code structure"}]"#;
+        let args = vec![
+            "run".to_string(),
+            "--chat-messages".to_string(),
+            messages.to_string(),
+            "1".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "run");
+        assert_eq!(request.params["chat_messages"], messages);
+        assert_eq!(request.params["objective"], "1");
+    }
+
+    #[test]
+    fn run_request_preserves_structured_permission_mode() {
+        let args = vec![
+            "run".to_string(),
+            "--permission-mode".to_string(),
+            "deny".to_string(),
+            "inspect".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "run");
+        assert_eq!(request.params["permission_mode"], "deny");
+        assert_eq!(request.params["objective"], "inspect");
+    }
+
+    #[test]
+    fn run_request_preserves_structured_workspace_planning_fields() {
+        let args = vec![
+            "run".to_string(),
+            "--mode".to_string(),
+            "chat".to_string(),
+            "--workspace-persistence".to_string(),
+            "ephemeral".to_string(),
+            "--workspace-intent".to_string(),
+            "explore_project".to_string(),
+            "read".to_string(),
+            "this".to_string(),
+            "project".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "run");
+        assert_eq!(request.params["mode"], "chat");
+        assert_eq!(request.params["workspace_persistence"], "ephemeral");
+        assert_eq!(request.params["workspace_intent"], "explore_project");
+        assert_eq!(request.params["objective"], "read this project");
+    }
+
+    #[test]
+    fn goal_request_uses_goal_runtime_contract() {
+        let args = vec![
+            "goal".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "make".to_string(),
+            "the".to_string(),
+            "cli".to_string(),
+            "excellent".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "goal");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["runtime_contract"], "goal");
+        assert_eq!(request.params["objective"], "make the cli excellent");
+    }
+
+    #[test]
+    fn model_request_is_structured_backend_command() {
+        let args = vec![
+            "model".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "--json".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "model");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["json"], true);
+    }
+
+    #[test]
+    fn diff_request_is_structured_backend_command() {
+        let args = vec![
+            "diff".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "--json".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "diff");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["json"], true);
+    }
+
+    #[test]
+    fn diff_request_accepts_structured_view() {
+        let args = vec![
+            "diff".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "--view".to_string(),
+            "summary".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "diff");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["view"], "summary");
+    }
+
+    #[test]
+    fn logs_request_accepts_optional_run_ref() {
+        let args = vec![
+            "logs".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "--json".to_string(),
+            "run_123".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "logs");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["json"], true);
+        assert_eq!(request.params["run_ref"], "run_123");
+    }
+
+    #[test]
+    fn logs_request_accepts_structured_view() {
+        let args = vec![
+            "logs".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "--view".to_string(),
+            "transcript".to_string(),
+            "run_123".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "logs");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["view"], "transcript");
+        assert_eq!(request.params["run_ref"], "run_123");
+    }
+
+    #[test]
+    fn fork_request_accepts_run_ref_and_objective_override() {
+        let args = vec![
+            "fork".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "run_123".to_string(),
+            "try".to_string(),
+            "another".to_string(),
+            "approach".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "fork");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["run_ref"], "run_123");
+        assert_eq!(request.params["objective"], "try another approach");
+    }
+
+    #[test]
+    fn runs_request_is_structured_backend_command() {
+        let args = vec![
+            "runs".to_string(),
+            "--workspace".to_string(),
+            "/tmp/work".to_string(),
+            "--json".to_string(),
+        ];
+        let request = NativeRequest::from_args(&args).expect("request");
+
+        assert_eq!(request.command, "runs");
+        assert_eq!(request.params["workspace"], "/tmp/work");
+        assert_eq!(request.params["json"], true);
+    }
+
+    #[test]
+    fn stream_input_cancel_is_structured_control() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StreamInput::Cancel).unwrap();
+        let mut input_rx = Some(rx);
+        let mut stdin = None;
+
+        assert_eq!(
+            drain_stream_input(&mut input_rx, &mut stdin).expect("drain"),
+            StreamDrain::Cancel
+        );
     }
 
     #[test]

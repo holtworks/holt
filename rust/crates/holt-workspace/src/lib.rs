@@ -127,46 +127,11 @@ fn ignored_entry(name: &str) -> bool {
 }
 
 fn select_key_files(files: &[String]) -> Vec<String> {
-    let mut selected = files
+    files
         .iter()
-        .filter(|path| root_doc_or_config(path))
+        .filter(|path| agent_instruction_file(path))
         .cloned()
-        .collect::<Vec<_>>();
-    selected.sort_by_key(|path| root_rank(path));
-
-    let mut by_area =
-        representative_by_area(files, |path| matches!(classify(path), FileKind::Source));
-    let mut tests = representative_by_area(files, |path| matches!(classify(path), FileKind::Test));
-
-    selected.truncate(5);
-    by_area.truncate(5);
-    tests.truncate(2);
-
-    selected.extend(by_area);
-    selected.extend(tests);
-    selected.sort();
-    selected.dedup();
-    selected.truncate(8);
-    selected
-}
-
-fn representative_by_area<F>(files: &[String], predicate: F) -> Vec<String>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut selected = Vec::new();
-    let mut seen = Vec::<String>::new();
-
-    for file in files.iter().filter(|path| predicate(path)) {
-        let area = top_level_area(file);
-        if !seen.iter().any(|value| value == &area) {
-            seen.push(area);
-            selected.push(file.clone());
-        }
-    }
-
-    selected.sort_by_key(|path| path.split('/').count());
-    selected
+        .collect()
 }
 
 fn read_key_file(root: &Path, path: &str) -> Result<KeyFile> {
@@ -193,6 +158,10 @@ fn classify(path: &str) -> FileKind {
 
 fn root_doc_or_config(path: &str) -> bool {
     !path.contains('/') && (markdown_path(path) || config_extension(extension(path)))
+}
+
+fn agent_instruction_file(path: &str) -> bool {
+    path == "AGENTS.md"
 }
 
 fn markdown_path(path: &str) -> bool {
@@ -241,33 +210,19 @@ fn extension(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn root_rank(path: &str) -> u8 {
-    let name = path.to_lowercase();
-    if name.starts_with("readme") {
-        0
-    } else if markdown_path(path) {
-        1
-    } else {
-        2
-    }
-}
-
-fn top_level_area(path: &str) -> String {
-    path.split('/').next().unwrap_or(".").to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{select_key_files, FileKind, WorkspaceScanner};
     use std::fs;
 
     #[test]
-    fn scanner_selects_generic_key_files_without_project_specific_paths() {
+    fn scanner_reads_only_agent_instructions_as_key_file() {
         let root = std::env::temp_dir().join(format!("holt-workspace-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join(".holtworks/runs")).unwrap();
+        fs::write(root.join("AGENTS.md"), "# Agent rules").unwrap();
         fs::write(root.join("README.md"), "# Demo").unwrap();
         fs::write(root.join("Cargo.toml"), "[package]").unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
@@ -281,8 +236,8 @@ mod tests {
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
 
-        assert!(names.contains(&"README.md"));
-        assert!(names.contains(&"src/main.rs"));
+        assert_eq!(names, vec!["AGENTS.md"]);
+        assert_eq!(snapshot.key_files[0].excerpt, "# Agent rules");
         assert!(snapshot
             .files
             .iter()
@@ -296,13 +251,14 @@ mod tests {
     }
 
     #[test]
-    fn key_selection_is_generic() {
+    fn key_selection_uses_only_canonical_agent_instructions() {
         let files = vec![
+            "AGENTS.md".to_string(),
             "README.md".to_string(),
             "app/root.py".to_string(),
             "tests/root_test.py".to_string(),
         ];
 
-        assert_eq!(select_key_files(&files)[0], "README.md");
+        assert_eq!(select_key_files(&files), vec!["AGENTS.md"]);
     }
 }

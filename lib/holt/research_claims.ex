@@ -2,15 +2,14 @@ defmodule Holt.ResearchClaims do
   @moduledoc """
   File-backed structured research claim ledger.
 
-  Research claims are explicit metadata records. Holt stores raw web tool
+  Research claims are explicit metadata records. Holt stores raw web action
   text as evidence preview only; durable workflow decisions must use the
   structured claim fields.
   """
 
   alias Holt.{Clock, JSON, Paths}
-  alias Holt.Tasks.RuntimeContracts
 
-  @schema_version "holtworks_research_claim/v1"
+  @schema_version "holt_research_claim/v1"
   @max_preview_chars 1_500
   @source_types ~w(
     api_reference
@@ -37,10 +36,10 @@ defmodule Holt.ResearchClaims do
     end
   end
 
-  def maybe_record(tool, params, opts, search_result) do
+  def maybe_record(action, params, opts, search_result) do
     case record_intent(params) do
       :record ->
-        record(tool, params, opts, search_result)
+        record(action, params, opts, search_result)
 
       :skip ->
         {:ok, %{"research_claim_saved" => false}}
@@ -51,13 +50,17 @@ defmodule Holt.ResearchClaims do
   end
 
   def record("search_web", params, opts, search_result) when is_map(params) do
-    claim = build_from_search_result(params, search_result, opts)
-    root = Paths.workspace_root(opts)
-    JSON.append_jsonl(Paths.research_claims_path(root), claim)
-    {:ok, %{"research_claim_saved" => true, "research_claim" => claim}}
+    with :ok <- canonical_attrs(params),
+         {:ok, result} <- normalize_result(search_result),
+         :ok <- canonical_attrs(result) do
+      claim = build_from_search_result(params, result, opts)
+      root = Paths.workspace_root(opts)
+      JSON.append_jsonl(Paths.research_claims_path(root), claim)
+      {:ok, %{"research_claim_saved" => true, "research_claim" => claim}}
+    end
   end
 
-  def record(_tool, _params, _opts, _result), do: {:error, :unsupported_research_claim_source}
+  def record(_action, _params, _opts, _result), do: {:error, :unsupported_research_claim_source}
 
   def list(opts \\ []) do
     root = Paths.workspace_root(opts)
@@ -69,27 +72,25 @@ defmodule Holt.ResearchClaims do
   end
 
   def build_from_search_result(params, search_result, opts \\ []) when is_map(params) do
-    params = RuntimeContracts.string_keys(params)
-    result = normalize_result(search_result)
+    {:ok, result} = normalize_result(search_result)
     source_urls = source_urls(params, result)
 
     %{
       "schema_version" => @schema_version,
       "id" => Clock.id("research_claim"),
       "source" => %{
-        "tool" => "search_web",
+        "action" => "search_web",
         "query" => string_value(params, "query"),
         "urls" => source_urls
       },
-      "source_type" => source_type(params, "web_search"),
+      "source_type" => source_type(params),
       "claim" => string_value(params, "claim"),
       "claim_origin" => "agent_supplied",
-      "version_applies" => string_value(params, "version_applies") || "unknown",
+      "version_applies" => string_value(params, "version_applies"),
       "confidence" => confidence(params),
       "evidence" => evidence(result),
       "recheck_after" => string_value(params, "recheck_after"),
-      "task_ref" =>
-        string_value(params, "task_ref") || string_value(params, "ref") || opts[:task_ref],
+      "task_ref" => task_ref(params, opts),
       "repair_run_id" => string_value(params, "repair_run_id"),
       "created_at" => Clock.iso_now()
     }
@@ -97,38 +98,75 @@ defmodule Holt.ResearchClaims do
   end
 
   defp record_intent(params) when is_map(params) do
-    params = RuntimeContracts.string_keys(params)
-    save? = Map.get(params, "save_research_claim")
-    claim = string_value(params, "claim")
-
-    cond do
-      save? == false ->
-        :skip
-
-      save? == true and claim in [nil, ""] ->
-        {:error,
-         %{
-           "code" => "invalid_params",
-           "field" => "claim",
-           "message" => "claim is required when save_research_claim is true"
-         }}
-
-      save? == true ->
-        :record
-
-      claim not in [nil, ""] ->
-        :record
-
-      true ->
-        :skip
+    with :ok <- canonical_attrs(params) do
+      case Map.fetch(params, "save_research_claim") do
+        {:ok, true} -> required_recording_params(params)
+        {:ok, false} -> :skip
+        {:ok, _value} -> {:error, invalid_param("save_research_claim", "must be true or false")}
+        :error -> :skip
+      end
     end
   end
 
   defp record_intent(_params), do: :skip
 
-  defp normalize_result(result) when is_map(result), do: RuntimeContracts.string_keys(result)
-  defp normalize_result(result) when is_binary(result), do: %{"text" => result}
-  defp normalize_result(_result), do: %{"text" => ""}
+  defp normalize_result(result) when is_map(result), do: {:ok, result}
+  defp normalize_result(result) when is_binary(result), do: {:ok, %{"text" => result}}
+  defp normalize_result(_result), do: {:ok, %{"text" => ""}}
+
+  defp required_recording_params(params) do
+    with {:ok, _claim} <- required_text(params, "claim"),
+         {:ok, _source_type} <- required_source_type(params),
+         {:ok, _version} <- required_text(params, "version_applies"),
+         :ok <- required_confidence(params),
+         :ok <- valid_source_urls(params) do
+      :record
+    end
+  end
+
+  defp required_source_type(params) do
+    case required_text(params, "source_type") do
+      {:ok, value} ->
+        if value in @source_types do
+          {:ok, value}
+        else
+          {:error, invalid_param("source_type", "must be a known source type")}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp required_confidence(params) do
+    case Map.fetch(params, "confidence") do
+      {:ok, value} when is_number(value) and value >= 0.0 and value <= 1.0 ->
+        :ok
+
+      {:ok, _value} ->
+        {:error, invalid_param("confidence", "must be a number between 0 and 1")}
+
+      :error ->
+        {:error, invalid_param("confidence", "is required when save_research_claim is true")}
+    end
+  end
+
+  defp valid_source_urls(params) do
+    case Map.fetch(params, "source_urls") do
+      {:ok, urls} when is_list(urls) ->
+        if Enum.all?(urls, &is_binary/1) do
+          :ok
+        else
+          {:error, invalid_param("source_urls", "must contain only strings")}
+        end
+
+      {:ok, _value} ->
+        {:error, invalid_param("source_urls", "must be a list of strings")}
+
+      :error ->
+        :ok
+    end
+  end
 
   defp source_urls(params, result) do
     explicit =
@@ -158,34 +196,24 @@ defmodule Holt.ResearchClaims do
     |> Enum.uniq()
   end
 
-  defp source_type(params, default) do
-    value = string_value(params, "source_type") || default
-
-    if value in @source_types do
-      value
-    else
-      "unclassified"
-    end
-  end
+  defp source_type(params), do: string_value(params, "source_type")
 
   defp confidence(params) do
     case params["confidence"] do
       number when is_number(number) ->
         number
-        |> max(0.0)
-        |> min(1.0)
 
       _value ->
-        0.5
+        nil
     end
   end
 
   defp evidence(result) do
-    text = result["text"] || ""
+    text = result_text(result)
 
     %{
-      "tool_output_preview" => text |> String.slice(0, @max_preview_chars) |> String.trim(),
-      "tool_output_bytes" => byte_size(text),
+      "action_output_preview" => text |> String.slice(0, @max_preview_chars) |> String.trim(),
+      "action_output_bytes" => byte_size(text),
       "result_count" => result |> Map.get("results", []) |> List.wrap() |> length()
     }
   end
@@ -211,6 +239,53 @@ defmodule Holt.ResearchClaims do
       _value ->
         nil
     end
+  end
+
+  defp required_text(map, key) do
+    case string_value(map, key) do
+      nil -> {:error, invalid_param(key, "is required when save_research_claim is true")}
+      value -> {:ok, value}
+    end
+  end
+
+  defp task_ref(params, opts) do
+    case string_value(params, "task_ref") do
+      nil -> opts[:task_ref]
+      value -> value
+    end
+  end
+
+  defp result_text(result) do
+    case Map.fetch(result, "text") do
+      {:ok, text} when is_binary(text) -> text
+      _value -> ""
+    end
+  end
+
+  defp canonical_attrs(attrs) do
+    if canonical_value?(attrs) do
+      :ok
+    else
+      {:error, invalid_param("params", "must use canonical string keys")}
+    end
+  end
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      {_key, _nested} -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp invalid_param(field, message) do
+    %{
+      "code" => "invalid_params",
+      "field" => field,
+      "message" => "#{field} #{message}"
+    }
   end
 
   defp reject_empty(map) when is_map(map) do

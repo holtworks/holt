@@ -21,10 +21,9 @@ impl SessionState {
         self.turns.push(message);
     }
 
-    pub fn recent_user_context(&self, limit: usize) -> Vec<ChatMessage> {
+    pub fn recent_chat_messages(&self, limit: usize) -> Vec<ChatMessage> {
         self.turns
             .iter()
-            .filter(|message| matches!(message.role, holt_protocol::ChatRole::User))
             .rev()
             .take(limit)
             .cloned()
@@ -41,12 +40,14 @@ mod tests {
     use holt_protocol::ChatMessage;
 
     #[test]
-    fn session_returns_recent_user_context_in_order() {
+    fn session_returns_recent_chat_messages_in_order() {
         let mut session = SessionState::new("session-1");
         session.push(ChatMessage::user("first"));
+        session.push(ChatMessage::assistant("first response"));
         session.push(ChatMessage::user("second"));
 
-        let context = session.recent_user_context(1);
-        assert_eq!(context[0].content, "second");
+        let messages = session.recent_chat_messages(2);
+        assert_eq!(messages[0].content, "first response");
+        assert_eq!(messages[1].content, "second");
     }
 }

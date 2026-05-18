@@ -1,13 +1,12 @@
 defmodule Holt.Pages do
   @moduledoc """
-  File-backed local page and document records for agent-facing page tools.
+  File-backed local page and document records for agent-facing page actions.
   """
 
   alias Holt.{Clock, JSON, Paths}
-  alias Holt.Tasks.RuntimeContracts
 
-  @page_schema_version "holtworks_page/v1"
-  @document_event_schema_version "holtworks_document_event/v1"
+  @page_schema_version "holt_page/v1"
+  @document_event_schema_version "holt_document_event/v1"
   @page_types ~w(document)
   @document_actions ~w(insert_below replace_selection replace_all)
 
@@ -57,15 +56,15 @@ defmodule Holt.Pages do
   def create(attrs, opts) when is_map(attrs) do
     root = Paths.workspace_root(opts)
     ensure_store(root)
-    attrs = RuntimeContracts.string_keys(attrs)
 
-    with {:ok, page_type} <- enum_value(attrs, "page_type", @page_types, "document"),
-         {:ok, title} <- required_text(attrs, "title") do
+    with :ok <- canonical_attrs(attrs),
+         {:ok, page_type} <- enum_value(attrs, "page_type", @page_types),
+         {:ok, title} <- required_text(attrs, "title"),
+         {:ok, content} <- optional_body(attrs, "content", "") do
       now = Clock.iso_now()
       page_id = Clock.id("page")
       relative_path = Path.join([".holtworks", "documents", page_id <> ".md"])
       absolute_path = Path.join(root, relative_path)
-      content = RuntimeContracts.text(attrs, "content", "")
 
       page =
         %{
@@ -74,13 +73,13 @@ defmodule Holt.Pages do
           "page_id" => page_id,
           "page_type" => page_type,
           "title" => title,
-          "project_id" => RuntimeContracts.text(attrs, "project_id"),
+          "project_id" => optional_text(attrs, "project_id"),
           "document_path" => relative_path,
           "content_bytes" => byte_size(content),
           "created_at" => now,
           "updated_at" => now
         }
-        |> RuntimeContracts.reject_empty()
+        |> compact()
 
       File.mkdir_p!(Path.dirname(absolute_path))
       File.write!(absolute_path, content)
@@ -98,36 +97,22 @@ defmodule Holt.Pages do
   def set_title(attrs, opts) when is_map(attrs) do
     root = Paths.workspace_root(opts)
     ensure_store(root)
-    attrs = RuntimeContracts.string_keys(attrs)
 
-    with {:ok, title} <- required_text(attrs, "title") do
-      case page_id(attrs) do
-        nil ->
-          state =
-            root
-            |> state_path()
-            |> JSON.read(%{})
-            |> RuntimeContracts.normalize_map()
-            |> Map.put("title", title)
-            |> Map.put("updated_at", Clock.iso_now())
+    with :ok <- canonical_attrs(attrs),
+         {:ok, id} <- required_text(attrs, "page_id"),
+         {:ok, title} <- required_text(attrs, "title") do
+      update_page(root, id, fn page ->
+        page
+        |> Map.put("title", title)
+        |> Map.put("updated_at", Clock.iso_now())
+      end)
+      |> case do
+        {:ok, page} ->
+          set_active_page(root, page)
+          {:ok, %{"page" => page, "text" => "Title set to \"#{title}\"."}}
 
-          JSON.write(state_path(root), state)
-          {:ok, %{"page_state" => state, "text" => "Title set to \"#{title}\"."}}
-
-        id ->
-          update_page(root, id, fn page ->
-            page
-            |> Map.put("title", title)
-            |> Map.put("updated_at", Clock.iso_now())
-          end)
-          |> case do
-            {:ok, page} ->
-              set_active_page(root, page)
-              {:ok, %{"page" => page, "text" => "Title set to \"#{title}\"."}}
-
-            error ->
-              error
-          end
+        error ->
+          error
       end
     end
   end
@@ -139,11 +124,12 @@ defmodule Holt.Pages do
   def write_document(attrs, opts) when is_map(attrs) do
     root = Paths.workspace_root(opts)
     ensure_store(root)
-    attrs = RuntimeContracts.string_keys(attrs)
 
-    with {:ok, action} <- enum_value(attrs, "action", @document_actions, nil),
-         {:ok, content} <- required_text(attrs, "content"),
-         {:ok, page} <- resolve_document_page(attrs, opts),
+    with :ok <- canonical_attrs(attrs),
+         {:ok, page_id} <- required_text(attrs, "page_id"),
+         {:ok, action} <- enum_value(attrs, "action", @document_actions),
+         {:ok, content} <- required_body(attrs, "content"),
+         {:ok, page} <- get(page_id, opts),
          {:ok, result} <- write_document_content(root, page, action, content, attrs) do
       {:ok, result}
     end
@@ -196,7 +182,7 @@ defmodule Holt.Pages do
   end
 
   defp edited_content(existing, "replace_selection", content, attrs) do
-    selected = RuntimeContracts.text(attrs, "selected_text")
+    selected = optional_text(attrs, "selected_text")
 
     cond do
       selected in [nil, ""] ->
@@ -209,42 +195,6 @@ defmodule Holt.Pages do
         separator = if existing == "", do: "", else: "\n\n"
         {existing <> separator <> content, "selection_not_found_inserted_below"}
     end
-  end
-
-  defp resolve_document_page(attrs, opts) do
-    root = Paths.workspace_root(opts)
-
-    cond do
-      id = page_id(attrs) ->
-        get(id, opts)
-
-      active_id = active_page_id(root) ->
-        get(active_id, opts)
-
-      page = latest_document_page(opts) ->
-        {:ok, page}
-
-      true ->
-        with {:ok, %{"page" => page}} <-
-               create(%{"page_type" => "document", "title" => "Untitled Document"}, opts) do
-          {:ok, page}
-        end
-    end
-  end
-
-  defp latest_document_page(opts) do
-    opts
-    |> list()
-    |> Enum.reverse()
-    |> Enum.find(&(&1["page_type"] == "document"))
-  end
-
-  defp active_page_id(root) do
-    root
-    |> state_path()
-    |> JSON.read(%{})
-    |> RuntimeContracts.normalize_map()
-    |> RuntimeContracts.text("active_page_id")
   end
 
   defp set_active_page(root, page) do
@@ -286,10 +236,6 @@ defmodule Holt.Pages do
     end
   end
 
-  defp page_id(attrs) do
-    RuntimeContracts.text(attrs, "page_id") || RuntimeContracts.text(attrs, "id")
-  end
-
   defp read_text(path) do
     case File.read(path) do
       {:ok, body} -> body
@@ -299,25 +245,92 @@ defmodule Holt.Pages do
 
   defp normalize_page(page) do
     page
-    |> RuntimeContracts.string_keys()
     |> Map.put_new("schema_version", @page_schema_version)
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
-  defp enum_value(attrs, key, allowed, default) do
-    value = RuntimeContracts.text(attrs, key, default)
+  defp enum_value(attrs, key, allowed) do
+    case required_text(attrs, key) do
+      {:ok, value} ->
+        if value in allowed do
+          {:ok, value}
+        else
+          {:error, {:invalid_enum, key, allowed}}
+        end
 
-    cond do
-      value in [nil, ""] -> {:error, {:required, key}}
-      value in allowed -> {:ok, value}
-      true -> {:error, {:invalid_enum, key, allowed}}
+      error ->
+        error
     end
   end
 
   defp required_text(attrs, key) do
-    case RuntimeContracts.text(attrs, key) do
-      nil -> {:error, {:required, key}}
+    case optional_text(attrs, key) do
+      nil -> {:error, {:missing_required, key}}
       text -> {:ok, text}
     end
+  end
+
+  defp optional_text(attrs, key) when is_map(attrs) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} when is_binary(value) ->
+        value
+        |> String.trim()
+        |> case do
+          "" -> nil
+          text -> text
+        end
+
+      {:ok, nil} ->
+        nil
+
+      {:ok, _value} ->
+        nil
+
+      :error ->
+        nil
+    end
+  end
+
+  defp optional_text(_attrs, _key), do: nil
+
+  defp optional_body(attrs, key, default) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      {:ok, nil} -> {:ok, default}
+      {:ok, _value} -> {:error, {:invalid_text, key}}
+      :error -> {:ok, default}
+    end
+  end
+
+  defp required_body(attrs, key) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} when is_binary(value) and value != "" -> {:ok, value}
+      {:ok, _value} -> {:error, {:invalid_text, key}}
+      :error -> {:error, {:missing_required, key}}
+    end
+  end
+
+  defp canonical_attrs(attrs) do
+    if canonical_value?(attrs) do
+      :ok
+    else
+      {:error, :invalid_page_attrs}
+    end
+  end
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      {_key, _nested} -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp compact(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
   end
 end

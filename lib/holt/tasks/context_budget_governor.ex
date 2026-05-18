@@ -10,76 +10,57 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
 
   alias Holt.Clock
 
-  @schema_version "holtworks_context_budget_governor/v1"
+  @schema_version "holt_context_budget_governor/v1"
   @default_context_window 128_000
   @default_output_reserve 8_192
-  @default_tool_reserve 24_000
+  @default_action_reserve 24_000
   @soft_ratio 0.75
   @critical_ratio 0.9
 
   def plan(attrs \\ %{})
 
   def plan(attrs) when is_map(attrs) do
-    attrs = string_keys(attrs)
-    provider_profile = normalize_map(value(attrs, "provider_profile"))
-    policy = normalize_map(value(attrs, "policy"))
-    messages = normalize_list(value(attrs, "messages"))
-    tools = normalize_list(value(attrs, "tools"))
+    with :ok <- canonical_attrs(attrs),
+         {:ok, provider_profile} <- map_field(attrs, "provider_profile"),
+         {:ok, messages} <- list_field(attrs, "messages"),
+         {:ok, actions} <- list_field(attrs, "actions"),
+         {:ok, provider} <- optional_text_field(provider_profile, "provider"),
+         {:ok, model} <- optional_text_field(provider_profile, "model"),
+         {:ok, context_window} <- context_window(provider_profile),
+         {:ok, output_reserve} <- output_reserve(attrs, context_window),
+         {:ok, action_reserve} <- action_reserve(attrs, context_window),
+         {:ok, hard_limit} <- hard_limit(attrs, context_window, output_reserve),
+         {:ok, soft_limit} <- soft_limit(attrs, context_window),
+         {:ok, critical_limit} <- critical_limit(attrs, context_window),
+         {:ok, input_tokens} <- input_tokens(attrs, messages, actions) do
+      available_tokens = max(hard_limit - input_tokens - action_reserve, 0)
 
-    context_window =
-      positive_int(value(provider_profile, "context_window")) ||
-        positive_int(value(attrs, "context_window")) ||
-        positive_int(value(policy, "max_total_tokens")) ||
-        @default_context_window
-
-    output_reserve =
-      positive_int(value(attrs, "output_reserve_tokens")) ||
-        min(@default_output_reserve, max(div(context_window, 20), 1_024))
-
-    tool_reserve =
-      positive_int(value(attrs, "tool_reserve_tokens")) ||
-        min(@default_tool_reserve, max(div(context_window, 10), 2_048))
-
-    hard_limit =
-      positive_int(value(attrs, "hard_limit_tokens")) ||
-        max(context_window - output_reserve, 1_024)
-
-    soft_limit =
-      positive_int(value(attrs, "soft_limit_tokens")) ||
-        floor(context_window * @soft_ratio)
-
-    critical_limit =
-      positive_int(value(attrs, "critical_limit_tokens")) ||
-        floor(context_window * @critical_ratio)
-
-    input_tokens =
-      nonnegative_int(value(attrs, "estimated_input_tokens")) ||
-        estimate_messages_tokens(messages) + estimate_tools_tokens(tools)
-
-    available_tokens = max(hard_limit - input_tokens - tool_reserve, 0)
-
-    %{
-      "schema_version" => @schema_version,
-      "provider" => value(provider_profile, "provider"),
-      "model" => value(provider_profile, "model"),
-      "context_window" => context_window,
-      "hard_limit_tokens" => hard_limit,
-      "soft_limit_tokens" => soft_limit,
-      "critical_limit_tokens" => critical_limit,
-      "output_reserve_tokens" => output_reserve,
-      "tool_reserve_tokens" => tool_reserve,
-      "estimated_input_tokens" => input_tokens,
-      "available_tokens" => available_tokens,
-      "budget_state" => budget_state(input_tokens, soft_limit, critical_limit, hard_limit),
-      "action" => action(input_tokens, soft_limit, critical_limit, hard_limit),
-      "compression" => compression_contract(input_tokens, soft_limit, critical_limit, hard_limit),
-      "provider_features" => provider_features(provider_profile),
-      "updated_at" => Clock.iso_now()
-    }
-    |> reject_empty()
+      %{
+        "schema_version" => @schema_version,
+        "provider" => provider,
+        "model" => model,
+        "context_window" => context_window,
+        "hard_limit_tokens" => hard_limit,
+        "soft_limit_tokens" => soft_limit,
+        "critical_limit_tokens" => critical_limit,
+        "output_reserve_tokens" => output_reserve,
+        "action_reserve_tokens" => action_reserve,
+        "estimated_input_tokens" => input_tokens,
+        "available_tokens" => available_tokens,
+        "budget_state" => budget_state(input_tokens, soft_limit, critical_limit, hard_limit),
+        "action" => action(input_tokens, soft_limit, critical_limit, hard_limit),
+        "compression" =>
+          compression_contract(input_tokens, soft_limit, critical_limit, hard_limit),
+        "provider_features" => provider_features(provider),
+        "updated_at" => Clock.iso_now()
+      }
+      |> reject_empty()
+    else
+      {:error, reason} -> rejected_plan(reason)
+    end
   end
 
-  def plan(_attrs), do: plan(%{})
+  def plan(_attrs), do: rejected_plan("invalid_attrs")
 
   def estimate_messages_tokens(messages) when is_list(messages) do
     messages
@@ -89,13 +70,13 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
 
   def estimate_messages_tokens(_messages), do: 0
 
-  def estimate_tools_tokens(tools) when is_list(tools) do
-    tools
+  def estimate_actions_tokens(actions) when is_list(actions) do
+    actions
     |> encode_size()
     |> estimate_tokens_from_bytes()
   end
 
-  def estimate_tools_tokens(_tools), do: 0
+  def estimate_actions_tokens(_actions), do: 0
 
   def compact_messages(messages, plan) when is_list(messages) and is_map(plan) do
     case value(plan, "action") do
@@ -108,7 +89,7 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
 
   def overflow_error(status, body) do
     %{
-      "schema_version" => "holtworks_context_overflow_error/v1",
+      "schema_version" => "holt_context_overflow_error/v1",
       "failure_class" => "context_budget_exceeded",
       "blocker_code" => "compression_required",
       "retryable" => true,
@@ -119,11 +100,74 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
     |> reject_empty()
   end
 
+  defp rejected_plan(reason) do
+    %{
+      "schema_version" => @schema_version,
+      "status" => "rejected",
+      "reason" => reason
+    }
+  end
+
+  defp context_window(provider_profile) do
+    optional_positive_integer(provider_profile, "context_window", @default_context_window)
+  end
+
+  defp output_reserve(attrs, context_window) do
+    optional_positive_integer(
+      attrs,
+      "output_reserve_tokens",
+      min(@default_output_reserve, max(div(context_window, 20), 1_024))
+    )
+  end
+
+  defp action_reserve(attrs, context_window) do
+    optional_positive_integer(
+      attrs,
+      "action_reserve_tokens",
+      min(@default_action_reserve, max(div(context_window, 10), 2_048))
+    )
+  end
+
+  defp hard_limit(attrs, context_window, output_reserve) do
+    optional_positive_integer(
+      attrs,
+      "hard_limit_tokens",
+      max(context_window - output_reserve, 1_024)
+    )
+  end
+
+  defp soft_limit(attrs, context_window) do
+    optional_positive_integer(attrs, "soft_limit_tokens", floor(context_window * @soft_ratio))
+  end
+
+  defp critical_limit(attrs, context_window) do
+    optional_positive_integer(
+      attrs,
+      "critical_limit_tokens",
+      floor(context_window * @critical_ratio)
+    )
+  end
+
+  defp input_tokens(attrs, messages, actions) do
+    case optional_nonnegative_integer(attrs, "estimated_input_tokens") do
+      {:ok, value} -> {:ok, value}
+      :missing -> {:ok, estimate_messages_tokens(messages) + estimate_actions_tokens(actions)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp compact_messages_to_budget([system | rest], plan) do
     target_tokens =
-      positive_int(value(plan, "soft_limit_tokens")) ||
-        positive_int(value(plan, "hard_limit_tokens")) ||
-        @default_context_window
+      case positive_integer_field(plan, "soft_limit_tokens") do
+        {:ok, value} ->
+          value
+
+        :error ->
+          case positive_integer_field(plan, "hard_limit_tokens") do
+            {:ok, value} -> value
+            :error -> @default_context_window
+          end
+      end
 
     recent_count = 8
     {old_messages, recent_messages} = Enum.split(rest, max(length(rest) - recent_count, 0))
@@ -155,58 +199,57 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
           "role" => "system",
           "content" =>
             "Older turn details were compacted by the context budget governor. " <>
-              "Use task memory artifact refs or task tools to dereference exact evidence."
+              "Use task memory artifact refs or task actions to dereference exact evidence."
         }
       ]
     end
   end
 
-  defp compact_message(%{"role" => "tool", "content" => content} = message)
+  defp compact_message(%{"role" => "action", "content" => content} = message)
        when is_binary(content) do
     Map.put(message, "content", bounded_text(content, 1_200))
   end
 
-  defp compact_message(%{role: "tool", content: content} = message) when is_binary(content) do
-    %{message | content: bounded_text(content, 1_200)}
-  end
-
-  defp compact_message(%{"role" => "assistant", "tool_calls" => tool_calls} = message)
-       when is_list(tool_calls) do
-    Map.put(message, "tool_calls", Enum.map(tool_calls, &compact_tool_call/1))
-  end
-
-  defp compact_message(%{role: "assistant", tool_calls: tool_calls} = message)
-       when is_list(tool_calls) do
-    %{message | tool_calls: Enum.map(tool_calls, &compact_tool_call/1)}
+  defp compact_message(%{"role" => "assistant", "action_calls" => action_calls} = message)
+       when is_list(action_calls) do
+    Map.put(message, "action_calls", Enum.map(action_calls, &compact_action_call/1))
   end
 
   defp compact_message(message), do: message
 
-  defp compact_tool_call(tool_call) when is_map(tool_call) do
-    function = value(tool_call, "function") || %{}
-    arguments = value(function, "arguments")
+  defp compact_action_call(action_call) when is_map(action_call) do
+    case value(action_call, "function") do
+      function when is_map(function) ->
+        compact_function_arguments(action_call, function)
 
-    if is_binary(arguments) and byte_size(arguments) > 1_200 do
-      name = value(function, "name") || "tool"
-      put_in_tool_arguments(tool_call, ~s({"_compacted":"#{name} arguments stored in artifacts"}))
-    else
-      tool_call
+      _value ->
+        action_call
     end
   end
 
-  defp compact_tool_call(tool_call), do: tool_call
+  defp compact_action_call(action_call), do: action_call
 
-  defp put_in_tool_arguments(%{"function" => function} = tool_call, replacement)
-       when is_map(function) do
-    Map.put(tool_call, "function", Map.put(function, "arguments", replacement))
+  defp compact_function_arguments(action_call, function) do
+    arguments = value(function, "arguments")
+
+    if is_binary(arguments) and byte_size(arguments) > 1_200 do
+      name = action_name(function)
+
+      put_in_action_arguments(
+        action_call,
+        ~s({"_compacted":"#{name} arguments stored in artifacts"})
+      )
+    else
+      action_call
+    end
   end
 
-  defp put_in_tool_arguments(%{function: function} = tool_call, replacement)
+  defp put_in_action_arguments(%{"function" => function} = action_call, replacement)
        when is_map(function) do
-    %{tool_call | function: Map.put(function, :arguments, replacement)}
+    Map.put(action_call, "function", Map.put(function, "arguments", replacement))
   end
 
-  defp put_in_tool_arguments(tool_call, _replacement), do: tool_call
+  defp put_in_action_arguments(action_call, _replacement), do: action_call
 
   defp bounded_text(text, max_chars) do
     if String.length(text) <= max_chars do
@@ -232,14 +275,12 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
     }
   end
 
-  defp provider_features(provider_profile) do
-    provider = value(provider_profile, "provider")
-
+  defp provider_features(provider) do
     %{
       "openai_server_compaction" => provider == "openai",
       "anthropic_context_management" => provider == "anthropic",
-      "tool_result_clearing" => provider in ["anthropic", "openai"],
-      "provider_neutral_fallback" => true
+      "action_result_clearing" => provider in ["anthropic", "openai"],
+      "provider_neutral_compaction" => true
     }
   end
 
@@ -262,7 +303,10 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
   end
 
   defp provider_message(body) when is_map(body) do
-    get_in(body, ["error", "message"]) || get_in(body, [:error, :message]) || to_text(body)
+    case get_in(body, ["error", "message"]) do
+      message when is_binary(message) -> message
+      _value -> to_text(body)
+    end
   end
 
   defp provider_message(body), do: to_text(body)
@@ -277,27 +321,28 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
     _reason -> 0
   end
 
-  defp positive_int(value) when is_integer(value) and value > 0, do: value
-
-  defp positive_int(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {int, ""} when int > 0 -> int
-      _other -> nil
+  defp positive_integer_field(map, key) do
+    case fetch_field(map, key) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _value -> :error
     end
   end
 
-  defp positive_int(_value), do: nil
-
-  defp nonnegative_int(value) when is_integer(value) and value >= 0, do: value
-
-  defp nonnegative_int(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {int, ""} when int >= 0 -> int
-      _other -> nil
+  defp optional_positive_integer(map, key, default) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_integer(value) and value > 0 -> {:ok, value}
+      {:ok, _value} -> {:error, "invalid_field:#{key}"}
+      :error -> {:ok, default}
     end
   end
 
-  defp nonnegative_int(_value), do: nil
+  defp optional_nonnegative_integer(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
+      {:ok, _value} -> {:error, "invalid_field:#{key}"}
+      :error -> :missing
+    end
+  end
 
   defp to_text(value) when is_binary(value), do: value
 
@@ -308,31 +353,97 @@ defmodule Holt.Tasks.ContextBudgetGovernor do
     end
   end
 
-  defp normalize_list(value) when is_list(value), do: value
-  defp normalize_list(_value), do: []
-
-  defp normalize_map(value) when is_map(value), do: string_keys(value)
-  defp normalize_map(_value), do: %{}
-
-  defp value(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, to_string(key))
-  defp value(_map, _key), do: nil
-
-  defp string_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {key, value} when is_atom(key) -> {Atom.to_string(key), normalize_value(value)}
-      {key, value} -> {to_string(key), normalize_value(value)}
-    end)
+  defp list_field(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_list(value) -> {:ok, value}
+      {:ok, _value} -> {:error, "invalid_field:#{key}"}
+      :error -> {:ok, []}
+    end
   end
 
-  defp string_keys(_value), do: %{}
+  defp map_field(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_map(value) -> canonical_nested_map(key, value)
+      {:ok, _value} -> {:error, "invalid_field:#{key}"}
+      :error -> {:ok, %{}}
+    end
+  end
 
-  defp normalize_value(value) when is_map(value), do: string_keys(value)
-  defp normalize_value(value) when is_list(value), do: Enum.map(value, &normalize_value/1)
-  defp normalize_value(value), do: value
+  defp optional_text_field(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> text_field(map_with_field(key, value), key)
+      :error -> {:ok, nil}
+    end
+  end
+
+  defp text_field(map, key) do
+    case fetch_field(map, key) do
+      value when is_binary(value) ->
+        value
+        |> String.trim()
+        |> case do
+          "" -> {:error, "invalid_field:#{key}"}
+          text -> {:ok, text}
+        end
+
+      _value ->
+        {:error, "invalid_field:#{key}"}
+    end
+  end
+
+  defp canonical_nested_map(key, map) do
+    case canonical_attrs(map) do
+      :ok -> {:ok, map}
+      {:error, _reason} -> {:error, "invalid_field:#{key}"}
+    end
+  end
+
+  defp canonical_attrs(attrs) do
+    if Enum.all?(attrs, fn {key, _value} -> is_binary(key) end) do
+      :ok
+    else
+      {:error, "invalid_attrs"}
+    end
+  end
+
+  defp action_name(function) do
+    case compact_text(function, "name") do
+      nil -> "action"
+      name -> name
+    end
+  end
+
+  defp compact_text(map, key) do
+    case fetch_field(map, key) do
+      value when is_binary(value) ->
+        value
+        |> String.trim()
+        |> case do
+          "" -> nil
+          text -> text
+        end
+
+      _value ->
+        nil
+    end
+  end
+
+  defp value(map, key), do: fetch_field(map, key)
+
+  defp fetch_field(map, key) when is_map(map) and is_binary(key), do: Map.get(map, key)
+  defp fetch_field(_map, _key), do: nil
+
+  defp map_with_field(key, value), do: %{key => value}
 
   defp reject_empty(map) do
     map
-    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Enum.reject(fn {_key, value} -> empty?(value) end)
     |> Map.new()
   end
+
+  defp empty?(nil), do: true
+  defp empty?(""), do: true
+  defp empty?([]), do: true
+  defp empty?(map) when is_map(map), do: map_size(map) == 0
+  defp empty?(_value), do: false
 end

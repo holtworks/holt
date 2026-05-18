@@ -8,11 +8,11 @@ defmodule Holt.Tasks.AgentTaskClassifier do
     kind = task["kind"]
 
     %{
-      "schema_version" => "holtworks_task_classification/v1",
+      "schema_version" => "holt_task_classification/v1",
       "task_complexity" => task_complexity(kind, estimate),
       "continuation_allowed" => kind in ["task", "epic"],
       "estimate" => estimate,
-      "kind" => kind || "task"
+      "kind" => task_kind(kind)
     }
   end
 
@@ -27,4 +27,7 @@ defmodule Holt.Tasks.AgentTaskClassifier do
     do: "standard"
 
   defp task_complexity(_kind, _estimate), do: "small"
+
+  defp task_kind(kind) when is_binary(kind) and kind != "", do: kind
+  defp task_kind(_kind), do: "task"
 end

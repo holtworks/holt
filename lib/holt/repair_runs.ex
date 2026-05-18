@@ -9,12 +9,11 @@ defmodule Holt.RepairRuns do
   """
 
   alias Holt.{Clock, JSON, Paths}
-  alias Holt.Tasks.RuntimeContracts
 
-  @schema_version "holtworks_repair_run/v1"
-  @event_schema_version "holtworks_repair_run_event/v1"
-  @artifact_schema_version "holtworks_repair_artifact/v1"
-  @score_schema_version "holtworks_repair_prediction_score/v1"
+  @schema_version "holt_repair_run/v1"
+  @event_schema_version "holt_repair_run_event/v1"
+  @artifact_schema_version "holt_repair_artifact/v1"
+  @score_schema_version "holt_repair_prediction_score/v1"
   @risk_levels ~w(low medium high critical)
   @strategies ~w(local_patch multi_file_repair architecture_refactor replacement human_gate)
   @artifact_types ~w(
@@ -71,25 +70,25 @@ defmodule Holt.RepairRuns do
   def start(attrs, opts) when is_map(attrs) do
     root = Paths.workspace_root(opts)
     ensure_store(root)
-    attrs = RuntimeContracts.string_keys(attrs)
 
-    with {:ok, risk_level} <- enum_value(attrs, "risk_level", @risk_levels, "low") do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, risk_level} <- enum_value(attrs, "risk_level", @risk_levels, "low") do
       now = Clock.iso_now()
 
       run =
         %{
           "schema_version" => @schema_version,
           "id" => Clock.id("repair_run"),
-          "task_id" => RuntimeContracts.text(attrs, "task_id"),
-          "agent_run_id" => RuntimeContracts.text(attrs, "agent_run_id"),
-          "project_id" => RuntimeContracts.text(attrs, "project_id"),
-          "space_id" => RuntimeContracts.text(attrs, "space_id"),
+          "task_id" => text(attrs, "task_id"),
+          "agent_run_id" => text(attrs, "agent_run_id"),
+          "project_id" => text(attrs, "project_id"),
+          "space_id" => text(attrs, "space_id"),
           "status" => "active",
           "phase" => "intake",
           "strategy" => nil,
           "risk_level" => risk_level,
           "approval_status" => approval_status(risk_level),
-          "goal_contract" => RuntimeContracts.normalize_map(attrs["goal_contract"]),
+          "goal_contract" => map_value(attrs["goal_contract"]),
           "hypotheses" => [],
           "predictions" => [],
           "prediction_scores" => [],
@@ -107,7 +106,7 @@ defmodule Holt.RepairRuns do
           "inserted_at" => now,
           "updated_at" => now
         }
-        |> RuntimeContracts.reject_empty()
+        |> reject_empty()
         |> append_run_event("repair_run.started", %{"risk_level" => risk_level}, now)
 
       store(root, upsert(list(workspace: root), run))
@@ -121,13 +120,12 @@ defmodule Holt.RepairRuns do
   def record_artifact(attrs, opts \\ [])
 
   def record_artifact(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
          {:ok, artifact_type} <- enum_value(attrs, "artifact_type", @artifact_types, nil),
          {:ok, artifact} <-
-           artifact(artifact_type, RuntimeContracts.normalize_map(attrs["payload"])),
+           artifact(artifact_type, map_value(attrs["payload"])),
          {:ok, updated} <- update_run(run["id"], opts, &put_artifact(&1, artifact_type, artifact)) do
       {:ok, payload(updated, "recorded #{artifact_type}")}
     end
@@ -138,9 +136,8 @@ defmodule Holt.RepairRuns do
   def choose_strategy(attrs, opts \\ [])
 
   def choose_strategy(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
          {:ok, strategy} <- enum_value(attrs, "strategy", @strategies, nil),
          {:ok, risk_level} <- enum_value(attrs, "risk_level", @risk_levels, run["risk_level"]) do
@@ -148,7 +145,7 @@ defmodule Holt.RepairRuns do
         current
         |> Map.put("strategy", strategy)
         |> Map.put("risk_level", risk_level)
-        |> Map.put("strategy_waiver", RuntimeContracts.normalize_map(attrs["strategy_waiver"]))
+        |> Map.put("strategy_waiver", map_value(attrs["strategy_waiver"]))
         |> Map.put("approval_status", approval_status(risk_level, current["approval_status"]))
         |> Map.put("phase", strategy_phase(strategy))
         |> evented("repair_run.strategy_chosen", %{
@@ -165,20 +162,19 @@ defmodule Holt.RepairRuns do
   def approve_gate(attrs, opts \\ [])
 
   def approve_gate(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts) do
       update_run(run["id"], opts, fn current ->
         current
         |> Map.put("approval_status", "approved")
         |> Map.put("approval", %{
           "approved_at" => Clock.iso_now(),
-          "reason_code" => RuntimeContracts.text(attrs, "reason_code", "explicit_approval"),
-          "approved_by" => RuntimeContracts.text(attrs, "approved_by")
+          "reason_code" => text(attrs, "reason_code", "explicit_approval"),
+          "approved_by" => text(attrs, "approved_by")
         })
         |> evented("repair_run.approved", %{
-          "reason_code" => RuntimeContracts.text(attrs, "reason_code")
+          "reason_code" => text(attrs, "reason_code")
         })
       end)
       |> wrap_payload("approved")
@@ -190,9 +186,8 @@ defmodule Holt.RepairRuns do
   def begin_implementation(attrs, opts \\ [])
 
   def begin_implementation(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
          :ok <- implementation_gate(run) do
       update_run(run["id"], opts, fn current ->
@@ -210,9 +205,8 @@ defmodule Holt.RepairRuns do
   def reconcile_prediction(attrs, opts \\ [])
 
   def reconcile_prediction(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
          {:ok, prediction_id} <- required_text(attrs, "prediction_id"),
          {:ok, observation_id} <- required_text(attrs, "observation_id"),
@@ -225,11 +219,11 @@ defmodule Holt.RepairRuns do
           "prediction_id" => prediction_id,
           "observation_id" => observation_id,
           "matched" => matched,
-          "mismatch_reason_code" => RuntimeContracts.text(attrs, "mismatch_reason_code"),
+          "mismatch_reason_code" => text(attrs, "mismatch_reason_code"),
           "next_decision" => next_decision,
           "created_at" => Clock.iso_now()
         }
-        |> RuntimeContracts.reject_empty()
+        |> reject_empty()
 
       update_run(run["id"], opts, fn current ->
         current
@@ -251,9 +245,8 @@ defmodule Holt.RepairRuns do
   def score_predictions(attrs, opts \\ [])
 
   def score_predictions(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts) do
       score = prediction_score(run, attrs)
 
@@ -310,11 +303,10 @@ defmodule Holt.RepairRuns do
   def complete(attrs, opts \\ [])
 
   def complete(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
-         :ok <- completion_gate(run, RuntimeContracts.normalize_map(attrs["final_report"])) do
+         :ok <- completion_gate(run, map_value(attrs["final_report"])) do
       update_run(run["id"], opts, fn current ->
         current
         |> Map.put("status", "completed")
@@ -330,9 +322,8 @@ defmodule Holt.RepairRuns do
   def complete(_attrs, _opts), do: {:error, :invalid_repair_completion}
 
   defp draft_and_maybe_record(attrs, opts, artifact_type, builder) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
          draft <- builder.(run, attrs) do
       if record?(attrs) do
@@ -354,9 +345,8 @@ defmodule Holt.RepairRuns do
   end
 
   defp execute_check(attrs, opts, artifact_type, builder) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, repair_run_id} <- required_text(attrs, "repair_run_id"),
          {:ok, run} <- get(repair_run_id, opts),
          check <- builder.(run, attrs) do
       if record?(attrs) do
@@ -379,107 +369,105 @@ defmodule Holt.RepairRuns do
 
   defp architecture_plan(run, attrs) do
     %{
-      "schema_version" => "holtworks_repair_architecture_plan/v1",
+      "schema_version" => "holt_repair_architecture_plan/v1",
       "id" => Clock.id("repair_architecture_plan"),
       "repair_run_id" => run["id"],
       "status" => "draft",
-      "problem_statement" =>
-        RuntimeContracts.text(attrs, "problem_statement") ||
-          RuntimeContracts.text(run["goal_contract"] || %{}, "original_issue"),
-      "target_architecture" => RuntimeContracts.text(attrs, "target_architecture"),
-      "write_scope" => RuntimeContracts.normalize_string_list(attrs["write_scope"]),
-      "protected_flows" => RuntimeContracts.normalize_string_list(attrs["protected_flows"]),
-      "non_goals" => RuntimeContracts.normalize_string_list(attrs["non_goals"]),
+      "problem_statement" => problem_statement(attrs, run),
+      "target_architecture" => text(attrs, "target_architecture"),
+      "write_scope" => normalize_string_list(attrs["write_scope"]),
+      "protected_flows" => normalize_string_list(attrs["protected_flows"]),
+      "non_goals" => normalize_string_list(attrs["non_goals"]),
       "replacement_candidates" => normalize_map_list(attrs["replacement_candidates"]),
       "migration_steps" => normalize_list(attrs["migration_steps"]),
       "state_and_data_changes" => normalize_map_list(attrs["state_and_data_changes"]),
-      "rollback_plan" => RuntimeContracts.normalize_map(attrs["rollback_plan"]),
+      "rollback_plan" => map_value(attrs["rollback_plan"]),
       "rollback_steps" => normalize_list(attrs["rollback_steps"]),
       "verification_matrix" => normalize_map_list(attrs["verification_matrix"]),
-      "external_facts_required" => RuntimeContracts.truthy?(attrs["external_facts_required"]),
-      "confidence" => RuntimeContracts.number(attrs["confidence"], nil),
-      "notes" => RuntimeContracts.text(attrs, "notes"),
+      "external_facts_required" => attrs["external_facts_required"] == true,
+      "confidence" => number(attrs["confidence"]),
+      "notes" => text(attrs, "notes"),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp blast_radius(run, attrs) do
     %{
-      "schema_version" => "holtworks_repair_blast_radius/v1",
+      "schema_version" => "holt_repair_blast_radius/v1",
       "id" => Clock.id("repair_blast_radius"),
       "repair_run_id" => run["id"],
       "status" => "draft",
-      "changed_files" => RuntimeContracts.normalize_string_list(attrs["changed_files"]),
-      "risk_flags" => RuntimeContracts.normalize_string_list(attrs["risk_flags"]),
-      "affected_domains" => RuntimeContracts.normalize_string_list(attrs["affected_domains"]),
-      "protected_flows" => RuntimeContracts.normalize_string_list(attrs["protected_flows"]),
-      "write_scope" => RuntimeContracts.normalize_string_list(attrs["write_scope"]),
+      "changed_files" => normalize_string_list(attrs["changed_files"]),
+      "risk_flags" => normalize_string_list(attrs["risk_flags"]),
+      "affected_domains" => normalize_string_list(attrs["affected_domains"]),
+      "protected_flows" => normalize_string_list(attrs["protected_flows"]),
+      "write_scope" => normalize_string_list(attrs["write_scope"]),
       "verification_matrix" => normalize_map_list(attrs["verification_matrix"]),
-      "rollback_notes" => RuntimeContracts.normalize_string_list(attrs["rollback_notes"]),
-      "notes" => RuntimeContracts.text(attrs, "notes"),
+      "rollback_notes" => normalize_string_list(attrs["rollback_notes"]),
+      "notes" => text(attrs, "notes"),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp original_issue_check_draft(run, attrs) do
     %{
-      "schema_version" => "holtworks_repair_original_issue_check_draft/v1",
+      "schema_version" => "holt_repair_original_issue_check_draft/v1",
       "id" => Clock.id("repair_original_issue_check_draft"),
       "repair_run_id" => run["id"],
       "status" => "pending",
       "proof_commands" => normalize_list(attrs["proof_commands"]),
       "manual_check_results" => normalize_map_list(attrs["manual_check_results"]),
-      "tool_check_results" => normalize_map_list(attrs["tool_check_results"]),
-      "goal_check" => RuntimeContracts.normalize_map(attrs["goal_check"]),
-      "notes" => RuntimeContracts.text(attrs, "notes"),
+      "action_check_results" => normalize_map_list(attrs["action_check_results"]),
+      "goal_check" => map_value(attrs["goal_check"]),
+      "notes" => text(attrs, "notes"),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp original_issue_execution(run, attrs) do
-    goal_check = RuntimeContracts.normalize_map(attrs["goal_check"])
+    goal_check = map_value(attrs["goal_check"])
     status = explicit_check_status(goal_check, "original_issue_fixed")
 
     %{
-      "schema_version" => "holtworks_repair_original_issue_check/v1",
+      "schema_version" => "holt_repair_original_issue_check/v1",
       "id" => Clock.id("repair_original_issue_check"),
       "repair_run_id" => run["id"],
       "status" => status,
-      "proof_draft_id" => RuntimeContracts.text(attrs, "proof_draft_id"),
+      "proof_draft_id" => text(attrs, "proof_draft_id"),
       "manual_check_results" => normalize_map_list(attrs["manual_check_results"]),
-      "tool_check_results" => normalize_map_list(attrs["tool_check_results"]),
+      "action_check_results" => normalize_map_list(attrs["action_check_results"]),
       "goal_check" => goal_check,
-      "evidence_refs" => RuntimeContracts.normalize_string_list(goal_check["evidence_refs"]),
+      "evidence_refs" => normalize_string_list(goal_check["evidence_refs"]),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp impact_check_execution(run, attrs) do
     status = impact_status(attrs)
 
     %{
-      "schema_version" => "holtworks_repair_impact_check/v1",
+      "schema_version" => "holt_repair_impact_check/v1",
       "id" => Clock.id("repair_impact_check"),
       "repair_run_id" => run["id"],
       "status" => status,
       "protected_flow_results" => normalize_map_list(attrs["protected_flow_results"]),
       "affected_domain_results" => normalize_map_list(attrs["affected_domain_results"]),
       "manual_check_results" => normalize_map_list(attrs["manual_check_results"]),
-      "tool_check_results" => normalize_map_list(attrs["tool_check_results"]),
+      "action_check_results" => normalize_map_list(attrs["action_check_results"]),
       "unexpected_change_candidates" => normalize_map_list(attrs["unexpected_change_candidates"]),
-      "impact_waiver" => RuntimeContracts.normalize_map(attrs["impact_waiver"]),
+      "impact_waiver" => map_value(attrs["impact_waiver"]),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp related_issue_sweep(run, attrs) do
     %{
-      "schema_version" => "holtworks_repair_related_issue_sweep/v1",
+      "schema_version" => "holt_repair_related_issue_sweep/v1",
       "id" => Clock.id("repair_related_issue"),
       "repair_run_id" => run["id"],
       "status" => related_issue_status(attrs),
@@ -493,13 +481,13 @@ defmodule Holt.RepairRuns do
       "recommended_diagnostics" => normalize_map_list(attrs["recommended_diagnostics"]),
       "fix_now" => normalize_map_list(attrs["fix_now"]),
       "track_later" => normalize_map_list(attrs["track_later"]),
-      "risk_flags" => RuntimeContracts.normalize_string_list(attrs["risk_flags"]),
+      "risk_flags" => normalize_string_list(attrs["risk_flags"]),
       "severity" => enum_text(attrs, "severity", ~w(low medium high critical unknown), "unknown"),
-      "should_fix_now" => RuntimeContracts.truthy?(attrs["should_fix_now"]),
-      "notes" => RuntimeContracts.text(attrs, "notes"),
+      "should_fix_now" => attrs["should_fix_now"] == true,
+      "notes" => text(attrs, "notes"),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp put_artifact(run, "goal_contract", artifact),
@@ -559,24 +547,24 @@ defmodule Holt.RepairRuns do
   defp put_artifact(run, "final_report", artifact),
     do:
       run
-      |> Map.put("final_report", artifact["payload"] || artifact)
+      |> Map.put("final_report", artifact_payload(artifact))
       |> artifact_event("final_report", artifact)
 
   defp artifact(type, payload) do
     {:ok,
      %{
        "schema_version" => @artifact_schema_version,
-       "id" => RuntimeContracts.text(payload, "id", Clock.id("repair_artifact")),
+       "id" => text(payload, "id", Clock.id("repair_artifact")),
        "artifact_type" => type,
-       "status" => RuntimeContracts.text(payload, "status"),
+       "status" => text(payload, "status"),
        "payload" => payload,
        "created_at" => Clock.iso_now()
      }
-     |> RuntimeContracts.reject_empty()}
+     |> reject_empty()}
   end
 
   defp prediction_score(run, attrs) do
-    reconciliations = run["reconciliations"] || []
+    reconciliations = list_value(run["reconciliations"])
     matched = Enum.count(reconciliations, &(&1["matched"] == true))
     total = length(reconciliations)
     convergence = if total == 0, do: 0.0, else: matched / total
@@ -584,16 +572,16 @@ defmodule Holt.RepairRuns do
     %{
       "schema_version" => @score_schema_version,
       "id" => Clock.id("repair_prediction_score"),
-      "prediction_count" => length(run["predictions"] || []),
+      "prediction_count" => length(list_value(run["predictions"])),
       "reconciliation_count" => total,
       "matched_count" => matched,
       "mismatch_count" => max(total - matched, 0),
       "convergence" => convergence,
       "recommendation" => prediction_recommendation(total, convergence),
-      "notes" => RuntimeContracts.text(attrs, "notes"),
+      "notes" => text(attrs, "notes"),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp prediction_recommendation(0, _convergence), do: "record_predictions"
@@ -637,22 +625,25 @@ defmodule Holt.RepairRuns do
   end
 
   defp prediction_score_satisfied?(run, final_report) do
-    waiver = RuntimeContracts.normalize_map(final_report["prediction_score_waiver"])
+    waiver = map_value(final_report["prediction_score_waiver"])
 
-    case List.last(run["prediction_scores"] || []) do
+    case List.last(list_value(run["prediction_scores"])) do
       %{"recommendation" => recommendation} when recommendation in ["finish", "continue"] -> true
-      _score -> RuntimeContracts.truthy?(waiver["waived"])
+      _score -> waiver["waived"] == true
     end
   end
 
   defp passed_or_waived?(checks, waiver) do
-    Enum.any?(checks || [], &(&1["status"] == "passed")) or
-      RuntimeContracts.truthy?(RuntimeContracts.normalize_map(waiver)["waived"])
+    cond do
+      Enum.any?(list_value(checks), &(&1["status"] == "passed")) -> true
+      map_value(waiver)["waived"] == true -> true
+      true -> false
+    end
   end
 
   defp final_report(attrs, run) do
     attrs["final_report"]
-    |> RuntimeContracts.normalize_map()
+    |> map_value()
     |> Map.put_new("completed_repair_run_id", run["id"])
     |> Map.put_new("created_at", Clock.iso_now())
   end
@@ -669,10 +660,10 @@ defmodule Holt.RepairRuns do
 
       store(root, upsert(list(workspace: root), updated))
 
-      latest_event = List.last(updated["events"] || [])
+      latest_event = List.last(list_value(updated["events"]))
 
       if latest_event,
-        do: append_event(root, updated, latest_event["kind"], latest_event["metadata"] || %{})
+        do: append_event(root, updated, latest_event["kind"], map_value(latest_event["metadata"]))
 
       {:ok, updated}
     end
@@ -690,7 +681,6 @@ defmodule Holt.RepairRuns do
 
   defp normalize_run(run) do
     run
-    |> RuntimeContracts.string_keys()
     |> Map.put_new("schema_version", @schema_version)
     |> Map.put_new("status", "active")
     |> Map.put_new("phase", "intake")
@@ -707,7 +697,7 @@ defmodule Holt.RepairRuns do
     |> Map.update("original_issue_checks", [], &normalize_list/1)
     |> Map.update("impact_checks", [], &normalize_list/1)
     |> Map.update("related_issues", [], &normalize_list/1)
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp append_event(root, run, kind, metadata) do
@@ -716,7 +706,7 @@ defmodule Holt.RepairRuns do
       "id" => Clock.id("repair_event"),
       "repair_run_id" => run["id"],
       "kind" => kind,
-      "metadata" => RuntimeContracts.normalize_map(metadata),
+      "metadata" => map_value(metadata),
       "at" => Clock.iso_now()
     })
   end
@@ -725,7 +715,7 @@ defmodule Holt.RepairRuns do
     event = %{
       "id" => Clock.id("repair_run_event"),
       "kind" => kind,
-      "metadata" => RuntimeContracts.normalize_map(metadata),
+      "metadata" => map_value(metadata),
       "at" => now
     }
 
@@ -747,7 +737,7 @@ defmodule Holt.RepairRuns do
     %{
       "repair_run" => run,
       "text" =>
-        "Repair run #{run["id"]} #{action}. Phase=#{run["phase"]}, status=#{run["status"]}, strategy=#{run["strategy"] || "unset"}."
+        "Repair run #{run["id"]} #{action}. Phase=#{run["phase"]}, status=#{run["status"]}, strategy=#{text_value(run["strategy"], "unset")}."
     }
   end
 
@@ -775,25 +765,25 @@ defmodule Holt.RepairRuns do
   defp explicit_check_status(map, key) do
     cond do
       Map.has_key?(map, "status") and map["status"] in @check_statuses -> map["status"]
-      RuntimeContracts.truthy?(map[key]) -> "passed"
+      map[key] == true -> "passed"
       Map.has_key?(map, key) -> "failed"
       true -> "pending"
     end
   end
 
   defp impact_status(attrs) do
-    waiver = RuntimeContracts.normalize_map(attrs["impact_waiver"])
+    waiver = map_value(attrs["impact_waiver"])
     unexpected = normalize_map_list(attrs["unexpected_change_candidates"])
     protected = normalize_map_list(attrs["protected_flow_results"])
     affected = normalize_map_list(attrs["affected_domain_results"])
 
     cond do
-      RuntimeContracts.truthy?(waiver["waived"]) ->
+      waiver["waived"] == true ->
         "passed"
 
       Enum.any?(
         unexpected,
-        &(&1["status"] == "failed" or RuntimeContracts.truthy?(&1["should_fix_now"]))
+        &unexpected_change_failed?/1
       ) ->
         "failed"
 
@@ -813,24 +803,22 @@ defmodule Holt.RepairRuns do
 
   defp related_issue_status(attrs) do
     cond do
-      RuntimeContracts.truthy?(attrs["should_fix_now"]) -> "failed"
+      attrs["should_fix_now"] == true -> "failed"
       normalize_map_list(attrs["fix_now"]) != [] -> "failed"
       true -> "passed"
     end
   end
 
   defp record?(%{"record" => false}), do: false
-  defp record?(%{"record" => "false"}), do: false
-  defp record?(%{"record" => 0}), do: false
   defp record?(_attrs), do: true
 
   defp enum_text(attrs, key, allowed, default) do
-    value = RuntimeContracts.text(attrs, key, default)
+    value = text(attrs, key, default)
     if value in allowed, do: value, else: default
   end
 
   defp enum_value(attrs, key, allowed, default) do
-    value = RuntimeContracts.text(attrs, key, default)
+    value = text(attrs, key, default)
 
     cond do
       value in [nil, ""] -> {:error, {:required, key}}
@@ -840,33 +828,116 @@ defmodule Holt.RepairRuns do
   end
 
   defp required_text(attrs, key) do
-    case RuntimeContracts.text(attrs, key) do
+    case text(attrs, key) do
       nil -> {:error, {:required, key}}
       text -> {:ok, text}
     end
   end
 
   defp required_boolean(attrs, key) do
-    if Map.has_key?(attrs, key) do
-      {:ok, RuntimeContracts.truthy?(attrs[key])}
-    else
-      {:error, {:required, key}}
+    case Map.fetch(attrs, key) do
+      {:ok, value} when is_boolean(value) -> {:ok, value}
+      {:ok, _value} -> {:error, {:invalid_boolean, key}}
+      :error -> {:error, {:required, key}}
     end
   end
 
   defp normalize_map_list(value) when is_list(value) do
     value
-    |> Enum.map(&RuntimeContracts.normalize_map/1)
+    |> Enum.map(&map_value/1)
     |> Enum.reject(&(&1 == %{}))
   end
 
   defp normalize_map_list(_value), do: []
 
-  defp normalize_list(value) when is_list(value),
-    do: Enum.map(value, &RuntimeContracts.normalize_value/1)
+  defp normalize_list(value) when is_list(value), do: value
 
   defp normalize_list(nil), do: []
-  defp normalize_list(value), do: [RuntimeContracts.normalize_value(value)]
+  defp normalize_list(value), do: [value]
+
+  defp normalize_string_list(nil), do: []
+
+  defp normalize_string_list(values) when is_list(values) do
+    values
+    |> Enum.flat_map(&normalize_string_list/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_string_list(value) when is_binary(value) do
+    value
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_string_list(_value), do: []
+
+  defp number(value) when is_integer(value), do: value * 1.0
+  defp number(value) when is_float(value), do: value
+  defp number(_value), do: nil
+
+  defp canonical_attrs(attrs) do
+    if canonical_value?(attrs) do
+      {:ok, attrs}
+    else
+      {:error, :invalid_repair_run_attrs}
+    end
+  end
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      _entry -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp map_value(value) when is_map(value), do: value
+  defp map_value(_value), do: %{}
+
+  defp list_value(value) when is_list(value), do: value
+  defp list_value(_value), do: []
+
+  defp text(attrs, key, default \\ nil) do
+    case Map.get(attrs, key) do
+      value when is_binary(value) ->
+        value
+        |> String.trim()
+        |> case do
+          "" -> default
+          text -> text
+        end
+
+      _value ->
+        default
+    end
+  end
+
+  defp text_value(value, _default) when is_binary(value) and value != "", do: value
+  defp text_value(_value, default), do: default
+
+  defp reject_empty(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
+  end
+
+  defp artifact_payload(%{"payload" => payload}) when is_map(payload), do: payload
+  defp artifact_payload(artifact), do: artifact
+
+  defp problem_statement(attrs, run) do
+    case text(attrs, "problem_statement") do
+      nil -> text(map_value(run["goal_contract"]), "original_issue")
+      statement -> statement
+    end
+  end
+
+  defp unexpected_change_failed?(%{"status" => "failed"}), do: true
+  defp unexpected_change_failed?(%{"should_fix_now" => true}), do: true
+  defp unexpected_change_failed?(_candidate), do: false
 
   defp draft_key("architecture_plan"), do: "architecture_plan_draft"
   defp draft_key("blast_radius"), do: "blast_radius_draft"

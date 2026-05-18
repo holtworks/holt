@@ -3,9 +3,9 @@ defmodule Holt.Tasks.CapabilityIndex do
   Normalizes local agent profiles into capability-index records.
   """
 
-  alias Holt.Tasks.{RuntimeContracts, TaskToolSession}
+  alias Holt.Tasks.ActionSession
 
-  @schema_version "holtworks_agent_capability_profile/v1"
+  @schema_version "holt_agent_capability_profile/v1"
   @effect_scopes ~w(read_only task_durable agent_orchestration workspace_durable external_side_effect routed)
   @artifact_kinds ~w(handoff verification_report research critique decision workflow_contract node_heartbeat)
 
@@ -19,87 +19,73 @@ defmodule Holt.Tasks.CapabilityIndex do
     |> dedupe_profiles()
   end
 
-  def profiles(value) when is_binary(value) do
-    value
-    |> RuntimeContracts.normalize_string_list()
-    |> Enum.map(&profile_from_id/1)
-  end
+  def profiles(value) when is_binary(value), do: []
 
   def profiles(value) when is_map(value) do
-    [profile_from_map(RuntimeContracts.string_keys(value))]
+    if canonical_value?(value) do
+      value
+      |> profile_from_map()
+      |> profile_list()
+    else
+      []
+    end
   end
 
   def profiles(_value), do: []
 
   def capability_available?(profile, capability) do
-    capability in RuntimeContracts.normalize_string_list(
-      RuntimeContracts.value(profile, "capabilities")
-    )
+    capability in string_list(value(profile, "capabilities"))
   end
 
-  def tool_available?(profile, tool_name) do
-    tool_name in RuntimeContracts.normalize_string_list(RuntimeContracts.value(profile, "tools"))
-  end
-
-  defp profile_from_id(id) do
-    profile_from_map(%{"agent_id" => id, "name" => id, "work_role" => "worker"})
+  def action_available?(profile, action_name) do
+    action_name in string_list(value(profile, "actions"))
   end
 
   defp profile_from_map(attrs) do
-    agent_id =
-      RuntimeContracts.text(attrs, "agent_id") ||
-        RuntimeContracts.text(attrs, "id") ||
-        RuntimeContracts.text(attrs, "agent_ref")
-
-    work_role = normalize_role(RuntimeContracts.text(attrs, "work_role", "worker"))
-    tools = tools(attrs)
+    agent_id = text(attrs, "agent_id")
+    work_role = normalize_role(text(attrs, "work_role", "worker"))
+    actions = actions(attrs)
     effect_scopes = effect_scopes(attrs)
     artifact_kinds = artifact_kinds(attrs)
 
     capabilities =
       [
-        RuntimeContracts.normalize_string_list(RuntimeContracts.value(attrs, "capabilities")),
+        string_list(value(attrs, "capabilities")),
         role_capabilities(work_role),
-        Enum.map(tools, &"tool:#{&1}"),
+        Enum.map(actions, &"action:#{&1}"),
         Enum.map(effect_scopes, &"effect_scope:#{&1}"),
         Enum.map(artifact_kinds, &"read_artifact:#{&1}"),
         Enum.map(artifact_kinds, &"produce_artifact:#{&1}")
       ]
       |> List.flatten()
-      |> RuntimeContracts.normalize_string_list()
+      |> string_list()
 
     %{
       "schema_version" => @schema_version,
       "agent_id" => agent_id,
-      "agent_ref" =>
-        RuntimeContracts.text(attrs, "agent_ref") || RuntimeContracts.text(attrs, "ref"),
-      "handle" =>
-        RuntimeContracts.text(attrs, "agent_handle") || RuntimeContracts.text(attrs, "handle"),
-      "name" =>
-        RuntimeContracts.text(attrs, "display_name") ||
-          RuntimeContracts.text(attrs, "agent_name") ||
-          RuntimeContracts.text(attrs, "name") ||
-          agent_id,
-      "status" => RuntimeContracts.text(attrs, "status", "active"),
+      "agent_ref" => text(attrs, "agent_ref"),
+      "handle" => text(attrs, "agent_handle"),
+      "name" => text(attrs, "display_name"),
+      "status" => text(attrs, "status", "active"),
       "work_role" => work_role,
       "capabilities" => capabilities,
-      "tools" => tools,
+      "actions" => actions,
       "effect_scopes" => effect_scopes,
       "artifact_kinds" => artifact_kinds
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
-  defp tools(attrs) do
-    explicit =
-      RuntimeContracts.normalize_string_list(
-        RuntimeContracts.value(attrs, "tools") ||
-          RuntimeContracts.value(attrs, "allowed_tools") ||
-          RuntimeContracts.value(attrs, "direct_tools")
-      )
+  defp profile_list(%{"agent_id" => agent_id} = profile) when agent_id not in [nil, ""],
+    do: [profile]
+
+  defp profile_list(_profile), do: []
+
+  defp actions(attrs) do
+    explicit = string_list(value(attrs, "actions"))
 
     if explicit == [] do
-      TaskToolSession.direct_tool_names() ++ TaskToolSession.meta_tool_names()
+      ActionSession.direct_action_names() ++ ActionSession.meta_action_names()
     else
       explicit
     end
@@ -107,15 +93,13 @@ defmodule Holt.Tasks.CapabilityIndex do
   end
 
   defp effect_scopes(attrs) do
-    explicit =
-      RuntimeContracts.normalize_string_list(RuntimeContracts.value(attrs, "effect_scopes"))
+    explicit = string_list(value(attrs, "effect_scopes"))
 
     if explicit == [], do: @effect_scopes, else: explicit
   end
 
   defp artifact_kinds(attrs) do
-    explicit =
-      RuntimeContracts.normalize_string_list(RuntimeContracts.value(attrs, "artifact_kinds"))
+    explicit = string_list(value(attrs, "artifact_kinds"))
 
     if explicit == [], do: @artifact_kinds, else: explicit
   end
@@ -146,12 +130,65 @@ defmodule Holt.Tasks.CapabilityIndex do
     |> Enum.reduce({MapSet.new(), []}, fn profile, {seen, acc} ->
       agent_id = profile["agent_id"]
 
-      if agent_id in [nil, ""] or MapSet.member?(seen, agent_id) do
-        {seen, acc}
-      else
-        {MapSet.put(seen, agent_id), acc ++ [profile]}
+      cond do
+        agent_id in [nil, ""] -> {seen, acc}
+        MapSet.member?(seen, agent_id) -> {seen, acc}
+        true -> {MapSet.put(seen, agent_id), acc ++ [profile]}
       end
     end)
     |> elem(1)
+  end
+
+  defp value(map, key) when is_map(map), do: Map.get(map, key)
+  defp value(_map, _key), do: nil
+
+  defp text(map, key, default \\ nil)
+
+  defp text(map, key, default) when is_map(map) do
+    case Map.get(map, key) do
+      value when is_binary(value) ->
+        value
+        |> String.trim()
+        |> case do
+          "" -> default
+          text -> text
+        end
+
+      _value ->
+        default
+    end
+  end
+
+  defp text(_map, _key, default), do: default
+
+  defp string_list(nil), do: []
+
+  defp string_list(value) when is_list(value) do
+    value
+    |> Enum.flat_map(&string_list/1)
+    |> Enum.uniq()
+  end
+
+  defp string_list(value) when is_binary(value) do
+    value = String.trim(value)
+    if value == "", do: [], else: [value]
+  end
+
+  defp string_list(_value), do: []
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      {_key, _nested} -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp reject_empty(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
   end
 end

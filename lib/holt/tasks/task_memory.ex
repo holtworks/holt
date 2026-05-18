@@ -10,11 +10,12 @@ defmodule Holt.Tasks.TaskMemory do
   alias Holt.{Clock, JSON, Paths}
   alias Holt.Tasks.ContextBudgetGovernor
 
-  @artifact_schema_version "holtworks_task_memory_artifact/v1"
-  @chunk_schema_version "holtworks_task_memory_artifact_chunk/v1"
-  @packet_schema_version "holtworks_task_memory_context_packet/v1"
+  @artifact_schema_version "holt_task_memory_artifact/v1"
+  @chunk_schema_version "holt_task_memory_artifact_chunk/v1"
+  @packet_schema_version "holt_task_memory_context_packet/v1"
   @chunk_chars 32_000
   @preview_chars 1_200
+  @obsolete_artifact_attrs %{"body" => "content", "action_name" => "action"}
 
   def ensure_store(root) do
     Paths.ensure_workspace(root)
@@ -39,49 +40,52 @@ defmodule Holt.Tasks.TaskMemory do
 
   def record_artifact(root, task, attrs) when is_map(task) and is_map(attrs) do
     ensure_store(root)
-    attrs = string_keys(attrs)
-    content = content_text(attrs)
-    artifact_ref = optional_text(attrs, "artifact_ref", Clock.id("task_memory_artifact"))
-    chunks = chunk_content(artifact_ref, content)
-    now = Clock.iso_now()
 
-    artifact =
-      %{
-        "schema_version" => @artifact_schema_version,
-        "artifact_ref" => artifact_ref,
-        "task_id" => task["id"] || attrs["task_id"],
-        "task_ref" => task["ref"] || attrs["task_ref"],
-        "kind" => optional_text(attrs, "kind", "artifact"),
-        "title" => optional_text(attrs, "title", default_title(attrs)),
-        "source" => optional_text(attrs, "source", "task_memory"),
-        "agent_run_id" => optional_text(attrs, "agent_run_id"),
-        "agent_work_id" => optional_text(attrs, "agent_work_id"),
-        "tool_name" => optional_text(attrs, "tool_name"),
-        "content_preview" => String.slice(content, 0, @preview_chars),
-        "content_bytes" => byte_size(content),
-        "chunk_count" => length(chunks),
-        "metadata" => normalize_map(value(attrs, "metadata")),
-        "created_at" => now,
-        "updated_at" => now
-      }
-      |> reject_empty()
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         :ok <- reject_obsolete_attrs(attrs, @obsolete_artifact_attrs),
+         {:ok, content} <- content_text(attrs) do
+      artifact_ref = optional_text(attrs, "artifact_ref", Clock.id("task_memory_artifact"))
+      chunks = chunk_content(artifact_ref, content)
+      now = Clock.iso_now()
 
-    artifacts =
-      root
-      |> load_artifacts()
-      |> Enum.reject(&(&1["artifact_ref"] == artifact_ref))
-      |> Kernel.++([artifact])
+      artifact =
+        %{
+          "schema_version" => @artifact_schema_version,
+          "artifact_ref" => artifact_ref,
+          "task_id" => task["id"],
+          "task_ref" => task["ref"],
+          "kind" => optional_text(attrs, "kind", "artifact"),
+          "title" => optional_text(attrs, "title", default_title(attrs)),
+          "source" => optional_text(attrs, "source", "task_memory"),
+          "agent_run_id" => optional_text(attrs, "agent_run_id"),
+          "agent_work_id" => optional_text(attrs, "agent_work_id"),
+          "action" => optional_text(attrs, "action"),
+          "content_preview" => String.slice(content, 0, @preview_chars),
+          "content_bytes" => byte_size(content),
+          "chunk_count" => length(chunks),
+          "metadata" => normalize_map(Map.get(attrs, "metadata")),
+          "created_at" => now,
+          "updated_at" => now
+        }
+        |> reject_empty()
 
-    stored_chunks =
-      root
-      |> load_chunks()
-      |> Enum.reject(&(&1["artifact_ref"] == artifact_ref))
-      |> Kernel.++(chunks)
+      artifacts =
+        root
+        |> load_artifacts()
+        |> Enum.reject(&(&1["artifact_ref"] == artifact_ref))
+        |> Kernel.++([artifact])
 
-    JSON.write(artifacts_path(root), artifacts)
-    JSON.write(chunks_path(root), stored_chunks)
+      stored_chunks =
+        root
+        |> load_chunks()
+        |> Enum.reject(&(&1["artifact_ref"] == artifact_ref))
+        |> Kernel.++(chunks)
 
-    {:ok, artifact}
+      JSON.write(artifacts_path(root), artifacts)
+      JSON.write(chunks_path(root), stored_chunks)
+
+      {:ok, artifact}
+    end
   end
 
   def record_artifact(_root, _task, _attrs), do: {:error, :invalid_artifact_attrs}
@@ -99,7 +103,7 @@ defmodule Holt.Tasks.TaskMemory do
           |> load_chunks()
           |> Enum.filter(&(&1["artifact_ref"] == artifact_ref))
           |> Enum.sort_by(& &1["chunk_index"])
-          |> Enum.map_join("", &(&1["content"] || ""))
+          |> Enum.map_join("", &text_value(&1["content"], ""))
 
         {:ok, Map.put(artifact, "content", content)}
     end
@@ -111,59 +115,56 @@ defmodule Holt.Tasks.TaskMemory do
 
   def context_packet(root, task, attrs) when is_map(task) and is_map(attrs) do
     ensure_store(root)
-    attrs = string_keys(attrs)
-    specs = normalize_specs(value(attrs, "specs"))
-    runs = normalize_list(value(attrs, "agent_runs"))
-    artifacts = recent_artifacts(root, task["id"], limit: positive_int(value(attrs, "limit"), 12))
-    evidence_ledgers = recent_json_records(root, "evidence_ledgers.json", task["id"], 8)
-    approvals = recent_json_records(root, "human_approval_requests.json", task["id"], 8)
-    comments = recent_comments(task, positive_int(value(attrs, "comment_limit"), 12))
 
-    messages =
-      value(attrs, "messages") ||
-        synthetic_messages(task, specs, artifacts, evidence_ledgers, approvals, comments)
+    with {:ok, attrs} <- canonical_attrs(attrs) do
+      specs = normalize_specs(Map.get(attrs, "specs"))
+      runs = normalize_list(Map.get(attrs, "agent_runs"))
 
-    context_budget =
-      ContextBudgetGovernor.plan(%{
-        "provider_profile" => normalize_map(value(attrs, "provider_profile")),
-        "policy" => normalize_map(value(attrs, "policy")),
-        "messages" => messages,
-        "tools" => normalize_list(value(attrs, "tools")),
-        "estimated_input_tokens" => value(attrs, "estimated_input_tokens"),
-        "context_window" => value(attrs, "context_window"),
-        "hard_limit_tokens" => value(attrs, "hard_limit_tokens"),
-        "soft_limit_tokens" => value(attrs, "soft_limit_tokens"),
-        "critical_limit_tokens" => value(attrs, "critical_limit_tokens"),
-        "output_reserve_tokens" => value(attrs, "output_reserve_tokens"),
-        "tool_reserve_tokens" => value(attrs, "tool_reserve_tokens")
-      })
+      artifacts =
+        recent_artifacts(root, task["id"], limit: positive_int(Map.get(attrs, "limit"), 12))
 
-    packet =
-      %{
-        "schema_version" => @packet_schema_version,
-        "packet_id" => optional_text(attrs, "packet_id", Clock.id("task_memory_packet")),
-        "task_id" => task["id"],
-        "task_ref" => task["ref"],
-        "task_status" => task["status"],
-        "task_title" => task["title"],
-        "memory_state" =>
-          memory_state(specs, artifacts, evidence_ledgers, approvals, context_budget, runs),
-        "task_summary" => task_summary(task),
-        "recent_comments" => comments,
-        "runtime_specs" => Enum.map(specs, &spec_summary/1),
-        "recent_artifacts" => Enum.map(artifacts, &artifact_summary/1),
-        "recent_evidence_ledgers" => Enum.map(evidence_ledgers, &ledger_summary/1),
-        "recent_approval_requests" => Enum.map(approvals, &approval_summary/1),
-        "artifact_refs" => Enum.map(artifacts, & &1["artifact_ref"]),
-        "context_budget" => context_budget,
-        "prompt_section" => nil,
-        "created_at" => Clock.iso_now()
-      }
-      |> reject_empty()
+      evidence_ledgers = recent_json_records(root, "evidence_ledgers.json", task["id"], 8)
+      approvals = recent_json_records(root, "human_approval_requests.json", task["id"], 8)
+      comments = recent_comments(task, positive_int(Map.get(attrs, "comment_limit"), 12))
 
-    packet = Map.put(packet, "prompt_section", context_prompt_section(packet))
-    persist_context_packet(root, packet)
-    {:ok, packet}
+      messages =
+        case Map.get(attrs, "messages") do
+          value when is_list(value) ->
+            value
+
+          _value ->
+            synthetic_messages(task, specs, artifacts, evidence_ledgers, approvals, comments)
+        end
+
+      context_budget = ContextBudgetGovernor.plan(context_budget_attrs(attrs, messages))
+
+      packet =
+        %{
+          "schema_version" => @packet_schema_version,
+          "packet_id" => optional_text(attrs, "packet_id", Clock.id("task_memory_packet")),
+          "task_id" => task["id"],
+          "task_ref" => task["ref"],
+          "task_status" => task["status"],
+          "task_title" => task["title"],
+          "memory_state" =>
+            memory_state(specs, artifacts, evidence_ledgers, approvals, context_budget, runs),
+          "task_summary" => task_summary(task),
+          "recent_comments" => comments,
+          "runtime_specs" => Enum.map(specs, &spec_summary/1),
+          "recent_artifacts" => Enum.map(artifacts, &artifact_summary/1),
+          "recent_evidence_ledgers" => Enum.map(evidence_ledgers, &ledger_summary/1),
+          "recent_approval_requests" => Enum.map(approvals, &approval_summary/1),
+          "artifact_refs" => Enum.map(artifacts, & &1["artifact_ref"]),
+          "context_budget" => context_budget,
+          "prompt_section" => nil,
+          "created_at" => Clock.iso_now()
+        }
+        |> reject_empty()
+
+      packet = Map.put(packet, "prompt_section", context_prompt_section(packet))
+      persist_context_packet(root, packet)
+      {:ok, packet}
+    end
   end
 
   def context_packet(_root, _task, _attrs), do: {:error, :invalid_context_attrs}
@@ -172,20 +173,20 @@ defmodule Holt.Tasks.TaskMemory do
     """
     ## Task Memory Context
     Packet: #{packet["packet_id"]}
-    Task: #{packet["task_ref"] || packet["task_id"] || "unknown"}
-    Budget: #{get_in(packet, ["context_budget", "budget_state"]) || "unknown"} / #{get_in(packet, ["context_budget", "action"]) || "unknown"}
+    Task: #{text_value(packet["task_ref"], "unknown")}
+    Budget: #{text_value(get_in(packet, ["context_budget", "budget_state"]), "unknown")} / #{text_value(get_in(packet, ["context_budget", "action"]), "unknown")}
 
     Task summary:
-    #{packet["task_summary"] || "none"}
+    #{text_value(packet["task_summary"], "none")}
 
     Runtime specs:
-    #{summary_rows(packet["runtime_specs"] || [], "id", "title")}
+    #{summary_rows(list_value(packet["runtime_specs"]), "id", "title")}
 
     Recent artifacts:
-    #{summary_rows(packet["recent_artifacts"] || [], "artifact_ref", "title")}
+    #{summary_rows(list_value(packet["recent_artifacts"]), "artifact_ref", "title")}
 
     Recent evidence ledgers:
-    #{summary_rows(packet["recent_evidence_ledgers"] || [], "ledger_id", "source_tool_name")}
+    #{summary_rows(list_value(packet["recent_evidence_ledgers"]), "ledger_id", "source_action")}
     """
     |> String.trim()
   end
@@ -199,7 +200,7 @@ defmodule Holt.Tasks.TaskMemory do
     root
     |> load_artifacts()
     |> Enum.filter(&(&1["task_id"] == task_id))
-    |> Enum.sort_by(&(&1["created_at"] || ""))
+    |> Enum.sort_by(&text_field(&1, "created_at"))
     |> Enum.reverse()
     |> Enum.take(limit)
     |> Enum.reverse()
@@ -212,7 +213,7 @@ defmodule Holt.Tasks.TaskMemory do
     root
     |> load_context_packets()
     |> Enum.filter(&(&1["task_id"] == task_id))
-    |> Enum.sort_by(&(&1["created_at"] || ""))
+    |> Enum.sort_by(&text_field(&1, "created_at"))
     |> Enum.reverse()
     |> Enum.take(limit)
     |> Enum.reverse()
@@ -239,7 +240,7 @@ defmodule Holt.Tasks.TaskMemory do
     path
     |> JSON.read([])
     |> Enum.filter(&(&1["task_id"] == task_id))
-    |> Enum.sort_by(&(&1["created_at"] || &1["inserted_at"] || ""))
+    |> Enum.sort_by(&text_field(&1, "created_at"))
     |> Enum.reverse()
     |> Enum.take(limit)
     |> Enum.reverse()
@@ -268,10 +269,9 @@ defmodule Holt.Tasks.TaskMemory do
   end
 
   defp content_text(attrs) do
-    cond do
-      is_binary(value(attrs, "content")) -> value(attrs, "content")
-      is_binary(value(attrs, "body")) -> value(attrs, "body")
-      true -> attrs |> value("content") |> inspect()
+    case Map.get(attrs, "content") do
+      content when is_binary(content) -> {:ok, content}
+      _value -> {:error, :missing_artifact_content}
     end
   end
 
@@ -282,7 +282,7 @@ defmodule Holt.Tasks.TaskMemory do
       %{
         "role" => "system",
         "content" =>
-          "Task memory context for #{task["ref"] || task["id"]}: #{task["title"] || ""}"
+          "Task memory context for #{text_value(task["ref"], "unknown")}: #{text_value(task["title"], "")}"
       },
       %{
         "role" => "user",
@@ -301,7 +301,7 @@ defmodule Holt.Tasks.TaskMemory do
 
   defp memory_state(specs, artifacts, ledgers, approvals, budget, runs) do
     %{
-      "schema_version" => "holtworks_task_memory_state/v1",
+      "schema_version" => "holt_task_memory_state/v1",
       "runtime_spec_count" => length(specs),
       "artifact_count" => length(artifacts),
       "evidence_ledger_count" => length(ledgers),
@@ -315,11 +315,11 @@ defmodule Holt.Tasks.TaskMemory do
 
   defp task_summary(task) do
     """
-    #{task["ref"] || task["id"]}: #{task["title"] || ""}
-    Status: #{task["status"] || "unknown"}
-    Priority: #{task["priority"] || "none"}
-    Kind: #{task["kind"] || "task"}
-    Description: #{String.slice(task["description"] || "", 0, @preview_chars)}
+    #{text_value(task["ref"], "unknown")}: #{text_value(task["title"], "")}
+    Status: #{text_value(task["status"], "unknown")}
+    Priority: #{text_value(task["priority"], "none")}
+    Kind: #{text_value(task["kind"], "task")}
+    Description: #{String.slice(text_value(task["description"], ""), 0, @preview_chars)}
     """
     |> String.trim()
   end
@@ -329,8 +329,8 @@ defmodule Holt.Tasks.TaskMemory do
       "id" => spec["id"],
       "kind" => spec["kind"],
       "title" => spec["title"],
-      "content_preview" => String.slice(spec["content"] || "", 0, @preview_chars),
-      "metadata" => spec["metadata"] || %{}
+      "content_preview" => String.slice(text_value(spec["content"], ""), 0, @preview_chars),
+      "metadata" => map_value(spec["metadata"])
     }
     |> reject_empty()
   end
@@ -344,7 +344,7 @@ defmodule Holt.Tasks.TaskMemory do
       "source",
       "agent_run_id",
       "agent_work_id",
-      "tool_name",
+      "action_name",
       "content_preview",
       "chunk_count",
       "created_at"
@@ -354,7 +354,7 @@ defmodule Holt.Tasks.TaskMemory do
 
   defp ledger_summary(ledger) do
     ledger
-    |> Map.take(["ledger_id", "source_tool_name", "task_ref", "coverage", "created_at"])
+    |> Map.take(["ledger_id", "source_action", "task_ref", "coverage", "created_at"])
     |> reject_empty()
   end
 
@@ -363,7 +363,7 @@ defmodule Holt.Tasks.TaskMemory do
     |> Map.take([
       "approval_request_id",
       "status",
-      "tool_name",
+      "action_name",
       "effect_scope",
       "risk_level",
       "created_at",
@@ -379,7 +379,7 @@ defmodule Holt.Tasks.TaskMemory do
     |> Enum.map(fn comment ->
       comment
       |> Map.take(["id", "body", "author", "created_at", "metadata"])
-      |> update_in(["body"], &String.slice(to_string(&1), 0, @preview_chars))
+      |> update_in(["body"], &String.slice(text_value(&1, ""), 0, @preview_chars))
       |> reject_empty()
     end)
   end
@@ -389,7 +389,7 @@ defmodule Holt.Tasks.TaskMemory do
   defp summary_rows(rows, id_key, title_key) do
     rows
     |> Enum.map(fn row ->
-      "- #{row[id_key] || "unknown"}: #{row[title_key] || row["kind"] || "item"}"
+      "- #{text_value(row[id_key], "unknown")}: #{summary_title(row, title_key)}"
     end)
     |> Enum.join("\n")
   end
@@ -397,7 +397,7 @@ defmodule Holt.Tasks.TaskMemory do
   defp normalize_specs(specs) when is_list(specs) do
     specs
     |> Enum.filter(&is_map/1)
-    |> Enum.map(&string_keys/1)
+    |> Enum.filter(&canonical_value?/1)
   end
 
   defp normalize_specs(_specs), do: []
@@ -405,17 +405,35 @@ defmodule Holt.Tasks.TaskMemory do
   defp normalize_list(value) when is_list(value), do: value
   defp normalize_list(_value), do: []
 
-  defp normalize_map(value) when is_map(value), do: string_keys(value)
+  defp normalize_map(value) when is_map(value), do: value
   defp normalize_map(_value), do: %{}
 
-  defp positive_int(value, _default) when is_integer(value) and value > 0, do: value
+  defp context_budget_attrs(attrs, messages) do
+    %{"messages" => messages}
+    |> put_present("provider_profile", normalize_map(Map.get(attrs, "provider_profile")))
+    |> put_present("policy", normalize_map(Map.get(attrs, "policy")))
+    |> put_present("actions", normalize_list(Map.get(attrs, "actions")))
+    |> put_existing(attrs, "estimated_input_tokens")
+    |> put_existing(attrs, "hard_limit_tokens")
+    |> put_existing(attrs, "soft_limit_tokens")
+    |> put_existing(attrs, "critical_limit_tokens")
+    |> put_existing(attrs, "output_reserve_tokens")
+    |> put_existing(attrs, "action_reserve_tokens")
+  end
 
-  defp positive_int(value, default) do
-    case Integer.parse(to_string(value)) do
-      {number, ""} when number > 0 -> number
-      _other -> default
+  defp put_present(map, _key, value) when value in [%{}, []], do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
+
+  defp put_existing(target, source, key) do
+    if Map.has_key?(source, key) do
+      Map.put(target, key, Map.get(source, key))
+    else
+      target
     end
   end
+
+  defp positive_int(value, _default) when is_integer(value) and value > 0, do: value
+  defp positive_int(_value, default), do: default
 
   defp optional_text(attrs, key, default \\ nil)
 
@@ -424,29 +442,67 @@ defmodule Holt.Tasks.TaskMemory do
       nil ->
         default
 
-      value ->
-        text = value |> to_string() |> String.trim()
+      value when is_binary(value) ->
+        text = String.trim(value)
         if text == "", do: default, else: text
+
+      _value ->
+        default
     end
   end
 
   defp optional_text(_attrs, _key, default), do: default
 
-  defp value(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, to_string(key))
-  defp value(_map, _key), do: nil
+  defp canonical_attrs(attrs) do
+    if canonical_value?(attrs) do
+      {:ok, attrs}
+    else
+      {:error, :invalid_task_memory_attrs}
+    end
+  end
 
-  defp string_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {key, value} when is_atom(key) -> {Atom.to_string(key), normalize_value(value)}
-      {key, value} -> {to_string(key), normalize_value(value)}
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      _entry -> false
     end)
   end
 
-  defp string_keys(_value), do: %{}
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
 
-  defp normalize_value(value) when is_map(value), do: string_keys(value)
-  defp normalize_value(value) when is_list(value), do: Enum.map(value, &normalize_value/1)
-  defp normalize_value(value), do: value
+  defp reject_obsolete_attrs(attrs, replacements) do
+    Enum.reduce_while(replacements, :ok, fn {key, replacement}, :ok ->
+      if Map.has_key?(attrs, key) do
+        {:halt, {:error, {:obsolete_task_memory_attr, key, replacement}}}
+      else
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  defp list_value(value) when is_list(value), do: value
+  defp list_value(_value), do: []
+
+  defp map_value(value) when is_map(value), do: value
+  defp map_value(_value), do: %{}
+
+  defp text_value(value, _default) when is_binary(value) and value != "", do: value
+  defp text_value(_value, default), do: default
+
+  defp text_field(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) -> value
+      _value -> ""
+    end
+  end
+
+  defp summary_title(row, title_key) do
+    case text_value(row[title_key], "") do
+      "" -> text_value(row["kind"], "item")
+      title -> title
+    end
+  end
 
   defp reject_empty(map) do
     map

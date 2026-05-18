@@ -30,7 +30,7 @@ defmodule Holt.Gateway do
   @impl true
   def init(opts) do
     state = %{
-      "schema_version" => "holtworks_gateway/v1",
+      "schema_version" => "holt_gateway/v1",
       "status" => "running",
       "transport" => "in_process",
       "bind" => "none",
@@ -83,7 +83,7 @@ defmodule Holt.Gateway do
     home
     |> Paths.gateway_status_path()
     |> JSON.read(%{
-      "schema_version" => "holtworks_gateway/v1",
+      "schema_version" => "holt_gateway/v1",
       "status" => "stopped",
       "transport" => "in_process",
       "bind" => "none",

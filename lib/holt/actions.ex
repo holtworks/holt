@@ -2,189 +2,206 @@ defmodule Holt.Actions do
   @moduledoc """
   Executable action registry for local Holt providers.
 
-  This module is the boundary between declared tool metadata and actual local
-  execution. Task actions are always routed through the task tool router before
-  dispatch, and workspace actions keep using the existing `Holt.Tools`
+  This module is the boundary between declared action metadata and actual local
+  execution. Task actions are always routed through the task action router before
+  dispatch, and workspace actions keep using the existing `Holt.LocalActions`
   approval policy.
   """
 
-  alias Holt.{Clock, Pages, Tools}
-  alias Holt.Actions.{ProviderRegistry, ToolCatalog}
+  alias Holt.{Clock, Pages, LocalActions}
+  alias Holt.Actions.{ProviderRegistry, ActionCatalog, Execution, Todos}
 
   alias Holt.Tasks.{
     ActionContract,
-    RuntimeContracts,
-    TaskToolRouter,
-    TaskToolSession
+    ActionRouter,
+    ActionSession
   }
 
-  @definition_schema "holtworks_action_definition/v1"
-  @execution_schema "holtworks_action_execution/v1"
-  @tool_schema "holtworks_tool_schema/v1"
+  @definition_schema "holt_action_definition/v1"
+  @action_schema "holt_action_schema/v1"
   @safe_routed_scopes ~w(read_only session_ephemeral)
 
   def definitions(opts \\ []) do
-    session = option(opts, :task_tool_session) || TaskToolSession.build(%{})
+    session =
+      case option(opts, :action_session) do
+        nil -> ActionSession.build(%{})
+        value -> value
+      end
 
-    TaskToolSession.direct_tool_names()
-    |> Kernel.++(TaskToolSession.meta_tool_names())
+    ActionSession.direct_action_names()
+    |> Kernel.++(ActionSession.meta_action_names())
     |> Enum.uniq()
     |> Enum.sort()
     |> Enum.map(&definition(&1, session))
   end
 
   def get(name, opts \\ []) do
-    normalized = normalize_tool_name(name)
+    normalized = normalize_action_name(name)
     Enum.find(definitions(opts), &(&1["name"] == normalized))
   end
 
   def search(filters \\ %{}, opts \\ []) do
-    filters = RuntimeContracts.string_keys(filters)
-    names = RuntimeContracts.normalize_string_list(RuntimeContracts.value(filters, "names"))
-
-    providers =
-      RuntimeContracts.normalize_string_list(RuntimeContracts.value(filters, "providers"))
-
-    toolkits = RuntimeContracts.normalize_string_list(RuntimeContracts.value(filters, "toolkits"))
-
-    effect_scopes =
-      RuntimeContracts.normalize_string_list(RuntimeContracts.value(filters, "effect_scopes"))
-
-    definitions(opts)
-    |> filter_exact("name", names)
-    |> filter_exact("provider", providers)
-    |> filter_exact("toolkit", toolkits)
-    |> filter_exact("effect_scope", effect_scopes)
+    if canonical_map?(filters) do
+      definitions(opts)
+      |> filter_exact("name", string_list(Map.get(filters, "names")))
+      |> filter_exact("provider", string_list(Map.get(filters, "providers")))
+      |> filter_exact("action_group", string_list(Map.get(filters, "action_groups")))
+      |> filter_exact("effect_scope", string_list(Map.get(filters, "effect_scopes")))
+    else
+      []
+    end
   end
 
-  def agent_tool_catalog(context \\ %{}, opts \\ []) do
+  def agent_action_catalog(context \\ %{}, opts \\ []) do
     {context, opts} = normalize_catalog_args(context, opts)
 
     context
     |> catalog_definitions(opts)
-    |> ToolCatalog.action_entries(context, "agent", opts)
+    |> ActionCatalog.action_entries(context, "agent", opts)
   end
 
-  def tool_catalog(context \\ %{}, opts \\ []) do
-    agent_tool_catalog(context, opts)
+  def action_catalog(context \\ %{}, opts \\ []) do
+    agent_action_catalog(context, opts)
   end
 
-  def mcp_tool_catalog(context \\ %{}, opts \\ []) do
+  def provider_action_catalog(context \\ %{}, opts \\ []) do
     {context, opts} = normalize_catalog_args(context, opts)
 
     context
     |> catalog_definitions(opts)
-    |> ToolCatalog.action_entries(context, "mcp", opts)
+    |> ActionCatalog.action_entries(context, "mcp", opts)
   end
 
-  def agent_tool_definitions(context \\ %{}, opts \\ []) do
+  def agent_action_definitions(context \\ %{}, opts \\ []) do
     context
-    |> agent_tool_catalog(opts)
-    |> ToolCatalog.openai_tools()
+    |> agent_action_catalog(opts)
+    |> ActionCatalog.openai_action_definitions()
   end
 
-  def mcp_tool_definitions(context \\ %{}, opts \\ []) do
+  def provider_action_definitions(context \\ %{}, opts \\ []) do
     context
-    |> mcp_tool_catalog(opts)
-    |> ToolCatalog.mcp_tools()
+    |> provider_action_catalog(opts)
+    |> ActionCatalog.mcp_action_definitions()
   end
 
   def action_providers(context \\ %{}, opts \\ []) do
-    {context, opts} = normalize_catalog_args(context, opts)
     ProviderRegistry.for_context(context, opts)
   end
 
   def action_provider_ids(context \\ %{}, opts \\ []) do
-    context
-    |> action_providers(opts)
-    |> Enum.map(& &1["id"])
-    |> Enum.sort()
+    case action_providers(context, opts) do
+      providers when is_list(providers) ->
+        providers
+        |> Enum.map(& &1["id"])
+        |> Enum.sort()
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
-  def tool_provider_metadata(context \\ %{}, opts \\ []) do
-    {context, opts} = normalize_catalog_args(context, opts)
+  def action_provider_metadata(context \\ %{}, opts \\ []) do
+    context_for_definitions =
+      case context do
+        %{} -> context
+        _context -> %{}
+      end
 
-    context
+    context_for_definitions
     |> catalog_definitions(opts)
     |> ProviderRegistry.metadata(context, opts)
   end
 
   def action_provider_prompt_sections(context \\ %{}, opts \\ []) do
-    {context, opts} = normalize_catalog_args(context, opts)
     ProviderRegistry.prompt_sections(context, opts)
   end
 
-  def dispatch_agent_tool(tool_name, params, context \\ %{}, opts \\ [])
+  def dispatch_agent_action(action_name, params, context \\ %{}, opts \\ [])
 
-  def dispatch_agent_tool(tool_name, params, context, opts)
-      when is_binary(tool_name) and is_map(params) do
+  def dispatch_agent_action(action_name, params, context, opts)
+      when is_binary(action_name) and is_map(params) do
     {context, opts} = normalize_catalog_args(context, opts)
 
-    case ToolCatalog.find_entry(agent_tool_catalog(context, opts), tool_name) do
-      {:ok, entry} ->
-        params =
-          params
-          |> RuntimeContracts.string_keys()
-          |> maybe_put_context_task_ref(context)
+    with :ok <- ensure_canonical_map(params),
+         {:ok, entry} <-
+           ActionCatalog.find_entry(agent_action_catalog(context, opts), action_name) do
+      params = maybe_put_context_task_ref(params, context)
 
-        execute(entry["action_name"], params, opts)
-
+      execute(entry["name"], params, opts)
+    else
       {:error, :not_found} ->
         {:error, :not_found}
+
+      {:error, :invalid_action_arguments} ->
+        {:error, :invalid_action_arguments}
     end
   end
 
-  def dispatch_agent_tool(_tool_name, _params, _context, _opts), do: {:error, :not_found}
+  def dispatch_agent_action(_action_name, _params, _context, _opts), do: {:error, :not_found}
 
   def execute(name, args \\ %{}, opts \\ [])
 
   def execute(name, args, opts) when is_map(args) do
-    args = RuntimeContracts.string_keys(args)
-    tool_name = normalize_tool_name(name)
+    case ensure_canonical_map(args) do
+      :ok ->
+        action_name = normalize_action_name(name)
 
-    cond do
-      is_nil(tool_name) ->
-        {:error, failed_execution(nil, args, nil, :tool_name_required)}
+        cond do
+          is_nil(action_name) ->
+            {:error, failed_execution(nil, args, nil, :action_required)}
 
-      repair_tool?(tool_name) ->
-        execute_workspace_action(tool_name, args, opts)
+          repair_action?(action_name) ->
+            execute_workspace_action(action_name, args, opts)
 
-      workspace_tool?(tool_name) and task_ref(args) in [nil, ""] ->
-        execute_workspace_action(tool_name, args, opts)
+          workspace_only_action?(action_name) ->
+            with :ok <- reject_workspace_task_scope_args(args) do
+              execute_workspace_action(action_name, args, opts)
+            else
+              {:error, reason} -> {:error, failed_execution(action_name, args, nil, reason)}
+            end
 
-      tool_name == "list_tasks" and task_ref(args) in [nil, ""] ->
-        route_and_dispatch(nil, tool_name, args, opts)
+          workspace_action?(action_name) and blank?(task_ref(args)) ->
+            execute_workspace_action(action_name, args, opts)
 
-      tool_name == "create_task" and task_ref(args) in [nil, ""] ->
-        route_and_dispatch(nil, tool_name, args, opts)
+          action_name == "list_tasks" and blank?(task_ref(args)) ->
+            route_and_dispatch(nil, action_name, args, opts)
 
-      tool_name == "watchdog_agent_runs" and task_ref(args) in [nil, ""] ->
-        route_and_dispatch(nil, tool_name, args, opts)
+          action_name == "create_task" and blank?(task_ref(args)) ->
+            route_and_dispatch(nil, action_name, args, opts)
 
-      tool_name == "capability_registry" and task_ref(args) in [nil, ""] ->
-        route_and_dispatch(nil, tool_name, args, opts)
+          action_name == "watchdog_agent_runs" and blank?(task_ref(args)) ->
+            route_and_dispatch(nil, action_name, args, opts)
 
-      tool_name in ["manage_connection", "use_workbench"] and task_ref(args) in [nil, ""] ->
-        route_and_dispatch(nil, tool_name, args, opts)
+          action_name == "capability_registry" and blank?(task_ref(args)) ->
+            route_and_dispatch(nil, action_name, args, opts)
 
-      true ->
-        case task_ref(args) do
-          nil -> {:error, failed_execution(tool_name, args, nil, :task_ref_required)}
-          ref -> execute_task_tool(ref, tool_name, drop_ref_args(args), opts)
+          action_name in ["manage_connection", "use_workbench"] and blank?(task_ref(args)) ->
+            route_and_dispatch(nil, action_name, args, opts)
+
+          true ->
+            case task_ref(args) do
+              nil -> {:error, failed_execution(action_name, args, nil, :task_ref_required)}
+              ref -> execute_task_action(ref, action_name, drop_ref_args(args), opts)
+            end
         end
+
+      {:error, :invalid_action_arguments} ->
+        {:error, :invalid_action_arguments}
     end
   end
 
   def execute(_name, _args, _opts), do: {:error, :invalid_action_arguments}
 
-  def execute_task_tool(ref_or_id, tool_name, args \\ %{}, opts \\ [])
+  def execute_task_action(ref_or_id, action_name, args \\ %{}, opts \\ [])
 
-  def execute_task_tool(ref_or_id, tool_name, args, opts) when is_map(args) do
-    args = RuntimeContracts.string_keys(args)
-    route_and_dispatch(ref_or_id, normalize_tool_name(tool_name), args, opts)
+  def execute_task_action(ref_or_id, action_name, args, opts) when is_map(args) do
+    case ensure_canonical_map(args) do
+      :ok -> route_and_dispatch(ref_or_id, normalize_action_name(action_name), args, opts)
+      {:error, :invalid_action_arguments} -> {:error, :invalid_action_arguments}
+    end
   end
 
-  def execute_task_tool(_ref_or_id, _tool_name, _args, _opts),
+  def execute_task_action(_ref_or_id, _action_name, _args, _opts),
     do: {:error, :invalid_action_arguments}
 
   def execute_many(ref_or_id, calls, opts \\ [])
@@ -192,20 +209,42 @@ defmodule Holt.Actions do
   def execute_many(ref_or_id, calls, opts) when is_list(calls) do
     calls
     |> Enum.reduce_while({:ok, []}, fn call, {:ok, executions} ->
-      call = RuntimeContracts.string_keys(call)
-      tool_name = RuntimeContracts.text(call, "tool_name", RuntimeContracts.text(call, "name"))
-      args = RuntimeContracts.normalize_map(RuntimeContracts.value(call, "arguments"))
+      action_call = action_call(call)
 
-      case execute_task_tool(ref_or_id, tool_name, args, opts) do
-        {:ok, execution} ->
-          {:cont, {:ok, [execution | executions]}}
+      case required_value(action_call, "action") do
+        {:ok, action_name} ->
+          case action_call_arguments(action_call) do
+            {:ok, args} ->
+              case execute_task_action(ref_or_id, action_name, args, opts) do
+                {:ok, execution} ->
+                  {:cont, {:ok, [execution | executions]}}
 
-        {:error, %{} = execution} ->
-          {:halt, {:error, Enum.reverse([execution | executions])}}
+                {:error, %{} = execution} ->
+                  {:halt, {:error, Enum.reverse([execution | executions])}}
+
+                {:error, reason} ->
+                  {:halt,
+                   {:error,
+                    Enum.reverse([failed_execution(action_name, args, nil, reason) | executions])}}
+              end
+
+            {:error, reason} ->
+              {:halt,
+               {:error,
+                Enum.reverse([failed_execution(action_name, %{}, nil, reason) | executions])}}
+          end
 
         {:error, reason} ->
-          {:halt,
-           {:error, Enum.reverse([failed_execution(tool_name, args, nil, reason) | executions])}}
+          reason =
+            case reason do
+              {:missing_required, "action"} ->
+                {:missing_required_arguments, ["action"], ["action"], received_arguments(call)}
+
+              other ->
+                other
+            end
+
+          {:halt, {:error, Enum.reverse([failed_execution(nil, call, nil, reason) | executions])}}
       end
     end)
     |> case do
@@ -216,29 +255,34 @@ defmodule Holt.Actions do
 
   def execute_many(_ref_or_id, _calls, _opts), do: {:error, :invalid_action_batch}
 
-  defp definition(tool_name, session) do
-    effect_scope = ActionContract.effect_scope(tool_name)
-    tool = Tools.get(tool_name) || %{}
+  defp definition(action_name, session) do
+    effect_scope = ActionContract.effect_scope(action_name)
+
+    action =
+      case LocalActions.get(action_name) do
+        nil -> %{}
+        value -> value
+      end
 
     %{
       "schema_version" => @definition_schema,
-      "name" => tool_name,
-      "description" => description(tool_name, tool),
-      "provider" => provider(tool_name, effect_scope),
-      "toolkit" => toolkit(tool_name, effect_scope),
+      "name" => action_name,
+      "description" => description(action_name, action),
+      "provider" => provider(action_name, effect_scope),
+      "action_group" => action_group(action_name, effect_scope),
       "effect_scope" => effect_scope,
-      "risk_level" => risk_level(tool, effect_scope),
+      "risk_level" => risk_level(action, effect_scope),
       "requires_approval" =>
         ActionContract.requires_approval?(%{
           "effect_scope" => effect_scope,
-          "risk_level" => risk_level(tool, effect_scope)
+          "risk_level" => risk_level(action, effect_scope)
         }),
-      "requires_task_ref" => requires_task_ref?(tool_name, effect_scope),
-      "arguments_schema" => arguments_schema(tool_name),
-      "availability" => availability(tool_name, session),
+      "requires_task_ref" => requires_task_ref?(action_name, effect_scope),
+      "arguments_schema" => arguments_schema(action_name),
+      "availability" => availability(action_name, session),
       "source" => "builtin"
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp filter_exact(definitions, _field, []), do: definitions
@@ -248,35 +292,40 @@ defmodule Holt.Actions do
     Enum.filter(definitions, &MapSet.member?(allowed, Map.get(&1, field)))
   end
 
-  defp availability(tool_name, session) do
+  defp availability(action_name, session) do
+    declared_direct? =
+      action_name in Map.get(session, "direct_actions", [])
+
+    declared_meta? =
+      action_name in meta_action_names(session)
+
     %{
       "route_status" =>
-        if(TaskToolRouter.allowed?(tool_name, session), do: "accepted", else: "unavailable"),
-      "declared_in_session" =>
-        tool_name in (session["direct_tools"] || []) or tool_name in meta_tool_names(session)
+        if(ActionRouter.allowed?(action_name, session), do: "accepted", else: "unavailable"),
+      "declared_in_session" => if(declared_direct?, do: true, else: declared_meta?)
     }
   end
 
-  defp meta_tool_names(session) do
+  defp meta_action_names(session) do
     session
-    |> Map.get("meta_tools", [])
+    |> Map.get("meta_actions", [])
     |> Enum.map(fn
       %{"name" => name} -> name
-      _tool -> nil
+      _action -> nil
     end)
     |> Enum.reject(&is_nil/1)
   end
 
   defp catalog_definitions(context, opts) do
-    context = RuntimeContracts.string_keys(context || %{})
+    context = catalog_context(context)
 
     session =
-      case RuntimeContracts.value(context, "task_tool_session") || opts[:task_tool_session] do
-        session when is_map(session) -> RuntimeContracts.string_keys(session)
-        _missing -> TaskToolSession.build(context)
+      case catalog_session_source(context, opts) do
+        session when is_map(session) -> session
+        _missing -> ActionSession.build(context)
       end
 
-    definitions(Keyword.put(opts, :task_tool_session, session))
+    definitions(Keyword.put(opts, :action_session, session))
   end
 
   defp normalize_catalog_args(context, opts) when is_list(context) and opts == [] do
@@ -284,20 +333,17 @@ defmodule Holt.Actions do
   end
 
   defp normalize_catalog_args(context, opts) do
-    {RuntimeContracts.string_keys(context || %{}), opts}
+    {catalog_context(context), opts}
   end
 
   defp maybe_put_context_task_ref(params, context) do
-    context_ref =
-      RuntimeContracts.text(context, "ref") ||
-        RuntimeContracts.text(context, "task_ref") ||
-        RuntimeContracts.text(context, "task_id")
+    context_ref = text(context, "task_ref")
 
     cond do
-      task_ref(params) not in [nil, ""] ->
+      present_text?(params, "ref") ->
         params
 
-      context_ref in [nil, ""] ->
+      blank?(context_ref) ->
         params
 
       true ->
@@ -305,50 +351,59 @@ defmodule Holt.Actions do
     end
   end
 
-  defp execute_workspace_action(tool_name, args, opts) do
-    route = TaskToolRouter.route(%{"tool_name" => tool_name, "arguments" => args})
+  defp execute_workspace_action(action_name, args, opts) do
+    with :ok <- ensure_required_arguments(action_name, args) do
+      route = ActionRouter.route(%{"action" => action_name, "arguments" => args})
 
-    case Tools.execute(tool_name, args, opts) do
-      {:ok, result} -> {:ok, completed_execution(tool_name, args, route, result)}
-      {:error, reason} -> {:error, failed_execution(tool_name, args, route, reason)}
+      case LocalActions.execute(action_name, args, opts) do
+        {:ok, result} -> {:ok, completed_execution(action_name, args, route, result)}
+        {:error, reason} -> {:error, failed_execution(action_name, args, route, reason)}
+      end
+    else
+      {:error, reason} -> {:error, failed_execution(action_name, args, nil, reason)}
     end
   end
 
-  defp route_and_dispatch(ref_or_id, tool_name, args, opts) do
-    with {:ok, route} <- route_action(ref_or_id, tool_name, args, opts),
+  defp route_and_dispatch(ref_or_id, action_name, args, opts) do
+    with :ok <- reject_legacy_context_keys(args),
+         :ok <- ensure_required_arguments(action_name, args),
+         {:ok, route} <- route_action(ref_or_id, action_name, args, opts),
          :ok <- ensure_route_accepted(route),
-         {:ok, result} <- dispatch(ref_or_id, tool_name, args, opts) do
-      {:ok, completed_execution(tool_name, args, route, result)}
+         {:ok, result} <- dispatch(ref_or_id, action_name, args, opts) do
+      {:ok, completed_execution(action_name, args, route, result)}
     else
       {:rejected, route} ->
-        {:error, rejected_execution(tool_name, args, route)}
+        {:error, rejected_execution(action_name, args, route)}
 
       {:error, %{} = execution} ->
         {:error, execution}
 
+      {:error, {:missing_required_arguments, _missing, _required, _received} = reason} ->
+        {:error, failed_execution(action_name, args, nil, reason)}
+
       {:error, reason} ->
         route =
-          case route_action(ref_or_id, tool_name, args, opts) do
+          case route_action(ref_or_id, action_name, args, opts) do
             {:ok, route} -> route
             _other -> nil
           end
 
-        {:error, failed_execution(tool_name, args, route, reason)}
+        {:error, failed_execution(action_name, args, route, reason)}
     end
   end
 
-  defp route_action(ref_or_id, tool_name, args, opts) do
+  defp route_action(ref_or_id, action_name, args, opts) do
     attrs =
       args
       |> route_attrs()
-      |> Map.put("tool_name", tool_name)
+      |> Map.put("action", action_name)
       |> Map.put("arguments", action_arguments(args))
-      |> Map.put_new("tool_call_id", Clock.id("tool_call"))
+      |> Map.put_new("action_call_id", Clock.id("action_call"))
 
     if ref_or_id in [nil, ""] do
-      {:ok, TaskToolRouter.route(attrs)}
+      {:ok, ActionRouter.route(attrs)}
     else
-      Holt.Tasks.route_task_tool(ref_or_id, attrs, opts)
+      Holt.Tasks.route_action(ref_or_id, attrs, opts)
     end
   end
 
@@ -368,64 +423,62 @@ defmodule Holt.Actions do
     do: Holt.Tasks.update(ref, action_arguments(args), opts)
 
   defp dispatch(ref, "set_priority", args, opts) do
-    with {:ok, priority} <- required_any(args, ["priority"]) do
+    with {:ok, priority} <- args |> action_arguments() |> required_value("priority") do
       Holt.Tasks.set_priority(ref, priority, opts)
     end
   end
 
   defp dispatch(ref, "set_estimate", args, opts) do
-    with {:ok, estimate} <- required_any(args, ["estimate"]) do
+    with {:ok, estimate} <- args |> action_arguments() |> required_value("estimate") do
       Holt.Tasks.set_estimate(ref, estimate, opts)
     end
   end
 
   defp dispatch(_ref, "todo_read", args, _opts) do
-    {:ok, todo_read_state(args)}
+    {:ok, Todos.read(args)}
   end
 
   defp dispatch(_ref, "todo_write", args, _opts) do
-    with {:ok, todos} <- todo_write_todos(args) do
-      {:ok, todo_state(todos, "updated")}
-    end
+    Todos.write(args)
   end
 
   defp dispatch(ref, "add_comment", args, opts) do
-    with {:ok, body} <- required_any(args, ["body", "comment", "text", "content"]) do
+    with {:ok, body} <- args |> action_arguments() |> required_value("body") do
       Holt.Tasks.add_comment(ref, body, opts)
     end
   end
 
   defp dispatch(ref, "delete_comment", args, opts) do
-    with {:ok, comment_id} <- required_any(args, ["comment_id", "id"]) do
+    with {:ok, comment_id} <- args |> action_arguments() |> required_value("comment_id") do
       Holt.Tasks.delete_comment(ref, comment_id, opts)
     end
   end
 
   defp dispatch(ref, "add_label", args, opts) do
-    label_args =
-      args
-      |> action_arguments()
-      |> maybe_put_from(args, "name", ["name", "label"])
+    label_args = action_arguments(args)
 
-    Holt.Tasks.add_label(ref, label_args, opts)
+    with {:ok, _name} <- required_value(label_args, "name") do
+      Holt.Tasks.add_label(ref, label_args, opts)
+    end
   end
 
   defp dispatch(ref, "remove_label", args, opts) do
-    with {:ok, name} <- required_any(args, ["name", "label"]) do
+    with {:ok, name} <- args |> action_arguments() |> required_value("name") do
       Holt.Tasks.remove_label(ref, name, opts)
     end
   end
 
   defp dispatch(ref, "add_link", args, opts) do
-    with {:ok, target_ref} <-
-           required_any(args, ["target_ref", "target_task_id", "target_id", "target"]),
-         type = RuntimeContracts.text(args, "type", "relates_to") do
+    link_args = action_arguments(args)
+
+    with {:ok, target_ref} <- required_value(link_args, "target_ref"),
+         type = text(link_args, "type", "relates_to") do
       Holt.Tasks.add_link(ref, target_ref, type, opts)
     end
   end
 
   defp dispatch(ref, "remove_link", args, opts) do
-    with {:ok, link_id} <- required_any(args, ["link_id", "id"]) do
+    with {:ok, link_id} <- args |> action_arguments() |> required_value("link_id") do
       Holt.Tasks.remove_link(ref, link_id, opts)
     end
   end
@@ -435,7 +488,7 @@ defmodule Holt.Actions do
   end
 
   defp dispatch(_ref, "get_task_spec", args, opts) do
-    with {:ok, spec_id} <- required_any(args, ["spec_id", "id"]) do
+    with {:ok, spec_id} <- args |> action_arguments() |> required_value("spec_id") do
       Holt.Tasks.get_spec(spec_id, spec_opts(args, opts))
     end
   end
@@ -444,7 +497,7 @@ defmodule Holt.Actions do
     do: Holt.Tasks.save_spec(ref, action_arguments(args), opts)
 
   defp dispatch(_ref, "read_task_memory_artifact", args, opts) do
-    with {:ok, artifact_ref} <- required_any(args, ["artifact_ref", "spec_id", "id"]) do
+    with {:ok, artifact_ref} <- args |> action_arguments() |> required_value("artifact_ref") do
       Holt.Tasks.read_memory_artifact(artifact_ref, opts)
     end
   end
@@ -473,8 +526,17 @@ defmodule Holt.Actions do
   defp dispatch(ref, "start_agent_work", args, opts),
     do: Holt.Tasks.start_agent_work(ref, action_arguments(args), opts)
 
+  defp dispatch(ref, "delegate_to_agent", args, opts),
+    do: Holt.Tasks.delegate_to_agent(ref, action_arguments(args), opts)
+
+  defp dispatch(ref, "invoke_agent", args, opts),
+    do: Holt.Tasks.invoke_agent(ref, action_arguments(args, keep_agent_id: true), opts)
+
   defp dispatch(ref, "continue_agent_work", args, opts),
     do: Holt.Tasks.continue_agent_work(ref, action_arguments(args), opts)
+
+  defp dispatch(ref, "schedule_mob_colleague_flow", args, opts),
+    do: Holt.Tasks.schedule_mob_colleague_flow(ref, action_arguments(args), opts)
 
   defp dispatch(_ref, "watchdog_agent_runs", args, opts) do
     {:ok, Holt.Tasks.watchdog_scan(watchdog_opts(args, opts))}
@@ -486,35 +548,32 @@ defmodule Holt.Actions do
   defp dispatch(ref, "list_task_graphs", _args, opts), do: Holt.Tasks.task_graphs(ref, opts)
 
   defp dispatch(_ref, "get_task_graph", args, opts) do
-    with {:ok, graph_id} <- required_any(args, ["graph_id", "task_graph_id", "id"]) do
+    with {:ok, graph_id} <- args |> action_arguments() |> required_value("graph_id") do
       Holt.Tasks.get_task_graph(graph_id, opts)
     end
   end
 
   defp dispatch(_ref, "advance_task_graph", args, opts) do
-    with {:ok, graph_id} <- required_any(args, ["graph_id", "task_graph_id", "id"]) do
+    graph_args = action_arguments(args)
+
+    with {:ok, graph_id} <- required_value(graph_args, "graph_id") do
       Holt.Tasks.advance_task_graph(
         graph_id,
-        Map.drop(action_arguments(args), ["graph_id", "task_graph_id", "id"]),
+        Map.delete(graph_args, "graph_id"),
         opts
       )
     end
   end
 
   defp dispatch(_ref, "complete_task_graph_node", args, opts) do
-    with {:ok, graph_id} <- required_any(args, ["graph_id", "task_graph_id", "id"]),
-         {:ok, node_ref} <- required_any(args, ["node_ref", "node_id", "node_key"]) do
+    graph_args = action_arguments(args)
+
+    with {:ok, graph_id} <- required_value(graph_args, "graph_id"),
+         {:ok, node_ref} <- required_value(graph_args, "node_ref") do
       Holt.Tasks.complete_task_graph_node(
         graph_id,
         node_ref,
-        Map.drop(action_arguments(args), [
-          "graph_id",
-          "task_graph_id",
-          "id",
-          "node_ref",
-          "node_id",
-          "node_key"
-        ]),
+        Map.drop(graph_args, ["graph_id", "node_ref"]),
         opts
       )
     end
@@ -587,8 +646,8 @@ defmodule Holt.Actions do
   end
 
   defp dispatch(_ref, "capability_registry", args, _opts) do
-    with {:ok, tool_name} <- required_any(args, ["tool_name", "name", "tool"]) do
-      Holt.Tasks.capability_registry(tool_name, action_arguments(args))
+    with {:ok, action_name} <- required_value(args, "action") do
+      Holt.Tasks.capability_registry(action_name, action_arguments(args))
     end
   end
 
@@ -605,10 +664,12 @@ defmodule Holt.Actions do
     do: Holt.Tasks.action_approval_request(ref, action_arguments(args), opts)
 
   defp dispatch(_ref, "resolve_action_approval_request", args, opts) do
-    with {:ok, request_id} <- required_any(args, ["approval_request_id", "request_id", "id"]) do
+    approval_args = action_arguments(args)
+
+    with {:ok, request_id} <- required_value(approval_args, "approval_request_id") do
       Holt.Tasks.resolve_action_approval_request(
         request_id,
-        Map.drop(action_arguments(args), ["approval_request_id", "request_id", "id"]),
+        Map.delete(approval_args, "approval_request_id"),
         opts
       )
     end
@@ -617,15 +678,15 @@ defmodule Holt.Actions do
   defp dispatch(ref, "action_evidence_ledger", args, opts),
     do: Holt.Tasks.action_evidence_ledger(ref, action_arguments(args), opts)
 
-  defp dispatch(_ref, "search_tools", args, opts) do
+  defp dispatch(_ref, "search_actions", args, opts) do
     {:ok, %{"actions" => search(action_arguments(args), opts)}}
   end
 
-  defp dispatch(_ref, "get_tool_schema", args, opts) do
-    with {:ok, tool_name} <- required_any(args, ["tool_name", "name", "tool"]) do
-      case get(tool_name, opts) do
-        nil -> {:error, :unknown_tool}
-        action -> {:ok, %{"schema_version" => @tool_schema, "action" => action}}
+  defp dispatch(_ref, "get_action_schema", args, opts) do
+    with {:ok, action_name} <- required_value(args, "action") do
+      case get(action_name, opts) do
+        nil -> {:error, :unknown_action}
+        action -> {:ok, %{"schema_version" => @action_schema, "action" => action}}
       end
     end
   end
@@ -636,55 +697,45 @@ defmodule Holt.Actions do
 
   defp dispatch(ref, "use_workbench", args, opts) do
     session = session_from_args(args)
-    workbench = RuntimeContracts.normalize_map(session["workbench"])
+    workbench = map_value(Map.get(session, "workbench"))
     action_args = action_arguments(args)
 
-    tool_name =
-      RuntimeContracts.text(
-        args,
-        "tool_name",
-        RuntimeContracts.text(
-          action_args,
-          "tool_name",
-          RuntimeContracts.text(action_args, "name")
-        )
-      )
+    with :ok <- reject_legacy_action_keys(args),
+         {:ok, nested_args} <- workbench_action_args(action_args),
+         :ok <- ensure_workbench_enabled(workbench) do
+      case text(args, "action") do
+        nil ->
+          {:ok, workbench_state(session, "available")}
 
-    tool_args = workbench_tool_args(action_args)
+        "" ->
+          {:ok, workbench_state(session, "available")}
 
-    cond do
-      workbench["enabled"] != true ->
-        {:error, :workbench_disabled}
+        action_name ->
+          case execute_safe_nested_action(ref, action_name, nested_args, opts) do
+            {:ok, execution} ->
+              {:ok,
+               session
+               |> workbench_state("executed")
+               |> Map.put("action_execution", execution)}
 
-      tool_name in [nil, ""] ->
-        {:ok, workbench_state(session, "available")}
-
-      true ->
-        case execute_safe_nested_tool(ref, tool_name, tool_args, opts) do
-          {:ok, execution} ->
-            {:ok,
-             session
-             |> workbench_state("executed")
-             |> Map.put("tool_execution", execution)}
-
-          error ->
-            error
-        end
+            error ->
+              error
+          end
+      end
     end
   end
 
-  defp dispatch(ref, "execute_tool", args, opts) do
-    with {:ok, nested_tool} <- required_any(args, ["tool_name", "name", "tool"]) do
-      nested_args = RuntimeContracts.normalize_map(RuntimeContracts.value(args, "arguments"))
-      execute_safe_nested_tool(ref, nested_tool, nested_args, opts)
+  defp dispatch(ref, "execute_action", args, opts) do
+    with {:ok, nested_action} <- required_value(args, "action"),
+         {:ok, nested_args} <- required_map(args, "arguments") do
+      execute_safe_nested_action(ref, nested_action, nested_args, opts)
     end
   end
 
-  defp dispatch(ref, "multi_execute_tool", args, opts) do
-    calls = RuntimeContracts.value(args, "calls") || RuntimeContracts.value(args, "tools")
-
-    with true <- is_list(calls) do
-      case execute_safe_nested_many(ref, calls, opts) do
+  defp dispatch(ref, "multi_execute_action", args, opts) do
+    with {:ok, calls} <- required_value(args, "calls"),
+         true <- is_list(calls) do
+      case execute_safe_nested_many_actions(ref, calls, opts) do
         {:ok, executions} -> {:ok, %{"executions" => executions}}
         {:error, executions} when is_list(executions) -> {:error, failed_batch(executions)}
         {:error, reason} -> {:error, reason}
@@ -694,31 +745,53 @@ defmodule Holt.Actions do
     end
   end
 
-  defp dispatch(_ref, tool_name, args, opts) do
-    if workspace_tool?(tool_name) do
-      Tools.execute(tool_name, action_arguments(args), opts)
+  defp dispatch(_ref, action_name, args, opts) do
+    if workspace_action?(action_name) do
+      LocalActions.execute(action_name, action_arguments(args), opts)
     else
       {:error, :unsupported_action}
     end
   end
 
-  defp execute_safe_nested_many(ref_or_id, calls, opts) when is_list(calls) do
+  defp execute_safe_nested_many_actions(ref_or_id, calls, opts) when is_list(calls) do
     calls
     |> Enum.reduce_while({:ok, []}, fn call, {:ok, executions} ->
-      call = RuntimeContracts.string_keys(call)
-      tool_name = RuntimeContracts.text(call, "tool_name", RuntimeContracts.text(call, "name"))
-      args = RuntimeContracts.normalize_map(RuntimeContracts.value(call, "arguments"))
+      action_call = action_call(call)
 
-      case execute_safe_nested_tool(ref_or_id, tool_name, args, opts) do
-        {:ok, execution} ->
-          {:cont, {:ok, [execution | executions]}}
+      case required_value(action_call, "action") do
+        {:ok, action_name} ->
+          case action_call_arguments(action_call) do
+            {:ok, args} ->
+              case execute_safe_nested_action(ref_or_id, action_name, args, opts) do
+                {:ok, execution} ->
+                  {:cont, {:ok, [execution | executions]}}
 
-        {:error, %{} = execution} ->
-          {:halt, {:error, Enum.reverse([execution | executions])}}
+                {:error, %{} = execution} ->
+                  {:halt, {:error, Enum.reverse([execution | executions])}}
+
+                {:error, reason} ->
+                  {:halt,
+                   {:error,
+                    Enum.reverse([failed_execution(action_name, args, nil, reason) | executions])}}
+              end
+
+            {:error, reason} ->
+              {:halt,
+               {:error,
+                Enum.reverse([failed_execution(action_name, %{}, nil, reason) | executions])}}
+          end
 
         {:error, reason} ->
-          {:halt,
-           {:error, Enum.reverse([failed_execution(tool_name, args, nil, reason) | executions])}}
+          reason =
+            case reason do
+              {:missing_required, "action"} ->
+                {:missing_required_arguments, ["action"], ["action"], received_arguments(call)}
+
+              other ->
+                other
+            end
+
+          {:halt, {:error, Enum.reverse([failed_execution(nil, call, nil, reason) | executions])}}
       end
     end)
     |> case do
@@ -727,26 +800,27 @@ defmodule Holt.Actions do
     end
   end
 
-  defp execute_safe_nested_many(_ref_or_id, _calls, _opts), do: {:error, :invalid_action_batch}
+  defp execute_safe_nested_many_actions(_ref_or_id, _calls, _opts),
+    do: {:error, :invalid_action_batch}
 
-  defp execute_safe_nested_tool(ref_or_id, tool_name, args, opts) do
-    tool_name = normalize_tool_name(tool_name)
+  defp execute_safe_nested_action(ref_or_id, action_name, args, opts) do
+    action_name = normalize_action_name(action_name)
 
-    with :ok <- reject_router_recursion(tool_name),
-         {:ok, route} <- route_action(ref_or_id, tool_name, args, opts),
+    with :ok <- reject_router_recursion(action_name),
+         {:ok, route} <- route_action(ref_or_id, action_name, args, opts),
          :ok <- ensure_route_accepted(route),
          :ok <- ensure_safe_routed_scope(route) do
-      execute_task_tool(ref_or_id, tool_name, args, opts)
+      execute_task_action(ref_or_id, action_name, args, opts)
     else
-      {:rejected, route} -> {:error, rejected_execution(tool_name, args, route)}
+      {:rejected, route} -> {:error, rejected_execution(action_name, args, route)}
       {:error, %{} = execution} -> {:error, execution}
-      {:error, reason} -> {:error, failed_execution(tool_name, args, nil, reason)}
+      {:error, reason} -> {:error, failed_execution(action_name, args, nil, reason)}
     end
   end
 
-  defp reject_router_recursion(tool_name) do
-    if tool_name in TaskToolSession.meta_tool_names() do
-      {:error, :router_meta_tool_recursion}
+  defp reject_router_recursion(action_name) do
+    if action_name in ActionSession.meta_action_names() do
+      {:error, :router_meta_action_recursion}
     else
       :ok
     end
@@ -758,124 +832,94 @@ defmodule Holt.Actions do
     if scope in @safe_routed_scopes do
       :ok
     else
-      {:error, {:unsafe_nested_effect_scope, scope || "unknown"}}
+      {:error, {:unsafe_nested_effect_scope, scope_name(scope)}}
     end
   end
 
-  defp completed_execution(tool_name, args, route, result) do
-    execution_base(tool_name, args, route)
-    |> Map.put("status", "ok")
-    |> Map.put("result", result)
+  defp completed_execution(action_name, args, route, result) do
+    Execution.completed(action_name, args, route, result)
   end
 
-  defp rejected_execution(tool_name, args, route) do
-    execution_base(tool_name, args, route)
-    |> Map.put("status", "rejected")
-    |> Map.put("reason", route["reason"])
+  defp rejected_execution(action_name, args, route) do
+    Execution.rejected(action_name, args, route)
   end
 
-  defp failed_execution(tool_name, args, route, reason) do
-    execution_base(tool_name, args, route)
-    |> Map.put("status", "error")
-    |> Map.put("reason", normalize_reason(reason))
-  end
-
-  defp execution_base(tool_name, args, route) do
-    %{
-      "schema_version" => @execution_schema,
-      "execution_id" => Clock.id("action_execution"),
-      "tool_name" => tool_name,
-      "tool_call_id" => route_value(route, "tool_call_id"),
-      "route" => route,
-      "action_contract" => route_value(route, "action_contract"),
-      "arguments_preview" =>
-        ActionContract.build(%{"tool_name" => tool_name, "arguments" => action_arguments(args)})[
-          "arguments_preview"
-        ],
-      "created_at" => Clock.iso_now()
-    }
-    |> RuntimeContracts.reject_empty()
+  defp failed_execution(action_name, args, route, reason) do
+    Execution.failed(action_name, args, route, reason)
   end
 
   defp failed_batch(executions) do
-    %{
-      "schema_version" => @execution_schema,
-      "execution_id" => Clock.id("action_execution"),
-      "tool_name" => "multi_execute_tool",
-      "status" => "error",
-      "reason" => "batch_stopped",
-      "executions" => executions,
-      "created_at" => Clock.iso_now()
-    }
+    Execution.failed_batch(executions)
   end
-
-  defp route_value(route, key) when is_map(route), do: Map.get(route, key)
-  defp route_value(_route, _key), do: nil
 
   defp task_list_opts(args, opts) do
     opts
-    |> maybe_put_opt(:status, RuntimeContracts.text(args, "status"))
+    |> maybe_put_opt(:status, text(args, "status"))
   end
 
   defp spec_opts(args, opts) do
     opts
-    |> maybe_put_opt(:kind, RuntimeContracts.text(args, "kind"))
-    |> maybe_put_opt(:include_content, RuntimeContracts.value(args, "include_content"))
-    |> maybe_put_opt(:content_limit, RuntimeContracts.value(args, "content_limit"))
-    |> maybe_put_opt(
-      :task_ref,
-      RuntimeContracts.text(
-        args,
-        "ref",
-        RuntimeContracts.text(args, "task_ref", RuntimeContracts.text(args, "task_id"))
-      )
-    )
+    |> maybe_put_opt(:kind, text(args, "kind"))
+    |> maybe_put_opt(:include_content, Map.get(args, "include_content"))
+    |> maybe_put_opt(:content_limit, Map.get(args, "content_limit"))
+    |> maybe_put_opt(:task_ref, text(args, "ref"))
   end
 
   defp teammate_runtime_opts(args, opts) do
     opts
-    |> maybe_put_opt(:content_limit, RuntimeContracts.value(args, "content_limit"))
-    |> maybe_put_opt(:comment_limit, RuntimeContracts.value(args, "comment_limit"))
+    |> maybe_put_opt(:content_limit, Map.get(args, "content_limit"))
+    |> maybe_put_opt(:comment_limit, Map.get(args, "comment_limit"))
   end
 
   defp watchdog_opts(args, opts) do
     opts
-    |> maybe_put_opt(:limit, RuntimeContracts.value(args, "limit"))
-    |> maybe_put_opt(:stale_after_seconds, RuntimeContracts.value(args, "stale_after_seconds"))
+    |> maybe_put_opt(:limit, Map.get(args, "limit"))
+    |> maybe_put_opt(:stale_after_seconds, Map.get(args, "stale_after_seconds"))
     |> maybe_put_opt(
       :recovery_cooldown_seconds,
-      RuntimeContracts.value(args, "recovery_cooldown_seconds")
+      Map.get(args, "recovery_cooldown_seconds")
     )
   end
 
   defp connection_management_state(args) do
     session = session_from_args(args)
     action_args = action_arguments(args)
-    action = RuntimeContracts.text(action_args, "action", "list")
-    toolkit = RuntimeContracts.text(action_args, "toolkit")
-    accounts = RuntimeContracts.normalize_map(session["connected_accounts"])
+    action = text(action_args, "action", "list")
+    action_group = text(action_args, "action_group")
+    accounts = map_value(Map.get(session, "connected_accounts"))
 
     %{
-      "schema_version" => "holtworks_task_connection_management/v1",
-      "tool_session_id" => session["session_id"],
+      "schema_version" => "holt_task_connection_management/v1",
+      "action_session_id" => session["session_id"],
       "action" => action,
-      "toolkit" => toolkit,
-      "connected_accounts" => filter_connected_accounts(accounts, toolkit),
-      "enabled_toolkits" => session["enabled_toolkits"] || [],
+      "action_group" => action_group,
+      "connected_accounts" => filter_connected_accounts(accounts, action_group),
+      "enabled_action_groups" => string_list(Map.get(session, "enabled_action_groups")),
       "status" => connection_management_status(action)
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp filter_connected_accounts(accounts, nil), do: accounts
   defp filter_connected_accounts(accounts, ""), do: accounts
 
-  defp filter_connected_accounts(accounts, toolkit) do
-    case Map.get(accounts, toolkit) do
+  defp filter_connected_accounts(accounts, action_group) do
+    case Map.get(accounts, action_group) do
       nil -> %{}
-      account -> %{toolkit => account}
+      account -> %{action_group => account}
     end
   end
+
+  defp ensure_workbench_enabled(%{"enabled" => true}), do: :ok
+  defp ensure_workbench_enabled(_workbench), do: {:error, :workbench_disabled}
+
+  defp reject_legacy_action_keys(%{"action_name" => _value}),
+    do: {:error, {:unsupported_argument, "action_name"}}
+
+  defp reject_legacy_action_keys(%{"name" => _value}),
+    do: {:error, {:unsupported_argument, "name"}}
+
+  defp reject_legacy_action_keys(_args), do: :ok
 
   defp connection_management_status(action) when action in ["list", "inspect"], do: "listed"
   defp connection_management_status("request"), do: "requires_user_initiated_connection_flow"
@@ -884,203 +928,53 @@ defmodule Holt.Actions do
 
   defp workbench_state(session, status) do
     %{
-      "schema_version" => "holtworks_task_workbench/v1",
-      "tool_session_id" => session["session_id"],
-      "workbench" => session["workbench"] || %{},
+      "schema_version" => "holt_task_workbench/v1",
+      "action_session_id" => session["session_id"],
+      "workbench" => map_value(Map.get(session, "workbench")),
       "status" => status,
       "message" => workbench_message(status)
     }
   end
 
   defp workbench_message("available"),
-    do:
-      "Provide tool_name and arguments to route a read-only or session-ephemeral workbench action."
+    do: "Provide action and arguments to route a read-only or session-ephemeral workbench action."
 
   defp workbench_message("executed"),
-    do: "Workbench action executed through the task tool router."
+    do: "Workbench action executed through the task action router."
 
   defp workbench_message(_status), do: nil
 
-  defp workbench_tool_args(action_args) do
-    case RuntimeContracts.value(action_args, "arguments") do
-      arguments when is_map(arguments) ->
-        RuntimeContracts.string_keys(arguments)
+  defp workbench_action_args(action_args) do
+    case Map.fetch(action_args, "arguments") do
+      {:ok, arguments} when is_map(arguments) ->
+        if canonical_map?(arguments) do
+          {:ok, arguments}
+        else
+          {:error, :invalid_action_arguments}
+        end
 
-      _value ->
-        Map.drop(action_args, ["tool_name", "name", "tool"])
+      {:ok, _value} ->
+        {:error, :invalid_action_arguments}
+
+      :error ->
+        {:ok, Map.drop(action_args, ["action"])}
     end
   end
 
   defp session_from_args(args) do
-    case RuntimeContracts.value(args, "task_tool_session") ||
-           RuntimeContracts.value(args, "session") do
-      session when is_map(session) -> TaskToolSession.build(session)
-      _missing -> TaskToolSession.build(args)
+    case Map.get(args, "action_session") do
+      session when is_map(session) -> ActionSession.build(session)
+      _missing -> ActionSession.build(args)
     end
   end
 
-  defp todo_read_state(args) do
-    args
-    |> todo_read_source()
-    |> normalize_read_todos()
-    |> todo_state("read")
-  end
+  defp reject_legacy_context_keys(%{"session" => _value}),
+    do: {:error, {:unsupported_argument, "session"}}
 
-  defp todo_state(todos, action) do
-    %{
-      "schema_version" => "holtworks_todo_state/v1",
-      "action" => action,
-      "status" => if(action == "read", do: "read", else: "updated"),
-      "count" => length(todos),
-      "text" => format_todos(todos),
-      "todos" => todos
-    }
-  end
+  defp reject_legacy_context_keys(%{"task_graph_id" => _value}),
+    do: {:error, {:unsupported_argument, "task_graph_id"}}
 
-  defp todo_read_source(args) do
-    action_args = action_arguments(args)
-
-    cond do
-      is_list(RuntimeContracts.value(action_args, "todos")) ->
-        RuntimeContracts.value(action_args, "todos")
-
-      is_list(RuntimeContracts.value(action_args, "items")) ->
-        RuntimeContracts.value(action_args, "items")
-
-      RuntimeContracts.text(action_args, "content") not in [nil, ""] ->
-        [action_args]
-
-      RuntimeContracts.text(action_args, "todo") not in [nil, ""] ->
-        [Map.put(action_args, "content", RuntimeContracts.text(action_args, "todo"))]
-
-      is_list(get_in(args, ["task_tool_session", "todos"])) ->
-        get_in(args, ["task_tool_session", "todos"])
-
-      is_list(get_in(args, ["session", "todos"])) ->
-        get_in(args, ["session", "todos"])
-
-      true ->
-        []
-    end
-  end
-
-  defp todo_write_todos(args) do
-    action_args = action_arguments(args)
-
-    case RuntimeContracts.value(action_args, "todos") do
-      nil -> {:error, "todos is required."}
-      todos when is_list(todos) -> normalize_write_todos(todos)
-      _value -> {:error, "todos must be an array."}
-    end
-  end
-
-  defp normalize_read_todos(value) when is_list(value) do
-    value
-    |> Enum.map(&normalize_read_todo/1)
-    |> Enum.reject(&(&1 == %{}))
-  end
-
-  defp normalize_read_todos(_value), do: []
-
-  defp normalize_read_todo(value) when is_map(value) do
-    todo = RuntimeContracts.string_keys(value)
-    content = RuntimeContracts.text(todo, "content")
-
-    if content in [nil, ""] do
-      %{}
-    else
-      active_form =
-        RuntimeContracts.text(
-          todo,
-          "activeForm",
-          RuntimeContracts.text(todo, "active_form", content)
-        )
-
-      %{
-        "content" => content,
-        "status" => todo_status(RuntimeContracts.text(todo, "status", "pending")),
-        "activeForm" => active_form,
-        "active_form" => active_form
-      }
-      |> RuntimeContracts.reject_empty()
-    end
-  end
-
-  defp normalize_read_todo(value) do
-    content = value |> to_string() |> String.trim()
-
-    if content == "" do
-      %{}
-    else
-      %{
-        "content" => content,
-        "status" => "pending",
-        "activeForm" => content,
-        "active_form" => content
-      }
-    end
-  end
-
-  defp normalize_write_todos(todos) do
-    todos
-    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-      case normalize_write_todo(item) do
-        {:ok, todo} -> {:cont, {:ok, [todo | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp normalize_write_todo(value) when is_map(value) do
-    todo = RuntimeContracts.string_keys(value)
-    content = RuntimeContracts.text(todo, "content")
-    status = RuntimeContracts.text(todo, "status", "pending")
-
-    active_form =
-      RuntimeContracts.text(
-        todo,
-        "activeForm",
-        RuntimeContracts.text(todo, "active_form", content)
-      )
-
-    cond do
-      content in [nil, ""] ->
-        {:error, "Each todo needs a non-empty `content` string."}
-
-      status not in ["pending", "in_progress", "completed"] ->
-        {:error, "Invalid todo status #{inspect(status)}."}
-
-      true ->
-        {:ok,
-         %{
-           "content" => content,
-           "status" => status,
-           "activeForm" => active_form,
-           "active_form" => active_form
-         }}
-    end
-  end
-
-  defp normalize_write_todo(_value), do: {:error, "Each todo must be an object."}
-
-  defp format_todos([]), do: "(no todos)"
-
-  defp format_todos(todos) do
-    Enum.map_join(todos, "\n", fn todo ->
-      "- #{todo_status_marker(todo["status"])} #{todo["content"]}"
-    end)
-  end
-
-  defp todo_status_marker("completed"), do: "[x]"
-  defp todo_status_marker("in_progress"), do: "[~]"
-  defp todo_status_marker(_status), do: "[ ]"
-
-  defp todo_status(status) when status in ["pending", "in_progress", "completed"], do: status
-  defp todo_status(_status), do: "pending"
+  defp reject_legacy_context_keys(_args), do: :ok
 
   defp verification_args(args) do
     args
@@ -1096,8 +990,7 @@ defmodule Holt.Actions do
 
   defp route_attrs(args) do
     Map.take(args, [
-      "task_tool_session",
-      "session",
+      "action_session",
       "session_id",
       "agent_id",
       "agent_ref",
@@ -1106,13 +999,12 @@ defmodule Holt.Actions do
       "run_id",
       "agent_run_id",
       "graph_id",
-      "task_graph_id",
       "policy_profile",
-      "enabled_toolkits",
-      "disabled_toolkits",
-      "disabled_tools",
-      "direct_tools",
-      "preload_tools",
+      "enabled_action_groups",
+      "disabled_action_groups",
+      "disabled_actions",
+      "direct_actions",
+      "preload_actions",
       "connected_accounts",
       "workbench",
       "todos",
@@ -1120,86 +1012,99 @@ defmodule Holt.Actions do
     ])
   end
 
-  defp action_arguments(args) do
-    case RuntimeContracts.value(args, "arguments") do
+  defp action_arguments(args, opts \\ []) do
+    case Map.get(args, "arguments") do
       value when is_map(value) ->
-        RuntimeContracts.string_keys(value)
+        value
 
       _value ->
-        Map.drop(args, [
-          "task_tool_session",
-          "session",
-          "session_id",
-          "agent_id",
-          "agent_ref",
-          "agent_handle",
-          "agent_name",
-          "run_id",
-          "agent_run_id",
-          "policy_profile",
-          "enabled_toolkits",
-          "disabled_toolkits",
-          "disabled_tools",
-          "direct_tools",
-          "preload_tools",
-          "connected_accounts",
-          "workbench",
-          "source"
-        ])
+        context_keys =
+          [
+            "action_session",
+            "session_id",
+            "agent_ref",
+            "agent_handle",
+            "agent_name",
+            "run_id",
+            "agent_run_id",
+            "policy_profile",
+            "enabled_action_groups",
+            "disabled_action_groups",
+            "disabled_actions",
+            "direct_actions",
+            "preload_actions",
+            "connected_accounts",
+            "workbench",
+            "source"
+          ]
+
+        context_keys =
+          if Keyword.get(opts, :keep_agent_id, false) do
+            context_keys
+          else
+            ["agent_id" | context_keys]
+          end
+
+        Map.drop(args, context_keys)
     end
   end
 
-  defp maybe_put_from(map, source, target_key, source_keys) do
-    if RuntimeContracts.text(map, target_key) do
-      map
-    else
-      case required_any(source, source_keys) do
-        {:ok, value} -> Map.put(map, target_key, value)
-        {:error, _reason} -> map
-      end
-    end
-  end
+  defp required_value(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) ->
+        text = String.trim(value)
+        if text == "", do: {:error, {:missing_required, key}}, else: {:ok, text}
 
-  defp required_any(map, keys) do
-    keys
-    |> Enum.find_value(fn key ->
-      case RuntimeContracts.value(map, key) do
-        value when is_binary(value) ->
-          text = String.trim(value)
-          if text == "", do: nil, else: {:ok, text}
+      value when is_integer(value) ->
+        {:ok, value}
 
-        value when is_integer(value) ->
-          {:ok, value}
+      value when is_float(value) ->
+        {:ok, value}
 
-        value when is_float(value) ->
-          {:ok, value}
+      value when is_map(value) ->
+        {:ok, value}
 
-        value when is_map(value) ->
-          {:ok, value}
+      value when is_list(value) ->
+        {:ok, value}
 
-        value when is_list(value) ->
-          {:ok, value}
-
-        _value ->
-          nil
-      end
-    end)
-    |> case do
-      nil -> {:error, {:missing_required, Enum.join(keys, "|")}}
-      result -> result
+      _value ->
+        {:error, {:missing_required, key}}
     end
   end
 
   defp required_map(map, key) do
-    case RuntimeContracts.value(map, key) do
-      value when is_map(value) -> {:ok, RuntimeContracts.string_keys(value)}
+    case Map.get(map, key) do
+      value when is_map(value) -> {:ok, value}
       _value -> {:error, {:missing_required, key}}
     end
   end
 
-  defp normalize_tool_name(nil), do: nil
+  defp ensure_required_arguments(action_name, args) do
+    required = required_arguments(action_name)
 
-  defp normalize_tool_name(value) do
+    missing =
+      required
+      |> Enum.reject(&argument_present?(args, &1))
+
+    if missing == [] do
+      :ok
+    else
+      {:error, {:missing_required_arguments, missing, required, received_arguments(args)}}
+    end
+  end
+
+  defp argument_present?(args, key) when is_map(args) do
+    Map.has_key?(args, key) and not is_nil(Map.get(args, key))
+  end
+
+  defp argument_present?(_args, _key), do: false
+
+  defp received_arguments(args) when is_map(args), do: Map.keys(args) |> Enum.sort()
+  defp received_arguments(_args), do: []
+
+  defp normalize_action_name(nil), do: nil
+
+  defp normalize_action_name(value) do
     value
     |> to_string()
     |> String.trim()
@@ -1210,35 +1115,46 @@ defmodule Holt.Actions do
   end
 
   defp task_ref(args) do
-    RuntimeContracts.text(args, "ref") ||
-      RuntimeContracts.text(args, "task_ref") ||
-      RuntimeContracts.text(args, "task_id")
+    text(args, "ref")
   end
 
-  defp drop_ref_args(args), do: Map.drop(args, ["ref", "task_ref", "task_id"])
+  defp drop_ref_args(args), do: Map.drop(args, ["ref"])
 
-  defp workspace_tool?(tool_name), do: not is_nil(Tools.get(tool_name))
+  defp workspace_action?(action_name), do: not is_nil(LocalActions.get(action_name))
 
-  defp repair_tool?(tool_name) do
-    tool_name in ~w(start_repair_run get_repair_run record_repair_run_artifact reconcile_repair_prediction score_repair_predictions choose_repair_strategy draft_repair_architecture_plan draft_repair_blast_radius draft_repair_original_issue_check execute_repair_original_issue_check execute_repair_impact_check draft_repair_related_issue_sweep begin_repair_implementation approve_repair_gate complete_repair_run)
+  defp workspace_only_action?(action_name) do
+    workspace_action?(action_name) and action_name not in ~w(delegate_to_agent invoke_agent)
   end
 
-  defp provider(tool_name, effect_scope) do
+  defp reject_workspace_task_scope_args(args) do
     cond do
-      workspace_tool?(tool_name) -> "workspace"
+      Map.has_key?(args, "ref") -> {:error, {:unsupported_argument, "ref"}}
+      Map.has_key?(args, "task_ref") -> {:error, {:unsupported_argument, "task_ref"}}
+      Map.has_key?(args, "task_id") -> {:error, {:unsupported_argument, "task_id"}}
+      true -> :ok
+    end
+  end
+
+  defp repair_action?(action_name) do
+    action_name in ~w(start_repair_run get_repair_run record_repair_run_artifact reconcile_repair_prediction score_repair_predictions choose_repair_strategy draft_repair_architecture_plan draft_repair_blast_radius draft_repair_original_issue_check execute_repair_original_issue_check execute_repair_impact_check draft_repair_related_issue_sweep begin_repair_implementation approve_repair_gate complete_repair_run)
+  end
+
+  defp provider(action_name, effect_scope) do
+    cond do
       effect_scope == "agent_orchestration" -> "agent_orchestration"
+      workspace_action?(action_name) -> "workspace"
       effect_scope == "routed" -> "router"
-      effect_scope == "read_only" and tool_name == "manage_connection" -> "task_tool_session"
+      effect_scope == "read_only" and action_name == "manage_connection" -> "action_session"
       true -> "tasks"
     end
   end
 
-  defp toolkit(tool_name, effect_scope) do
+  defp action_group(action_name, effect_scope) do
     cond do
-      workspace_tool?(tool_name) -> "workspace"
       effect_scope == "agent_orchestration" -> "agent_orchestration"
+      workspace_action?(action_name) -> "workspace"
       effect_scope == "routed" -> "meta"
-      tool_name == "manage_connection" -> "meta"
+      action_name == "manage_connection" -> "meta"
       effect_scope == "session_ephemeral" -> "session"
       effect_scope == "read_only" -> "task"
       effect_scope == "task_durable" -> "task"
@@ -1246,42 +1162,46 @@ defmodule Holt.Actions do
     end
   end
 
-  defp description(_tool_name, %{"description" => description}), do: description
-  defp description("search_tools", _tool), do: "Find available actions for a task session."
+  defp description(_action_name, %{"description" => description}), do: description
+  defp description("search_actions", _action), do: "Find available actions for a task session."
 
-  defp description("get_tool_schema", _tool),
+  defp description("get_action_schema", _action),
     do: "Return structured metadata for one executable action."
 
-  defp description("execute_tool", _tool),
+  defp description("execute_action", _action),
     do: "Execute one read-only or session-ephemeral routed task action."
 
-  defp description("multi_execute_tool", _tool),
+  defp description("multi_execute_action", _action),
     do: "Execute an ordered batch of read-only or session-ephemeral routed task actions."
 
-  defp description("todo_read", _tool), do: "Read the current in-session todo list."
-  defp description("todo_write", _tool), do: "Replace the in-session todo list."
+  defp description("todo_read", _action), do: "Read the current in-session todo list."
+  defp description("todo_write", _action), do: "Replace the in-session todo list."
 
-  defp description("manage_connection", _tool),
+  defp description("manage_connection", _action),
     do: "Inspect connected-account context declared for the task session."
 
-  defp description("use_workbench", _tool),
+  defp description("use_workbench", _action),
     do: "Inspect the local workbench or route a safe workbench action."
 
-  defp description(tool_name, _tool),
-    do: "Execute #{tool_name} through the local Holt provider."
+  defp description("schedule_mob_colleague_flow", _action) do
+    "Create a specialist mob colleague that observes a task live through comments and reviews the completed groundwork."
+  end
+
+  defp description(action_name, _action),
+    do: "Execute #{action_name} through the local Holt provider."
 
   defp risk_level(%{"risk" => "read"}, _effect_scope), do: "low"
   defp risk_level(%{"risk" => "write"}, _effect_scope), do: "medium"
   defp risk_level(%{"risk" => "execute"}, _effect_scope), do: "high"
   defp risk_level(%{"risk" => "network"}, _effect_scope), do: "high"
-  defp risk_level(_tool, "read_only"), do: "low"
-  defp risk_level(_tool, "session_ephemeral"), do: "low"
-  defp risk_level(_tool, "task_durable"), do: "medium"
-  defp risk_level(_tool, "agent_orchestration"), do: "medium"
-  defp risk_level(_tool, "workspace_durable"), do: "high"
-  defp risk_level(_tool, "external_side_effect"), do: "high"
-  defp risk_level(_tool, "routed"), do: "medium"
-  defp risk_level(_tool, _effect_scope), do: "unknown"
+  defp risk_level(_action, "read_only"), do: "low"
+  defp risk_level(_action, "session_ephemeral"), do: "low"
+  defp risk_level(_action, "task_durable"), do: "medium"
+  defp risk_level(_action, "agent_orchestration"), do: "medium"
+  defp risk_level(_action, "workspace_durable"), do: "high"
+  defp risk_level(_action, "external_side_effect"), do: "high"
+  defp risk_level(_action, "routed"), do: "medium"
+  defp risk_level(_action, _effect_scope), do: "unknown"
 
   defp requires_task_ref?("list_tasks", _effect_scope), do: false
   defp requires_task_ref?("create_task", _effect_scope), do: false
@@ -1290,17 +1210,17 @@ defmodule Holt.Actions do
   defp requires_task_ref?("manage_connection", _effect_scope), do: false
   defp requires_task_ref?("use_workbench", _effect_scope), do: false
 
-  defp requires_task_ref?(tool_name, _effect_scope)
-       when tool_name in ~w(list_files read_file search_files write_file append_file run_command fetch_url search_web ask_user ask_user_question delegate_to_agent set_page_title create_page write_to_document save_memory search_memory remember_about_user forget_about_user list_user_memories search_user_memory remember_for_project save_plan save_research recall_project_memory read_project_memory list_skills load_skill save_skill update_skill run_skill_script list_agents create_agent update_agent suspend_agent resume_agent delete_agent list_agent_cards get_agent_card list_agent_skills invoke_agent start_repair_run get_repair_run record_repair_run_artifact reconcile_repair_prediction score_repair_predictions choose_repair_strategy draft_repair_architecture_plan draft_repair_blast_radius draft_repair_original_issue_check execute_repair_original_issue_check execute_repair_impact_check draft_repair_related_issue_sweep begin_repair_implementation approve_repair_gate complete_repair_run),
+  defp requires_task_ref?(action_name, _effect_scope)
+       when action_name in ~w(list read search write append run fetch search_web ask ask delegate_to_agent set_page_title create_page write_to_document remember recall remember_about_user forget_about_user list_user_memories search_user_memory remember_for_project save_plan save_research recall_project_memory read_project_memory list_skills load_skill save_skill update_skill run_skill_script list_agents create_agent update_agent suspend_agent resume_agent delete_agent list_agent_cards get_agent_card list_agent_skills invoke_agent start_repair_run get_repair_run record_repair_run_artifact reconcile_repair_prediction score_repair_predictions choose_repair_strategy draft_repair_architecture_plan draft_repair_blast_radius draft_repair_original_issue_check execute_repair_original_issue_check execute_repair_impact_check draft_repair_related_issue_sweep begin_repair_implementation approve_repair_gate complete_repair_run),
        do: false
 
-  defp requires_task_ref?(_tool_name, _effect_scope), do: true
+  defp requires_task_ref?(_action_name, _effect_scope), do: true
 
-  defp arguments_schema(tool_name) do
+  defp arguments_schema(action_name) do
     %{
       "type" => "object",
-      "required" => required_arguments(tool_name),
-      "properties" => argument_properties(tool_name)
+      "required" => required_arguments(action_name),
+      "properties" => argument_properties(action_name)
     }
   end
 
@@ -1318,29 +1238,42 @@ defmodule Holt.Actions do
   defp required_arguments("get_task_graph"), do: ["graph_id"]
   defp required_arguments("advance_task_graph"), do: ["graph_id"]
   defp required_arguments("complete_task_graph_node"), do: ["graph_id", "node_ref"]
-  defp required_arguments("capability_registry"), do: ["tool_name"]
-  defp required_arguments("get_tool_schema"), do: ["tool_name"]
-  defp required_arguments("execute_tool"), do: ["tool_name", "arguments"]
-  defp required_arguments("multi_execute_tool"), do: ["calls"]
+  defp required_arguments("capability_registry"), do: ["action"]
+  defp required_arguments("get_action_schema"), do: ["action"]
+  defp required_arguments("execute_action"), do: ["action", "arguments"]
+  defp required_arguments("multi_execute_action"), do: ["calls"]
   defp required_arguments("todo_write"), do: ["todos"]
-  defp required_arguments("read_file"), do: ["path"]
-  defp required_arguments("write_file"), do: ["path", "content"]
-  defp required_arguments("append_file"), do: ["path", "content"]
-  defp required_arguments("search_files"), do: ["query"]
-  defp required_arguments("run_command"), do: ["command"]
-  defp required_arguments("fetch_url"), do: ["url"]
+  defp required_arguments("read"), do: ["path"]
+  defp required_arguments("write"), do: ["path", "content"]
+  defp required_arguments("append"), do: ["path", "content"]
+  defp required_arguments("search"), do: ["query"]
+  defp required_arguments("run"), do: ["command"]
+  defp required_arguments("fetch"), do: ["url"]
   defp required_arguments("search_web"), do: ["query"]
-  defp required_arguments("ask_user_question"), do: ["question"]
+  defp required_arguments("ask"), do: ["question"]
   defp required_arguments("delegate_to_agent"), do: ["role", "system_prompt", "instructions"]
-  defp required_arguments("set_page_title"), do: ["title"]
+
+  defp required_arguments("schedule_mob_colleague_flow"),
+    do: [
+      "groundwork_agent_id",
+      "colleague_agent",
+      "setup_task",
+      "observation_task",
+      "observation_message",
+      "review_task",
+      "review_message",
+      "collaboration_comments"
+    ]
+
+  defp required_arguments("set_page_title"), do: ["page_id", "title"]
   defp required_arguments("create_page"), do: ["page_type", "title"]
-  defp required_arguments("write_to_document"), do: ["action", "content"]
+  defp required_arguments("write_to_document"), do: ["page_id", "action", "content"]
   defp required_arguments("remember_about_user"), do: ["summary", "category"]
   defp required_arguments("forget_about_user"), do: ["substring"]
   defp required_arguments("search_user_memory"), do: ["query"]
   defp required_arguments("remember_for_project"), do: ["summary", "category"]
-  defp required_arguments("save_plan"), do: ["title", "body"]
-  defp required_arguments("save_research"), do: ["title", "body"]
+  defp required_arguments("save_plan"), do: ["title", "body", "category"]
+  defp required_arguments("save_research"), do: ["title", "body", "category"]
   defp required_arguments("read_project_memory"), do: ["id"]
   defp required_arguments("load_skill"), do: ["slug"]
   defp required_arguments("save_skill"), do: ["name", "description", "body"]
@@ -1348,6 +1281,10 @@ defmodule Holt.Actions do
   defp required_arguments("run_skill_script"), do: ["skill_slug", "script_name"]
   defp required_arguments("get_agent_card"), do: ["agent_id"]
   defp required_arguments("list_agent_skills"), do: ["agent_id"]
+
+  defp required_arguments("create_agent"),
+    do: ["agent_id", "display_name", "instructions", "skills"]
+
   defp required_arguments("update_agent"), do: ["agent_id"]
   defp required_arguments("suspend_agent"), do: ["agent_id"]
   defp required_arguments("resume_agent"), do: ["agent_id"]
@@ -1375,7 +1312,7 @@ defmodule Holt.Actions do
   defp required_arguments("begin_repair_implementation"), do: ["repair_run_id"]
   defp required_arguments("approve_repair_gate"), do: ["repair_run_id"]
   defp required_arguments("complete_repair_run"), do: ["repair_run_id"]
-  defp required_arguments(_tool_name), do: []
+  defp required_arguments(_action_name), do: []
 
   defp argument_properties("start_repair_run") do
     Map.merge(base_argument_properties(), %{
@@ -1432,8 +1369,8 @@ defmodule Holt.Actions do
     })
   end
 
-  defp argument_properties(tool_name)
-       when tool_name in ~w(draft_repair_architecture_plan draft_repair_blast_radius draft_repair_original_issue_check execute_repair_original_issue_check execute_repair_impact_check draft_repair_related_issue_sweep) do
+  defp argument_properties(action_name)
+       when action_name in ~w(draft_repair_architecture_plan draft_repair_blast_radius draft_repair_original_issue_check execute_repair_original_issue_check execute_repair_impact_check draft_repair_related_issue_sweep) do
     base_argument_properties()
     |> Map.merge(repair_run_identifier_properties())
     |> Map.merge(%{
@@ -1441,7 +1378,7 @@ defmodule Holt.Actions do
       "payload" => %{"type" => "object"},
       "proof_commands" => array_of(%{"type" => "object"}),
       "manual_check_results" => array_of(%{"type" => "object"}),
-      "tool_check_results" => array_of(%{"type" => "object"}),
+      "action_check_results" => array_of(%{"type" => "object"}),
       "goal_check" => %{"type" => "object"},
       "changed_files" => array_of(%{"type" => "string"}),
       "risk_flags" => array_of(%{"type" => "string"}),
@@ -1477,8 +1414,7 @@ defmodule Holt.Actions do
 
   defp argument_properties("list_agents") do
     Map.merge(base_argument_properties(), %{
-      "status" => %{"type" => "string", "enum" => ["all"] ++ Holt.Agents.statuses()},
-      "status_filter" => %{"type" => "string", "enum" => ["all"] ++ Holt.Agents.statuses()}
+      "status" => %{"type" => "string", "enum" => ["all"] ++ Holt.Agents.statuses()}
     })
   end
 
@@ -1492,7 +1428,7 @@ defmodule Holt.Actions do
     |> Map.merge(agent_profile_properties())
   end
 
-  defp argument_properties(tool_name) when tool_name in ~w(suspend_agent resume_agent) do
+  defp argument_properties(action_name) when action_name in ~w(suspend_agent resume_agent) do
     base_argument_properties()
     |> Map.merge(agent_identifier_properties())
     |> Map.merge(%{
@@ -1511,12 +1447,12 @@ defmodule Holt.Actions do
 
   defp argument_properties("list_agent_cards") do
     Map.merge(base_argument_properties(), %{
-      "status" => %{"type" => "string", "enum" => ["all"] ++ Holt.Agents.statuses()},
-      "status_filter" => %{"type" => "string", "enum" => ["all"] ++ Holt.Agents.statuses()}
+      "status" => %{"type" => "string", "enum" => ["all"] ++ Holt.Agents.statuses()}
     })
   end
 
-  defp argument_properties(tool_name) when tool_name in ~w(get_agent_card list_agent_skills) do
+  defp argument_properties(action_name)
+       when action_name in ~w(get_agent_card list_agent_skills) do
     Map.merge(base_argument_properties(), agent_identifier_properties())
   end
 
@@ -1525,6 +1461,7 @@ defmodule Holt.Actions do
     |> Map.merge(agent_identifier_properties())
     |> Map.merge(%{
       "instructions" => %{"type" => "string"},
+      "task_title" => %{"type" => "string"},
       "target_skill" => %{"type" => "string"},
       "work_role" => %{
         "type" => "string",
@@ -1534,7 +1471,7 @@ defmodule Holt.Actions do
       "expected_output_artifacts" => %{"type" => "array", "items" => %{"type" => "string"}},
       "validation_contract" => %{"type" => "string"},
       "handoff_requirements" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "allowed_tools" => %{"type" => "array", "items" => %{"type" => "string"}},
+      "allowed_actions" => %{"type" => "array", "items" => %{"type" => "string"}},
       "max_autonomy" => %{
         "type" => "string",
         "enum" => [
@@ -1547,7 +1484,7 @@ defmodule Holt.Actions do
     })
   end
 
-  defp argument_properties("ask_user_question") do
+  defp argument_properties("ask") do
     Map.merge(base_argument_properties(), %{
       "question" => %{"type" => "string"},
       "description" => %{"type" => "string"},
@@ -1565,6 +1502,43 @@ defmodule Holt.Actions do
     })
   end
 
+  defp argument_properties("list") do
+    Map.merge(workspace_argument_properties(), %{
+      "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 500}
+    })
+  end
+
+  defp argument_properties("read") do
+    Map.merge(workspace_argument_properties(), %{
+      "path" => %{"type" => "string"}
+    })
+  end
+
+  defp argument_properties(action_name) when action_name in ~w(write append) do
+    Map.merge(workspace_argument_properties(), %{
+      "path" => %{"type" => "string"},
+      "content" => %{"type" => "string"}
+    })
+  end
+
+  defp argument_properties("search") do
+    Map.merge(workspace_argument_properties(), %{
+      "query" => %{"type" => "string"}
+    })
+  end
+
+  defp argument_properties("run") do
+    Map.merge(workspace_argument_properties(), %{
+      "command" => %{"type" => "string"}
+    })
+  end
+
+  defp argument_properties("fetch") do
+    Map.merge(workspace_argument_properties(), %{
+      "url" => %{"type" => "string"}
+    })
+  end
+
   defp argument_properties("delegate_to_agent") do
     Map.merge(base_argument_properties(), %{
       "role" => %{"type" => "string"},
@@ -1574,6 +1548,7 @@ defmodule Holt.Actions do
       },
       "system_prompt" => %{"type" => "string"},
       "instructions" => %{"type" => "string"},
+      "task_title" => %{"type" => "string"},
       "page_id" => %{"type" => "string"},
       "target_agent_id" => %{"type" => "string"},
       "target_skill" => %{"type" => "string"},
@@ -1582,7 +1557,7 @@ defmodule Holt.Actions do
       "validation_contract" => %{"type" => "string"},
       "parent_task_id" => %{"type" => "string"},
       "handoff_requirements" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "allowed_tools" => %{"type" => "array", "items" => %{"type" => "string"}},
+      "allowed_actions" => %{"type" => "array", "items" => %{"type" => "string"}},
       "max_autonomy" => %{
         "type" => "string",
         "enum" => [
@@ -1592,6 +1567,60 @@ defmodule Holt.Actions do
           "no_external_side_effects"
         ]
       }
+    })
+  end
+
+  defp argument_properties("schedule_mob_colleague_flow") do
+    Map.merge(base_argument_properties(), %{
+      "groundwork_agent_id" => %{"type" => "string"},
+      "colleague_agent" => %{
+        "type" => "object",
+        "required" => ["agent_id", "display_name", "instructions", "skills"],
+        "properties" => %{
+          "agent_id" => %{"type" => "string"},
+          "display_name" => %{"type" => "string"},
+          "description" => %{"type" => "string"},
+          "agent_handle" => %{"type" => "string"},
+          "agent_ref" => %{"type" => "string"},
+          "status" => %{"type" => "string", "enum" => Holt.Agents.statuses()},
+          "work_roles" => array_of(%{"type" => "string", "enum" => Holt.Agents.work_roles()}),
+          "default_work_role" => %{"type" => "string", "enum" => Holt.Agents.work_roles()},
+          "skills" =>
+            array_of(%{
+              "type" => "object",
+              "required" => ["id", "name"],
+              "properties" => %{
+                "id" => %{"type" => "string"},
+                "name" => %{"type" => "string"},
+                "description" => %{"type" => "string"},
+                "action_names" => array_of(%{"type" => "string"})
+              }
+            }),
+          "model" => %{"type" => "string"},
+          "provider" => %{"type" => "string"},
+          "instructions" => %{"type" => "string"},
+          "capabilities" => array_of(%{"type" => "string"}),
+          "permissions" => %{"type" => "object"},
+          "metadata" => %{"type" => "object"}
+        }
+      },
+      "setup_task" => mob_colleague_task_template_schema(),
+      "observation_task" => mob_colleague_task_template_schema(),
+      "observation_message" => %{"type" => "string"},
+      "review_task" => mob_colleague_task_template_schema(),
+      "review_message" => %{"type" => "string"},
+      "documentation_sources" => array_of(%{"type" => "string"}),
+      "collaboration_comments" =>
+        array_of(%{
+          "type" => "object",
+          "required" => ["body"],
+          "properties" => %{
+            "body" => %{"type" => "string"},
+            "phase" => %{"type" => "string", "enum" => ["groundwork", "review"]},
+            "priority" => %{"type" => "string"},
+            "topic" => %{"type" => "string"}
+          }
+        })
     })
   end
 
@@ -1665,8 +1694,8 @@ defmodule Holt.Actions do
     })
   end
 
-  defp argument_properties(tool_name)
-       when tool_name in ~w(remember_about_user list_user_memories) do
+  defp argument_properties(action_name)
+       when action_name in ~w(remember_about_user list_user_memories) do
     Map.merge(base_argument_properties(), %{
       "summary" => %{"type" => "string"},
       "category" => %{"type" => "string", "enum" => Holt.Memory.user_categories()},
@@ -1697,7 +1726,7 @@ defmodule Holt.Actions do
     })
   end
 
-  defp argument_properties(tool_name) when tool_name in ~w(save_plan save_research) do
+  defp argument_properties(action_name) when action_name in ~w(save_plan save_research) do
     Map.merge(base_argument_properties(), %{
       "title" => %{"type" => "string"},
       "body" => %{"type" => "string"},
@@ -1737,33 +1766,48 @@ defmodule Holt.Actions do
     })
   end
 
-  defp argument_properties(_tool_name), do: base_argument_properties()
+  defp argument_properties(_action_name), do: base_argument_properties()
 
   defp base_argument_properties do
     %{
       "ref" => %{"type" => "string"},
       "arguments" => %{"type" => "object"},
-      "task_tool_session" => %{"type" => "object"},
-      "tool_name" => %{"type" => "string"},
+      "action_session" => %{"type" => "object"},
       "action" => %{"type" => "string"},
-      "toolkit" => %{"type" => "string"},
+      "action_group" => %{"type" => "string"},
       "todos" => array_of(%{"type" => "object"})
+    }
+  end
+
+  defp workspace_argument_properties do
+    %{
+      "reason" => %{"type" => "string"}
+    }
+  end
+
+  defp mob_colleague_task_template_schema do
+    %{
+      "type" => "object",
+      "required" => ["title", "description"],
+      "properties" => %{
+        "title" => %{"type" => "string"},
+        "description" => %{"type" => "string"},
+        "priority" => %{"type" => "string", "enum" => Holt.Tasks.priorities()},
+        "labels" => array_of(%{"type" => "object"}),
+        "agent_policy" => %{"type" => "object"}
+      }
     }
   end
 
   defp agent_identifier_properties do
     %{
-      "agent_id" => %{"type" => "string"},
-      "id" => %{"type" => "string"},
-      "agent_ref" => %{"type" => "string"},
-      "handle" => %{"type" => "string"}
+      "agent_id" => %{"type" => "string"}
     }
   end
 
   defp repair_run_identifier_properties do
     %{
-      "repair_run_id" => %{"type" => "string"},
-      "id" => %{"type" => "string"}
+      "repair_run_id" => %{"type" => "string"}
     }
   end
 
@@ -1776,22 +1820,17 @@ defmodule Holt.Actions do
 
   defp agent_profile_properties do
     %{
-      "id" => %{"type" => "string"},
       "agent_id" => %{"type" => "string"},
       "display_name" => %{"type" => "string"},
-      "name" => %{"type" => "string"},
       "description" => %{"type" => "string"},
       "agent_handle" => %{"type" => "string"},
-      "handle" => %{"type" => "string"},
       "agent_ref" => %{"type" => "string"},
       "status" => %{"type" => "string", "enum" => Holt.Agents.statuses()},
       "work_roles" => %{
         "type" => "array",
         "items" => %{"type" => "string", "enum" => Holt.Agents.work_roles()}
       },
-      "work_role" => %{"type" => "string", "enum" => Holt.Agents.work_roles()},
       "skills" => array_of(%{"type" => "object"}),
-      "skill" => %{"type" => "string"},
       "model" => %{"type" => "string"},
       "provider" => %{"type" => "string"},
       "instructions" => %{"type" => "string"},
@@ -1801,16 +1840,113 @@ defmodule Holt.Actions do
     }
   end
 
+  defp action_call(call) when is_map(call) do
+    if canonical_map?(call), do: call, else: %{}
+  end
+
+  defp action_call(_call), do: %{}
+
+  defp action_call_arguments(%{"arguments" => arguments}) when is_map(arguments),
+    do: {:ok, arguments}
+
+  defp action_call_arguments(%{"arguments" => _arguments}),
+    do: {:error, :invalid_action_arguments}
+
+  defp action_call_arguments(_call), do: {:ok, %{}}
+
+  defp catalog_context(context) when is_map(context) do
+    if canonical_map?(context), do: context, else: %{}
+  end
+
+  defp catalog_context(_context), do: %{}
+
+  defp catalog_session_source(context, opts) do
+    case Map.fetch(context, "action_session") do
+      {:ok, session} -> session
+      :error -> option(opts, :action_session)
+    end
+  end
+
+  defp ensure_canonical_map(map) do
+    if canonical_map?(map), do: :ok, else: {:error, :invalid_action_arguments}
+  end
+
+  defp canonical_map?(map) when is_map(map) do
+    Enum.all?(map, fn {key, value} -> is_binary(key) and canonical_value?(value) end)
+  end
+
+  defp canonical_map?(_value), do: false
+
+  defp canonical_value?(value) when is_map(value), do: canonical_map?(value)
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp text(map, key, default \\ nil)
+
+  defp text(map, key, default) when is_map(map) do
+    case Map.get(map, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> default
+          trimmed -> trimmed
+        end
+
+      _value ->
+        default
+    end
+  end
+
+  defp text(_map, _key, default), do: default
+
+  defp present_text?(map, key) do
+    case text(map, key) do
+      nil -> false
+      _value -> true
+    end
+  end
+
+  defp blank?(nil), do: true
+  defp blank?(""), do: true
+  defp blank?(_value), do: false
+
+  defp string_list(nil), do: []
+
+  defp string_list(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> []
+      trimmed -> [trimmed]
+    end
+  end
+
+  defp string_list(value) when is_list(value) do
+    value
+    |> Enum.flat_map(&string_list/1)
+    |> Enum.uniq()
+  end
+
+  defp string_list(_value), do: []
+
+  defp map_value(value) when is_map(value) do
+    if canonical_map?(value), do: value, else: %{}
+  end
+
+  defp map_value(_value), do: %{}
+
+  defp compact(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
+  end
+
+  defp scope_name(value) when is_binary(value), do: value
+  defp scope_name(_value), do: "unknown"
+
   defp maybe_put_opt(opts, _key, value) when value in [nil, "", []], do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp array_of(items), do: %{"type" => "array", "items" => items}
 
   defp option(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+  defp option(opts, key) when is_map(opts), do: Map.get(opts, key)
   defp option(_opts, _key), do: nil
-
-  defp normalize_reason(reason) when is_binary(reason), do: reason
-  defp normalize_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
-  defp normalize_reason({key, value}), do: "#{normalize_reason(key)}:#{value}"
-  defp normalize_reason(reason), do: inspect(reason)
 end

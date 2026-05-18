@@ -11,6 +11,13 @@ defmodule Holt.Tasks.ProcessWakeScheduler do
 
   @source "task_agent_process_wake"
   @terminal_statuses ~w(exited missing)
+  @obsolete_context_keys %{
+    "workspace" => "workspace option",
+    "workspace_root" => "workspace option",
+    "run_id" => "agent_run_id",
+    "routine_run_id" => "agent_run_id",
+    "work_id" => "agent_run_id"
+  }
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -19,7 +26,10 @@ defmodule Holt.Tasks.ProcessWakeScheduler do
   def record_started(payload, context \\ %{}, opts \\ [])
 
   def record_started(payload, context, opts) when is_map(payload) and is_map(context) do
-    handle_started(payload, context, opts)
+    with :ok <- string_keyed_payload(payload),
+         :ok <- valid_context(context) do
+      handle_started(payload, context, opts)
+    end
   end
 
   def record_started(_payload, _context, _opts), do: {:error, :invalid_process_event}
@@ -27,10 +37,13 @@ defmodule Holt.Tasks.ProcessWakeScheduler do
   def notify_terminal(payload, context \\ %{}, opts \\ [])
 
   def notify_terminal(payload, context, opts) when is_map(payload) and is_map(context) do
-    if Process.whereis(__MODULE__) do
-      GenServer.call(__MODULE__, {:terminal_process_event, payload, context, opts})
-    else
-      handle_terminal(payload, context, opts)
+    with :ok <- string_keyed_payload(payload),
+         :ok <- valid_context(context) do
+      if Process.whereis(__MODULE__) do
+        GenServer.call(__MODULE__, {:terminal_process_event, payload, context, opts})
+      else
+        handle_terminal(payload, context, opts)
+      end
     end
   end
 
@@ -105,29 +118,14 @@ defmodule Holt.Tasks.ProcessWakeScheduler do
   end
 
   defp process_context(context, opts) do
-    root =
-      opts
-      |> Keyword.put(
-        :workspace,
-        context["workspace"] || context["workspace_root"] || opts[:workspace]
-      )
-      |> Paths.workspace_root()
-
-    run_id =
-      context["agent_run_id"] ||
-        context["run_id"] ||
-        context["routine_run_id"] ||
-        context["work_id"]
-
-    if run_id in [nil, ""] do
-      {:error, :missing_agent_run_id}
-    else
-      {:ok, root, run_id}
+    with :ok <- reject_obsolete_context(context),
+         {:ok, run_id} <- agent_run_id(context) do
+      {:ok, Paths.workspace_root(opts), run_id}
     end
   end
 
   defp terminal_wake_candidate?(payload) do
-    terminal_status?(payload["status"]) and notify_on_exit?(payload)
+    terminal_status?(payload["status"]) and wait_for_exit?(payload) and notify_on_exit?(payload)
   end
 
   defp terminal_status?(status), do: status in @terminal_statuses
@@ -135,19 +133,44 @@ defmodule Holt.Tasks.ProcessWakeScheduler do
   defp terminal_event_kind(%{"status" => "missing"}), do: "process.missing"
   defp terminal_event_kind(_payload), do: "process.exited"
 
-  defp notify_on_exit?(payload) do
-    case payload["notify_on_exit"] do
-      false -> false
-      "false" -> false
-      _value -> wait_for_exit?(payload)
+  defp notify_on_exit?(%{"notify_on_exit" => false}), do: false
+  defp notify_on_exit?(%{"notify_on_exit" => true}), do: true
+  defp notify_on_exit?(payload), do: Map.has_key?(payload, "notify_on_exit") == false
+
+  defp wait_for_exit?(%{"wait_for_exit" => true}), do: true
+  defp wait_for_exit?(_payload), do: false
+
+  defp agent_run_id(%{"agent_run_id" => run_id}) when is_binary(run_id) and run_id != "",
+    do: {:ok, run_id}
+
+  defp agent_run_id(%{"agent_run_id" => _run_id}), do: {:error, :invalid_agent_run_id}
+  defp agent_run_id(_context), do: {:error, :missing_agent_run_id}
+
+  defp reject_obsolete_context(context) do
+    Enum.reduce_while(@obsolete_context_keys, :ok, fn {key, replacement}, :ok ->
+      if Map.has_key?(context, key) do
+        {:halt, {:error, {:obsolete_process_context_key, key, replacement}}}
+      else
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  defp string_keyed_payload(payload), do: string_keyed_map(payload, :invalid_process_payload)
+  defp string_keyed_context(context), do: string_keyed_map(context, :invalid_process_context)
+
+  defp valid_context(context) do
+    with :ok <- string_keyed_context(context),
+         :ok <- reject_obsolete_context(context),
+         {:ok, _run_id} <- agent_run_id(context) do
+      :ok
     end
   end
 
-  defp wait_for_exit?(payload) do
-    case payload["wait_for_exit"] do
-      false -> false
-      "false" -> false
-      _value -> true
+  defp string_keyed_map(map, reason) do
+    case Enum.find(Map.keys(map), fn key -> is_binary(key) == false end) do
+      nil -> :ok
+      _key -> {:error, reason}
     end
   end
 

@@ -1,52 +1,36 @@
 defmodule Holt.Runtime.Context do
   @moduledoc """
-  Builds bounded local context from workspace instructions, skills, and memory.
+  Builds bounded local discovery context from agent instructions.
   """
 
-  alias Holt.{Memory, Skills, Workspace}
+  alias Holt.Workspace
 
   def build(objective, opts \\ []) do
     root = Holt.Paths.workspace_root(opts)
-    selected_skills = Skills.relevant(objective, opts)
-    memories = Memory.search(objective, opts) |> Enum.take(10)
+    agents = agent_instructions(opts, root)
 
     %{
       objective: objective,
       workspace: root,
-      holt: Workspace.read_instruction(root, "HOLT.md"),
-      agents: Workspace.read_instruction(root, "AGENTS.md"),
-      tools: Workspace.read_instruction(root, "TOOLS.md"),
-      skills: selected_skills,
-      memories: memories
+      agent_instruction_file: Workspace.agent_instruction_file(),
+      agents: agents,
+      skills: [],
+      memories: []
     }
   end
 
   def prompt_section(context) do
-    skills =
-      context.skills
-      |> Enum.map(fn skill -> "## #{skill.name}\n#{skill.content}" end)
-      |> Enum.join("\n\n")
-
-    memories =
-      context.memories
-      |> Enum.map(&("- " <> Map.get(&1, "text", "")))
-      |> Enum.join("\n")
-
     """
-    # Workspace Policy
-    #{context.holt}
-
-    # Agents
+    # Agent Instructions
+    File: #{context.agent_instruction_file}
     #{context.agents}
-
-    # Tools
-    #{context.tools}
-
-    # Relevant Skills
-    #{skills}
-
-    # Relevant Memory
-    #{memories}
     """
+  end
+
+  defp agent_instructions(opts, root) do
+    case Keyword.get(opts, :agent_instructions) do
+      instructions when is_binary(instructions) -> instructions
+      _missing -> Workspace.read_agent_instructions(root)
+    end
   end
 end

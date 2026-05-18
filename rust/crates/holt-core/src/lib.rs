@@ -49,9 +49,9 @@ pub fn architecture_summary() -> &'static str {
      - holt-cli: command dispatch and structured backend calls\n\
      - holt-tui: terminal rendering over typed events\n\
      - holt-core: agent loop and turn orchestration\n\
-     - holt-protocol: requests, events, tools, approvals\n\
+     - holt-protocol: requests, events, actions, approvals\n\
      - holt-workspace: repo scan and context packing\n\
-     - holt-tools: tool registry and execution\n\
+     - holt-actions: action registry and execution\n\
      - holt-policy: approvals and side-effect decisions\n\
      - holt-sessions: durable conversation state\n\
      - holt-models: provider clients and streaming\n\
@@ -84,7 +84,7 @@ fn workspace_overview(snapshot: &WorkspaceSnapshot) -> String {
         .join("\n");
 
     format!(
-        "I scanned this workspace as Holt.\n\nFiles: {} total, {source_count} source, {test_count} test.\n\nKey files read:\n{}",
+        "I scanned this workspace as Holt.\n\nFiles: {} total, {source_count} source, {test_count} test.\n\nAgent instructions read:\n{}",
         snapshot.files.len(),
         if key_files.is_empty() {
             "- none"
@@ -97,7 +97,7 @@ fn workspace_overview(snapshot: &WorkspaceSnapshot) -> String {
 fn workspace_overview_intent(request: &TurnRequest) -> bool {
     let tokens = intent_tokens(
         request
-            .chat_context
+            .chat_messages
             .iter()
             .chain(std::iter::once(&ChatMessage::user(&request.objective)))
             .map(|message| message.content.as_str()),
@@ -148,7 +148,7 @@ mod tests {
         let summary = architecture_summary();
         assert!(summary.contains("holt-core"));
         assert!(summary.contains("holt-protocol"));
-        assert!(summary.contains("holt-tools"));
+        assert!(summary.contains("holt-actions"));
     }
 
     #[test]
@@ -156,15 +156,18 @@ mod tests {
         let root = std::env::temp_dir().join(format!("holt-core-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("AGENTS.md"), "# Agent rules").unwrap();
         fs::write(root.join("README.md"), "# Demo").unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
         let request = TurnRequest::new("the entire project", root.to_string_lossy())
-            .with_chat_context(vec![ChatMessage::user("read this repo")]);
+            .with_chat_messages(vec![ChatMessage::user("read this repo")]);
         let response = AgentEngine::default().run_turn(request).unwrap();
 
         assert!(response.output.contains("I scanned this workspace as Holt"));
-        assert!(response.output.contains("README.md"));
+        assert!(response.output.contains("Agent instructions read"));
+        assert!(response.output.contains("AGENTS.md"));
+        assert!(!response.output.contains("README.md"));
         assert!(response
             .events
             .iter()

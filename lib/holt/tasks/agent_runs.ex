@@ -9,9 +9,9 @@ defmodule Holt.Tasks.AgentRuns do
   """
 
   alias Holt.{Clock, JSON, Paths}
-  alias Holt.Tasks.{AgentLoop, AgentRunStateMachine, RuntimeContracts}
+  alias Holt.Tasks.{AgentLoop, AgentRunStateMachine}
 
-  @schema_version "holtworks_agent_run/v1"
+  @schema_version "holt_agent_run/v1"
 
   def ensure_store(root) do
     Paths.ensure_workspace(root)
@@ -68,7 +68,7 @@ defmodule Holt.Tasks.AgentRuns do
         "lifecycle_state" => AgentRunStateMachine.running(),
         "runtime_status" => "running",
         "objective_status" => "in_progress",
-        "started_at" => work["started_at"] || now,
+        "started_at" => started_at(work, now),
         "heartbeat_at" => now,
         "last_event_at" => now,
         "last_effective_work_at" => now,
@@ -80,6 +80,12 @@ defmodule Holt.Tasks.AgentRuns do
     append_event(root, record, "agent_run.started", "Started local task-agent work.")
     {:ok, record}
   end
+
+  defp started_at(%{"started_at" => started_at}, _now)
+       when is_binary(started_at) and started_at != "",
+       do: started_at
+
+  defp started_at(_work, now), do: now
 
   def record_completed(root, task, work, run, attrs \\ %{}) do
     now = Clock.iso_now()
@@ -176,9 +182,9 @@ defmodule Holt.Tasks.AgentRuns do
     root
     |> event_log()
     |> Enum.filter(&(&1["agent_run_id"] in run_ids))
-    |> filter_event_kind(option_value(opts, :kind) || option_value(opts, :type))
-    |> filter_event_run(option_value(opts, :agent_run_id) || option_value(opts, :run_id))
-    |> limit_items(option_value(opts, :limit))
+    |> filter_event_kind(event_kind_filter(opts))
+    |> filter_event_run(event_run_filter(opts))
+    |> limit_items(event_limit_filter(opts))
   end
 
   def search_events_by_agent(_root, _agent_id, _opts), do: []
@@ -190,7 +196,7 @@ defmodule Holt.Tasks.AgentRuns do
          {:ok, events} <- list_events(root, run["id"]) do
       {:ok,
        %{
-         "schema_version" => "holtworks_agent_run_replay/v1",
+         "schema_version" => "holt_agent_run_replay/v1",
          "agent_id" => agent_id,
          "agent_run_id" => run["id"],
          "agent_run" => run,
@@ -223,7 +229,7 @@ defmodule Holt.Tasks.AgentRuns do
 
     {:ok,
      %{
-       "schema_version" => "holtworks_agent_task_inspector/v1",
+       "schema_version" => "holt_agent_task_inspector/v1",
        "task_ref_or_id" => task_ref_or_id,
        "run_count" => length(runs),
        "event_count" => length(events),
@@ -238,10 +244,10 @@ defmodule Holt.Tasks.AgentRuns do
 
   def record_event_once(root, run_or_id, kind, message, metadata)
       when is_binary(kind) and is_binary(message) do
-    with {:ok, run} <- get(root, run_or_id) do
+    with {:ok, metadata} <- event_metadata_map(metadata),
+         {:ok, run} <- get(root, run_or_id) do
       metadata =
         metadata
-        |> normalize_metadata()
         |> Map.put_new("idempotency_key", event_idempotency_key(run, kind, message, metadata))
         |> reject_empty()
 
@@ -256,29 +262,36 @@ defmodule Holt.Tasks.AgentRuns do
     do: {:error, :invalid_agent_run_event}
 
   def record_continuation_packet(root, run_or_id, packet) when is_map(packet) do
-    packet = RuntimeContracts.string_keys(packet)
-
-    metadata =
-      %{
-        "schema_version" => "holtworks_agent_run_continuation_packet_event/v1",
-        "idempotency_key" =>
-          packet["idempotency_key"] ||
-            RuntimeContracts.stable_id("agent_run_continuation_packet", [
+    with :ok <- canonical_continuation_packet(packet),
+         :ok <- continuation_packet_schema(packet),
+         {:ok, packet_id} <- required_continuation_packet_text(packet, "packet_id"),
+         {:ok, previous_agent_run_id} <-
+           required_continuation_packet_text(packet, "previous_agent_run_id"),
+         {:ok, continuation_depth} <-
+           required_continuation_packet_integer(packet, "continuation_depth"),
+         {:ok, source} <- required_continuation_packet_text(packet, "source") do
+      metadata =
+        %{
+          "schema_version" => "holt_agent_run_continuation_packet_event/v1",
+          "idempotency_key" =>
+            stable_id("agent_run_continuation_packet", [
               run_or_id,
-              packet["previous_agent_run_id"],
-              packet["continuation_depth"],
-              packet["source"]
+              packet_id,
+              previous_agent_run_id,
+              continuation_depth,
+              source
             ]),
-        "packet" => packet
-      }
+          "packet" => packet
+        }
 
-    record_event_once(
-      root,
-      run_or_id,
-      "agent_run.continuation_packet",
-      "Continuation packet recorded.",
-      metadata
-    )
+      record_event_once(
+        root,
+        run_or_id,
+        "agent_run.continuation_packet",
+        "Continuation packet recorded.",
+        metadata
+      )
+    end
   end
 
   def record_continuation_packet(_root, _run_or_id, _packet),
@@ -287,85 +300,85 @@ defmodule Holt.Tasks.AgentRuns do
   def record_agent_narration(root, run_or_id, attrs \\ %{})
 
   def record_agent_narration(root, run_or_id, attrs) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    body = attrs["body"] || attrs["content"] || attrs["message"]
+    with :ok <- canonical_event_attrs(attrs, :invalid_attrs),
+         {:ok, body} <- narration_body(attrs) do
+      metadata =
+        attrs
+        |> Map.drop(["kind", "type", "message"])
+        |> Map.merge(%{
+          "schema_version" => "holt_agent_run_narration/v1",
+          "trusted_for_liveness" => false,
+          "body_preview" => preview(body)
+        })
+        |> Map.put_new(
+          "idempotency_key",
+          stable_id("agent_run_narration", [
+            run_or_id,
+            attrs["idempotency_key"],
+            body
+          ])
+        )
 
-    metadata =
-      attrs
-      |> Map.drop(["kind", "type", "message"])
-      |> Map.merge(%{
-        "schema_version" => "holtworks_agent_run_narration/v1",
-        "trusted_for_liveness" => false,
-        "body_preview" => preview(body)
-      })
-      |> Map.put_new(
-        "idempotency_key",
-        RuntimeContracts.stable_id("agent_run_narration", [
-          run_or_id,
-          attrs["idempotency_key"],
-          body
-        ])
+      record_event_once(
+        root,
+        run_or_id,
+        "agent.narration",
+        event_message(attrs, "Agent narration recorded."),
+        metadata
       )
-
-    record_event_once(
-      root,
-      run_or_id,
-      "agent.narration",
-      attrs["message"] || "Agent narration recorded.",
-      metadata
-    )
+    end
   end
 
   def record_agent_narration(_root, _run_or_id, _attrs), do: {:error, :invalid_narration}
 
   def record_plan_contract(root, run_or_id, plan_contract) when is_map(plan_contract) do
-    plan_contract = RuntimeContracts.string_keys(plan_contract)
-
-    metadata =
-      %{
-        "schema_version" => "holtworks_agent_run_plan_contract_event/v1",
-        "idempotency_key" =>
-          plan_contract["idempotency_key"] ||
-            RuntimeContracts.stable_id("agent_run_plan_contract", [
+    with :ok <- canonical_event_attrs(plan_contract, :invalid_plan_contract) do
+      metadata =
+        %{
+          "schema_version" => "holt_agent_run_plan_contract_event/v1",
+          "idempotency_key" =>
+            event_idempotency_value(plan_contract, [
+              "agent_run_plan_contract",
               run_or_id,
               plan_contract["plan_id"],
               plan_contract["schema_version"],
               plan_contract
             ]),
-        "plan_contract" => plan_contract
-      }
+          "plan_contract" => plan_contract
+        }
 
-    record_event_once(root, run_or_id, "plan.contract", "Plan contract recorded.", metadata)
+      record_event_once(root, run_or_id, "plan.contract", "Plan contract recorded.", metadata)
+    end
   end
 
   def record_plan_contract(_root, _run_or_id, _plan_contract),
     do: {:error, :invalid_plan_contract}
 
   def record_child_agent_contract(root, run_or_id, child_contract) when is_map(child_contract) do
-    child_contract = RuntimeContracts.string_keys(child_contract)
-
-    metadata =
-      %{
-        "schema_version" => "holtworks_agent_run_child_contract_event/v1",
-        "idempotency_key" =>
-          child_contract["idempotency_key"] ||
-            RuntimeContracts.stable_id("agent_run_child_contract", [
+    with :ok <- canonical_event_attrs(child_contract, :invalid_child_agent_contract) do
+      metadata =
+        %{
+          "schema_version" => "holt_agent_run_child_contract_event/v1",
+          "idempotency_key" =>
+            event_idempotency_value(child_contract, [
+              "agent_run_child_contract",
               run_or_id,
               child_contract["child_agent_id"],
               child_contract["agent_id"],
               child_contract["role"],
               child_contract
             ]),
-        "child_agent_contract" => child_contract
-      }
+          "child_agent_contract" => child_contract
+        }
 
-    record_event_once(
-      root,
-      run_or_id,
-      "child_agent.contract",
-      "Child agent contract recorded.",
-      metadata
-    )
+      record_event_once(
+        root,
+        run_or_id,
+        "child_agent.contract",
+        "Child agent contract recorded.",
+        metadata
+      )
+    end
   end
 
   def record_child_agent_contract(_root, _run_or_id, _child_contract),
@@ -374,113 +387,122 @@ defmodule Holt.Tasks.AgentRuns do
   def record_child_agent_completion(root, run_or_id, attrs \\ %{})
 
   def record_child_agent_completion(root, run_or_id, attrs) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
+    with :ok <- canonical_child_completion_attrs(attrs),
+         :ok <- reject_child_completion_aliases(attrs),
+         {:ok, child_agent_id} <- required_child_completion_text(attrs, "child_agent_id"),
+         {:ok, child_run_id} <- required_child_completion_text(attrs, "child_run_id"),
+         {:ok, status} <- required_child_completion_text(attrs, "status"),
+         {:ok, message} <- required_child_completion_text(attrs, "message") do
+      metadata =
+        attrs
+        |> Map.merge(%{
+          "schema_version" => "holt_agent_run_child_completion_event/v1",
+          "child_agent_id" => child_agent_id,
+          "child_run_id" => child_run_id,
+          "status" => status
+        })
+        |> Map.put_new(
+          "idempotency_key",
+          stable_id("agent_run_child_completion", [
+            run_or_id,
+            child_agent_id,
+            child_run_id,
+            status
+          ])
+        )
 
-    metadata =
-      attrs
-      |> Map.merge(%{
-        "schema_version" => "holtworks_agent_run_child_completion_event/v1",
-        "child_agent_id" => attrs["child_agent_id"] || attrs["agent_id"],
-        "status" => attrs["status"] || "completed"
-      })
-      |> Map.put_new(
-        "idempotency_key",
-        RuntimeContracts.stable_id("agent_run_child_completion", [
-          run_or_id,
-          attrs["child_agent_id"] || attrs["agent_id"],
-          attrs["child_run_id"] || attrs["run_id"],
-          attrs["status"]
-        ])
+      record_event_once(
+        root,
+        run_or_id,
+        "child_agent.completed",
+        message,
+        metadata
       )
-
-    record_event_once(
-      root,
-      run_or_id,
-      "child_agent.completed",
-      attrs["message"] || "Child agent completion recorded.",
-      metadata
-    )
+    end
   end
 
   def record_child_agent_completion(_root, _run_or_id, _attrs),
     do: {:error, :invalid_child_agent_completion}
 
-  def record_tool_event(root, run_or_id, tool_name, tool_call_id, result, attrs \\ %{})
+  def record_action_event(root, run_or_id, action_name, action_call_id, result, attrs \\ %{})
 
-  def record_tool_event(root, run_or_id, tool_name, tool_call_id, result, attrs)
-      when is_binary(tool_name) and tool_name != "" do
-    attrs = RuntimeContracts.string_keys(attrs)
-    result = normalize_event_value(result)
-    status = attrs["status"] || attrs["result_status"] || tool_result_status(result)
+  def record_action_event(root, run_or_id, action_name, action_call_id, result, attrs)
+      when is_binary(action_name) and action_name != "" do
+    with :ok <- canonical_event_attrs(attrs, :invalid_attrs),
+         :ok <- canonical_event_value(result, :invalid_attrs) do
+      result = normalize_event_value(result)
+      status = action_result_status(result)
 
-    metadata =
-      attrs
-      |> Map.drop(["kind", "type", "message", "tool", "tool_name", "tool_call_id"])
-      |> Map.merge(%{
-        "schema_version" => "holtworks_agent_run_tool_event/v1",
-        "tool_name" => tool_name,
-        "tool_call_id" => tool_call_id,
-        "status" => status,
-        "effective_work" => tool_effective_work?(status, attrs),
-        "result_preview" => attrs["result_preview"] || preview(result),
-        "result" => result
-      })
-      |> Map.put_new(
-        "idempotency_key",
-        RuntimeContracts.stable_id("agent_run_tool_event", [
-          run_or_id,
-          tool_name,
-          tool_call_id,
-          status,
-          attrs["idempotency_key"]
-        ])
+      metadata =
+        attrs
+        |> Map.drop(["kind", "type", "message", "action", "action_call_id"])
+        |> Map.merge(%{
+          "schema_version" => "holt_agent_run_action_event/v1",
+          "action" => action_name,
+          "action_call_id" => action_call_id,
+          "status" => status,
+          "effective_work" => action_effective_work?(status, attrs),
+          "result_preview" => preview(result),
+          "result" => result
+        })
+        |> Map.put_new(
+          "idempotency_key",
+          stable_id("agent_run_action_event", [
+            run_or_id,
+            action_name,
+            action_call_id,
+            status,
+            attrs["idempotency_key"]
+          ])
+        )
+
+      record_event_once(
+        root,
+        run_or_id,
+        "action.completed",
+        event_message(attrs, "Action event recorded."),
+        metadata
       )
-
-    record_event_once(
-      root,
-      run_or_id,
-      "tool.completed",
-      attrs["message"] || "Tool event recorded.",
-      metadata
-    )
+    end
   end
 
-  def record_tool_event(_root, _run_or_id, _tool_name, _tool_call_id, _result, _attrs),
-    do: {:error, :invalid_tool_event}
+  def record_action_event(_root, _run_or_id, _action_name, _action_call_id, _result, _attrs),
+    do: {:error, :invalid_action_event}
 
   def record_objective_evaluation(root, run_or_id, route, attrs \\ %{})
 
   def record_objective_evaluation(root, run_or_id, route, attrs) when is_map(route) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    route = RuntimeContracts.string_keys(route)
+    with :ok <- canonical_objective_evaluation(route, attrs),
+         {:ok, message} <- required_objective_text(attrs, "message"),
+         {:ok, verification_status} <- required_objective_text(attrs, "verification_status") do
+      metadata =
+        attrs
+        |> Map.drop(["kind", "type", "message", "route", "evaluation"])
+        |> Map.merge(%{
+          "schema_version" => "holt_agent_run_objective_event/v1",
+          "evaluation" => route,
+          "status" => objective_evaluation_status(route, attrs),
+          "verification_status" => verification_status
+        })
+        |> Map.put_new(
+          "idempotency_key",
+          stable_id("agent_run_objective_evaluation", [
+            run_or_id,
+            route["route_id"],
+            route["decision"],
+            route["can_finish"],
+            attrs["idempotency_key"]
+          ])
+        )
 
-    metadata =
-      attrs
-      |> Map.drop(["kind", "type", "message", "route", "evaluation"])
-      |> Map.merge(%{
-        "schema_version" => "holtworks_agent_run_objective_event/v1",
-        "evaluation" => route,
-        "status" => objective_evaluation_status(route, attrs),
-        "verification_status" => attrs["verification_status"] || route["verification_status"]
-      })
-      |> Map.put_new(
-        "idempotency_key",
-        RuntimeContracts.stable_id("agent_run_objective_evaluation", [
-          run_or_id,
-          route["route_id"],
-          route["decision"],
-          route["can_finish"],
-          attrs["idempotency_key"]
-        ])
+      record_event_once(
+        root,
+        run_or_id,
+        "objective.evaluated",
+        message,
+        metadata
       )
-
-    record_event_once(
-      root,
-      run_or_id,
-      "objective.evaluated",
-      attrs["message"] || "Objective evaluation recorded.",
-      metadata
-    )
+    end
   end
 
   def record_objective_evaluation(_root, _run_or_id, _route, _attrs),
@@ -490,7 +512,7 @@ defmodule Holt.Tasks.AgentRuns do
     root
     |> list_for_root()
     |> Enum.find(fn run ->
-      run["id"] == run_or_id or run["run_id"] == run_or_id or run["work_id"] == run_or_id
+      run_matches_identifier?(run, run_or_id)
     end)
     |> case do
       nil -> {:error, :agent_run_not_found}
@@ -499,6 +521,15 @@ defmodule Holt.Tasks.AgentRuns do
   end
 
   def get(_root, _run_or_id), do: {:error, :invalid_agent_run_id}
+
+  defp run_matches_identifier?(run, run_or_id) do
+    cond do
+      run["id"] == run_or_id -> true
+      run["run_id"] == run_or_id -> true
+      run["work_id"] == run_or_id -> true
+      true -> false
+    end
+  end
 
   def latest_for_task_agent(root, task_id, agent_id) do
     root
@@ -518,14 +549,13 @@ defmodule Holt.Tasks.AgentRuns do
   def record_process_event(root, run_or_id, kind, payload, opts)
       when is_binary(kind) and is_map(payload) do
     with {:ok, run} <- get(root, run_or_id) do
-      idempotency_key =
-        Keyword.get(opts, :idempotency_key) || process_event_idempotency_key(kind, payload, run)
+      idempotency_key = process_event_key(opts, kind, payload, run)
 
       case find_event_by_idempotency_key(root, idempotency_key) do
         nil ->
           metadata =
             %{
-              "schema_version" => "holtworks_agent_run_process_event/v1",
+              "schema_version" => "holt_agent_run_process_event/v1",
               "idempotency_key" => idempotency_key,
               "trigger" => Keyword.get(opts, :trigger),
               "process" => payload
@@ -554,6 +584,16 @@ defmodule Holt.Tasks.AgentRuns do
   def record_process_event(_root, _run_or_id, _kind, _payload, _opts),
     do: {:error, :invalid_process_event}
 
+  defp process_event_key(opts, kind, payload, run) do
+    case Keyword.get(opts, :idempotency_key) do
+      idempotency_key when is_binary(idempotency_key) and idempotency_key != "" ->
+        idempotency_key
+
+      _missing ->
+        process_event_idempotency_key(kind, payload, run)
+    end
+  end
+
   def watchdog_snapshot(root, run) when is_map(run) do
     events =
       root
@@ -562,7 +602,7 @@ defmodule Holt.Tasks.AgentRuns do
       |> Enum.take(-8)
 
     %{
-      "schema_version" => "holtworks_agent_run_watchdog_snapshot/v1",
+      "schema_version" => "holt_agent_run_watchdog_snapshot/v1",
       "agent_run_id" => run["id"],
       "task_id" => run["task_id"],
       "task_ref" => run["task_ref"],
@@ -693,7 +733,7 @@ defmodule Holt.Tasks.AgentRuns do
         "agent_run.wake_queued",
         "Process wake continuation queued.",
         %{
-          "schema_version" => "holtworks_agent_run_process_wake/v1",
+          "schema_version" => "holt_agent_run_process_wake/v1",
           "source" => packet["source"],
           "reason" => reason,
           "process_event_id" => packet["process_event_id"],
@@ -727,7 +767,7 @@ defmodule Holt.Tasks.AgentRuns do
       "agent_run.wake_failed",
       "Process wake continuation could not be queued.",
       %{
-        "schema_version" => "holtworks_agent_run_process_wake/v1",
+        "schema_version" => "holt_agent_run_process_wake/v1",
         "source" => packet["source"],
         "reason" => to_string(reason),
         "process_event_id" => packet["process_event_id"],
@@ -758,16 +798,16 @@ defmodule Holt.Tasks.AgentRuns do
     %{"last_narration_at" => now}
   end
 
-  defp event_activity_update("tool.completed", metadata, now) do
+  defp event_activity_update("action.completed", metadata, now) do
     update =
       %{
-        "last_tool_event_at" => now,
-        "last_tool_event" =>
-          Map.take(metadata, ["tool_name", "tool_call_id", "status", "effective_work"]),
+        "last_action_event_at" => now,
+        "last_action_event" =>
+          Map.take(metadata, ["action", "action_call_id", "status", "effective_work"]),
         "heartbeat_at" => now
       }
 
-    if tool_metadata_effective?(metadata) do
+    if action_metadata_effective?(metadata) do
       Map.merge(update, %{
         "last_effective_work_at" => now,
         "last_observed_progress_at" => now,
@@ -796,7 +836,7 @@ defmodule Holt.Tasks.AgentRuns do
       %{
         "last_child_agent_completion_at" => now,
         "last_child_agent_completion" =>
-          Map.take(metadata, ["child_agent_id", "child_run_id", "run_id", "status"]),
+          Map.take(metadata, ["child_agent_id", "child_run_id", "status"]),
         "heartbeat_at" => now
       }
 
@@ -825,23 +865,39 @@ defmodule Holt.Tasks.AgentRuns do
   end
 
   defp agent_matches?(run, agent_id) do
-    run["agent_id"] == agent_id or agent_id in List.wrap(run["agent_ids"])
+    cond do
+      run["agent_id"] == agent_id -> true
+      agent_id in List.wrap(run["agent_ids"]) -> true
+      true -> false
+    end
   end
 
   defp task_matches?(run, task_ref_or_id) do
-    run["task_id"] == task_ref_or_id or run["task_ref"] == task_ref_or_id
+    cond do
+      run["task_id"] == task_ref_or_id -> true
+      run["task_ref"] == task_ref_or_id -> true
+      true -> false
+    end
   end
 
   defp filter_event_kind(events, nil), do: events
   defp filter_event_kind(events, ""), do: events
 
   defp filter_event_kind(events, kind) do
-    kinds = RuntimeContracts.normalize_string_list(kind)
+    kinds = string_list(kind)
 
     if kinds == [] do
       events
     else
-      Enum.filter(events, &(&1["kind"] in kinds or &1["type"] in kinds))
+      Enum.filter(events, &event_kind_matches?(&1, kinds))
+    end
+  end
+
+  defp event_kind_matches?(event, kinds) do
+    cond do
+      event["kind"] in kinds -> true
+      event["type"] in kinds -> true
+      true -> false
     end
   end
 
@@ -854,16 +910,12 @@ defmodule Holt.Tasks.AgentRuns do
 
     previous =
       Enum.find(runs, fn candidate ->
-        candidate["id"] == run["previous_agent_run_id"] or
-          candidate["run_id"] == run["previous_run_id"] or
-          candidate["work_id"] == run["continuation_of"]
+        previous_run?(candidate, run)
       end)
 
     continuations =
       Enum.filter(runs, fn candidate ->
-        candidate["previous_agent_run_id"] == run["id"] or
-          candidate["previous_run_id"] == run["run_id"] or
-          candidate["continuation_of"] == run["work_id"]
+        continuation_run?(candidate, run)
       end)
 
     %{
@@ -873,24 +925,53 @@ defmodule Holt.Tasks.AgentRuns do
     |> reject_empty()
   end
 
-  defp event_idempotency_key(run, kind, message, metadata) do
-    metadata = normalize_metadata(metadata)
-
-    metadata["idempotency_key"] ||
-      RuntimeContracts.stable_id("agent_run_event", [
-        run["id"],
-        kind,
-        message,
-        Map.drop(metadata, ["idempotency_key"])
-      ])
+  defp previous_run?(candidate, run) do
+    cond do
+      candidate["id"] == run["previous_agent_run_id"] -> true
+      candidate["run_id"] == run["previous_run_id"] -> true
+      candidate["work_id"] == run["continuation_of"] -> true
+      true -> false
+    end
   end
 
-  defp normalize_metadata(metadata) when is_map(metadata),
-    do: RuntimeContracts.string_keys(metadata)
+  defp continuation_run?(candidate, run) do
+    cond do
+      candidate["previous_agent_run_id"] == run["id"] -> true
+      candidate["previous_run_id"] == run["run_id"] -> true
+      candidate["continuation_of"] == run["work_id"] -> true
+      true -> false
+    end
+  end
 
-  defp normalize_metadata(_metadata), do: %{}
+  defp event_idempotency_key(run, kind, message, metadata) do
+    event_idempotency_value(metadata, [
+      "agent_run_event",
+      run["id"],
+      kind,
+      message,
+      Map.drop(metadata, ["idempotency_key"])
+    ])
+  end
 
-  defp normalize_event_value(value) when is_map(value), do: RuntimeContracts.string_keys(value)
+  defp event_idempotency_value(%{"idempotency_key" => idempotency_key}, _stable_parts)
+       when is_binary(idempotency_key) and idempotency_key != "" do
+    idempotency_key
+  end
+
+  defp event_idempotency_value(_metadata, [prefix | parts]), do: stable_id(prefix, parts)
+
+  defp event_metadata_map(metadata) when metadata in [nil, []], do: {:ok, %{}}
+
+  defp event_metadata_map(metadata) when is_map(metadata) do
+    case canonical_value?(metadata) do
+      true -> {:ok, metadata}
+      false -> {:error, :invalid_agent_run_event_metadata}
+    end
+  end
+
+  defp event_metadata_map(_metadata), do: {:error, :invalid_agent_run_event_metadata}
+
+  defp normalize_event_value(value) when is_map(value), do: value
 
   defp normalize_event_value(value) when is_list(value),
     do: Enum.map(value, &normalize_event_value/1)
@@ -905,15 +986,132 @@ defmodule Holt.Tasks.AgentRuns do
 
   defp normalize_event_value(value), do: value
 
-  defp tool_result_status(%{"status" => status}) when is_binary(status) and status != "",
+  defp action_result_status(%{"status" => status}) when is_binary(status) and status != "",
     do: status
 
-  defp tool_result_status(%{"tuple_status" => status}) when is_binary(status) and status != "",
+  defp action_result_status(%{"tuple_status" => status}) when is_binary(status) and status != "",
     do: status
 
-  defp tool_result_status(_result), do: "unknown"
+  defp action_result_status(_result), do: "unknown"
 
-  defp tool_effective_work?(status, attrs) do
+  defp event_message(attrs, default) do
+    case attrs["message"] do
+      value when value in [nil, ""] -> default
+      message -> message
+    end
+  end
+
+  defp narration_body(attrs) do
+    case attrs["body"] do
+      value when value in [nil, ""] -> {:error, {:missing_required, "body"}}
+      body -> {:ok, body}
+    end
+  end
+
+  defp canonical_child_completion_attrs(attrs) do
+    if canonical_value?(attrs) do
+      :ok
+    else
+      {:error, :invalid_child_agent_completion}
+    end
+  end
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      _entry -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp canonical_event_attrs(attrs, reason) do
+    case canonical_value?(attrs) do
+      true -> :ok
+      false -> {:error, reason}
+    end
+  end
+
+  defp canonical_event_value({status, payload}, reason) when is_atom(status),
+    do: canonical_event_value(payload, reason)
+
+  defp canonical_event_value({status, payload}, reason) when is_binary(status),
+    do: canonical_event_value(payload, reason)
+
+  defp canonical_event_value(value, reason) do
+    case canonical_value?(value) do
+      true -> :ok
+      false -> {:error, reason}
+    end
+  end
+
+  defp reject_child_completion_aliases(attrs) do
+    cond do
+      Map.has_key?(attrs, "agent_id") ->
+        {:error, {:obsolete_child_completion_key, "agent_id", "child_agent_id"}}
+
+      Map.has_key?(attrs, "run_id") ->
+        {:error, {:obsolete_child_completion_key, "run_id", "child_run_id"}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp required_child_completion_text(attrs, key) do
+    case Map.get(attrs, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _value -> {:error, {:missing_required, key}}
+    end
+  end
+
+  defp canonical_continuation_packet(packet) do
+    if canonical_value?(packet) do
+      :ok
+    else
+      {:error, :invalid_continuation_packet}
+    end
+  end
+
+  defp continuation_packet_schema(%{"schema_version" => "holt_continuation_packet/v1"}), do: :ok
+  defp continuation_packet_schema(_packet), do: {:error, :invalid_continuation_packet_schema}
+
+  defp required_continuation_packet_text(packet, key) do
+    case Map.get(packet, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _value -> {:error, {:missing_required, key}}
+    end
+  end
+
+  defp required_continuation_packet_integer(packet, key) do
+    case Map.get(packet, key) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _value -> {:error, {:invalid_integer, key}}
+    end
+  end
+
+  defp canonical_objective_evaluation(route, attrs) do
+    cond do
+      canonical_value?(route) == false ->
+        {:error, :invalid_objective_evaluation}
+
+      canonical_value?(attrs) == false ->
+        {:error, :invalid_objective_evaluation}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp required_objective_text(attrs, key) do
+    case Map.get(attrs, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _value -> {:error, {:missing_required, key}}
+    end
+  end
+
+  defp action_effective_work?(status, attrs) do
     case attrs["effective_work"] do
       true -> true
       false -> false
@@ -921,7 +1119,7 @@ defmodule Holt.Tasks.AgentRuns do
     end
   end
 
-  defp tool_metadata_effective?(metadata), do: metadata["effective_work"] == true
+  defp action_metadata_effective?(metadata), do: metadata["effective_work"] == true
 
   defp objective_evaluation_status(route, attrs) do
     cond do
@@ -957,12 +1155,21 @@ defmodule Holt.Tasks.AgentRuns do
 
   defp objective_verification_gate(metadata) do
     %{
-      "schema_version" => "holtworks_agent_run_objective_gate/v1",
-      "status" => metadata["verification_status"] || metadata["status"],
+      "schema_version" => "holt_agent_run_objective_gate/v1",
+      "status" => objective_gate_status(metadata),
       "evaluation" => metadata["evaluation"]
     }
     |> reject_empty()
   end
+
+  defp objective_gate_status(%{"verification_status" => status})
+       when is_binary(status) and status != "",
+       do: status
+
+  defp objective_gate_status(%{"status" => status}) when is_binary(status) and status != "",
+    do: status
+
+  defp objective_gate_status(_metadata), do: nil
 
   defp preview(nil), do: nil
 
@@ -998,24 +1205,63 @@ defmodule Holt.Tasks.AgentRuns do
 
   defp positive_integer(_value), do: nil
 
-  defp option_value(opts, key) when is_list(opts) do
-    Keyword.get(opts, key) || keyword_string_value(opts, to_string(key))
+  defp event_kind_filter(%{"kind" => kind}), do: kind
+  defp event_kind_filter(%{"type" => type}), do: type
+
+  defp event_kind_filter(opts) when is_list(opts) do
+    case Keyword.fetch(opts, :kind) do
+      {:ok, kind} -> kind
+      :error -> Keyword.get(opts, :type)
+    end
   end
 
-  defp option_value(opts, key) when is_map(opts) do
-    Map.get(opts, key) || Map.get(opts, to_string(key))
+  defp event_kind_filter(_opts), do: nil
+
+  defp event_run_filter(%{"agent_run_id" => run_id}), do: run_id
+  defp event_run_filter(%{"run_id" => run_id}), do: run_id
+
+  defp event_run_filter(opts) when is_list(opts) do
+    case Keyword.fetch(opts, :agent_run_id) do
+      {:ok, run_id} -> run_id
+      :error -> Keyword.get(opts, :run_id)
+    end
   end
 
+  defp event_run_filter(_opts), do: nil
+
+  defp event_limit_filter(%{"limit" => limit}), do: limit
+  defp event_limit_filter(opts) when is_list(opts), do: Keyword.get(opts, :limit)
+  defp event_limit_filter(_opts), do: nil
+
+  defp option_value(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+  defp option_value(opts, key) when is_map(opts), do: Map.get(opts, key)
   defp option_value(_opts, _key), do: nil
 
-  defp keyword_string_value(opts, key) do
-    Enum.find_value(opts, fn
-      {current_key, value} when is_binary(current_key) ->
-        if current_key == key, do: value, else: nil
+  defp string_list(nil), do: []
 
-      _entry ->
-        nil
-    end)
+  defp string_list(values) when is_list(values) do
+    values
+    |> Enum.flat_map(&string_list/1)
+    |> Enum.uniq()
+  end
+
+  defp string_list(value) when is_binary(value) do
+    value
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp string_list(_value), do: []
+
+  defp stable_id(prefix, parts) do
+    digest =
+      :crypto.hash(:sha256, :erlang.term_to_binary(parts))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    "#{prefix}_#{digest}"
   end
 
   defp maybe_put(map, _key, value) when value in [nil, "", [], %{}], do: map
@@ -1029,12 +1275,12 @@ defmodule Holt.Tasks.AgentRuns do
   defp base_record(task, work, now) do
     %{
       "schema_version" => @schema_version,
-      "id" => work["agent_run_id"] || Clock.id("agent_run"),
+      "id" => agent_run_id(work),
       "task_id" => task["id"],
       "task_ref" => task["ref"],
       "task_title" => task["title"],
       "agent_id" => first_agent_id(work),
-      "agent_ids" => work["agent_ids"] || [],
+      "agent_ids" => agent_ids(work),
       "assignee" => work["assignee"],
       "dispatch_id" => work["dispatch_id"],
       "dispatch_plan" => work["dispatch_plan"],
@@ -1050,6 +1296,15 @@ defmodule Holt.Tasks.AgentRuns do
       "updated_at" => now
     }
   end
+
+  defp agent_run_id(%{"agent_run_id" => agent_run_id})
+       when is_binary(agent_run_id) and agent_run_id != "",
+       do: agent_run_id
+
+  defp agent_run_id(_work), do: Clock.id("agent_run")
+
+  defp agent_ids(%{"agent_ids" => agent_ids}) when is_list(agent_ids), do: agent_ids
+  defp agent_ids(_work), do: []
 
   defp existing_or_base(root, task, work, now) do
     list_for_root(root)
@@ -1164,20 +1419,41 @@ defmodule Holt.Tasks.AgentRuns do
   end
 
   defp agent_loop_contract(task, work, lifecycle_state, status, now, attrs \\ %{}) do
-    AgentLoop.contract(%{
+    %{
       "task" => task,
       "agent" => work,
       "agent_id" => work["agent_id"],
-      "policy" => Map.get(attrs, "policy", work["policy"] || %{}),
+      "policy" => agent_loop_policy(attrs, work),
       "decision" => Map.get(attrs, "continuation_decision", %{}),
-      "continuation_count" => max((work["iteration"] || 1) - 1, 0),
+      "continuation_count" => continuation_count(work),
       "lifecycle_state" => lifecycle_state,
       "status" => status,
-      "loop_started_at" => work["created_at"] || work["started_at"] || now,
+      "loop_started_at" => loop_started_at(work, now),
       "now" => now,
       "source" => work["source"]
-    })
+    }
+    |> reject_empty()
+    |> AgentLoop.contract()
   end
+
+  defp agent_loop_policy(%{"policy" => policy}, _work) when is_map(policy), do: policy
+  defp agent_loop_policy(_attrs, %{"policy" => policy}) when is_map(policy), do: policy
+  defp agent_loop_policy(_attrs, _work), do: %{}
+
+  defp continuation_count(%{"iteration" => iteration}) when is_integer(iteration),
+    do: max(iteration - 1, 0)
+
+  defp continuation_count(_work), do: 0
+
+  defp loop_started_at(%{"created_at" => created_at}, _now)
+       when is_binary(created_at) and created_at != "",
+       do: created_at
+
+  defp loop_started_at(%{"started_at" => started_at}, _now)
+       when is_binary(started_at) and started_at != "",
+       do: started_at
+
+  defp loop_started_at(_work, now), do: now
 
   defp transition_or_keep(current_state, next_state) do
     case AgentRunStateMachine.transition(current_state, next_state) do
@@ -1195,16 +1471,28 @@ defmodule Holt.Tasks.AgentRuns do
   end
 
   defp process_event_idempotency_key(kind, payload, run) do
-    identity =
-      payload["managed_process_id"] ||
-        payload["status_path"] ||
-        payload["sandbox_pid"] ||
-        payload["process_id"] ||
-        payload_fingerprint(payload)
+    identity = process_identity(payload)
 
     ["agent_process_event", run["id"], kind, identity]
     |> Enum.reject(&blank?/1)
     |> Enum.join(":")
+  end
+
+  defp process_identity(payload) do
+    ["managed_process_id", "status_path", "sandbox_pid", "process_id"]
+    |> Enum.find_value(&process_identity_value(payload, &1))
+    |> case do
+      nil -> payload_fingerprint(payload)
+      identity -> identity
+    end
+  end
+
+  defp process_identity_value(payload, key) do
+    case Map.get(payload, key) do
+      value when is_binary(value) and value != "" -> value
+      value when is_integer(value) -> value
+      _missing -> nil
+    end
   end
 
   defp payload_fingerprint(payload) do

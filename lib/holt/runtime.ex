@@ -3,55 +3,66 @@ defmodule Holt.Runtime do
   Local agent loop for Holt.
   """
 
-  alias Holt.Runtime.{Context, EventRecorder, Runs}
+  alias Holt.Runtime.{ChatMessages, Context, EventRecorder, Runs}
+  alias Holt.Actions.{Executor, ProviderAdapter, Registry}
   alias Holt.Tasks.OutputSanitizer
-  alias Holt.Tasks.{RuntimeContracts, TaskToolSession}
+  alias Holt.Tasks.ActionSession
 
   alias Holt.{
-    Actions,
     Clock,
     Config,
     Memory,
     Models,
     Paths,
-    Tools,
-    ToolVisibility,
+    LocalActions,
+    ActionVisibility,
     Workspace
   }
 
   def run(objective, opts \\ []) when is_binary(objective) do
-    home = Paths.home(opts)
-    root = Paths.workspace_root(opts)
-    Holt.Env.load(opts)
-    Config.bootstrap(home: home)
-    Workspace.init(root)
-    provider = Models.default_provider(home)
-    model = "#{provider["type"]}:#{provider["model"] || provider["id"]}"
+    with :ok <- validate_runtime_opts(opts) do
+      home = Paths.home(opts)
+      root = Paths.workspace_root(opts)
+      Holt.Env.load(opts)
+      Config.bootstrap(home: home)
+      workspace_initialized? = Workspace.initialized?(root)
+      {:ok, pre_task_plan} = pre_task_plan(opts, workspace_initialized?)
+      maybe_init_workspace(root, pre_task_plan)
+      provider = runtime_provider(home, opts)
+      model = provider_runtime_model(provider)
 
-    run_opts =
-      opts
-      |> Keyword.merge(model: model)
-      |> maybe_put_resumed_from()
+      run_opts =
+        opts
+        |> Keyword.merge(model: model)
+        |> maybe_put_resumed_from()
+        |> maybe_put_forked_from()
+        |> Keyword.put(:pre_task_plan, pre_task_plan)
+        |> Keyword.put(:workspace_discovery, pre_task_plan["workspace_discovery"])
 
-    with {:ok, run} <- Runs.start(objective, run_opts),
-         run_dir <- run["run_dir"],
-         {:ok, _run} <- Runs.transition(run_dir, "running") do
-      runtime_opts = agent_event_runtime_opts(opts, run, provider, root)
-      session_id = runtime_opts[:agent_event_session_id]
+      with {:ok, run} <- start_run(objective, run_opts, pre_task_plan),
+           run_dir <- run["run_dir"],
+           {:ok, _run} <- Runs.transition(run_dir, "running") do
+        runtime_opts =
+          opts
+          |> agent_event_runtime_opts(run, provider, root, pre_task_plan)
+          |> put_pre_task_plan_opts(pre_task_plan)
 
-      EventRecorder.session_started(
-        session_id,
-        agent_event_opts(runtime_opts,
-          objective: objective,
-          model: model,
-          provider: provider["id"] || provider["type"]
+        session_id = runtime_opts[:agent_event_session_id]
+
+        maybe_record_session_started(
+          session_id,
+          agent_event_opts(runtime_opts,
+            objective: objective,
+            model: model,
+            provider: provider_id(provider)
+          )
         )
-      )
 
-      progress(run_dir, runtime_opts, :started, "Starting request")
-      result = execute_local_loop(objective, provider, run_dir, runtime_opts)
-      record_session_result(session_id, result, runtime_opts)
-      result
+        progress(run_dir, runtime_opts, :started, "Starting request")
+        result = execute_local_loop(objective, provider, run_dir, runtime_opts)
+        record_session_result(session_id, result, runtime_opts)
+        result
+      end
     end
   rescue
     reason ->
@@ -71,6 +82,23 @@ defmodule Holt.Runtime do
     end
   end
 
+  def fork(run_ref \\ "latest", opts \\ []) do
+    root = Paths.workspace_root(opts)
+
+    case Runs.find(root, run_ref) do
+      nil ->
+        {:error, :run_not_found}
+
+      run ->
+        objective = fork_objective(opts, run)
+
+        opts
+        |> Keyword.delete(:objective)
+        |> Keyword.put(:forked_from, run["id"])
+        |> then(&run(objective, &1))
+    end
+  end
+
   def status(opts \\ []) do
     root = Paths.workspace_root(opts)
     latest = Runs.latest(root)
@@ -83,16 +111,241 @@ defmodule Holt.Runtime do
     }
   end
 
+  defp validate_runtime_opts(opts) do
+    cond do
+      Keyword.has_key?(opts, :chat_context) ->
+        {:error, {:obsolete_opt, :chat_context, :chat_messages}}
+
+      true ->
+        with :ok <- validate_runtime_contract(opts),
+             :ok <- validate_workspace_persistence(opts),
+             :ok <- validate_workspace_intent(opts),
+             :ok <- validate_workspace_persistence_contract(opts) do
+          opts
+          |> Keyword.get(:chat_messages, [])
+          |> ChatMessages.normalize()
+          |> case do
+            {:ok, _messages} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        end
+    end
+  end
+
+  defp validate_runtime_contract(opts) do
+    contract = Keyword.get(opts, :runtime_contract)
+    mode = Keyword.get(opts, :mode)
+
+    cond do
+      contract in [nil, ""] ->
+        :ok
+
+      mode not in [nil, ""] ->
+        {:error, {:conflicting_runtime_contract, "runtime_contract", "mode"}}
+
+      contract in ["chat_turn", :chat_turn, "goal", :goal] ->
+        :ok
+
+      true ->
+        {:error, {:unsupported_runtime_contract, contract}}
+    end
+  end
+
+  defp validate_workspace_persistence(opts) do
+    case Keyword.get(opts, :workspace_persistence) do
+      nil -> :ok
+      "workspace" -> :ok
+      "ephemeral" -> :ok
+      value -> {:error, {:unsupported_workspace_persistence, value}}
+    end
+  end
+
+  defp validate_workspace_intent(opts) do
+    case Keyword.get(opts, :workspace_intent) do
+      nil -> :ok
+      "none" -> :ok
+      "explore_project" -> :ok
+      value -> {:error, {:unsupported_workspace_intent, value}}
+    end
+  end
+
+  defp validate_workspace_persistence_contract(opts) do
+    case {Keyword.get(opts, :workspace_persistence), runtime_contract(opts), run_lineage(opts)} do
+      {"ephemeral", :plan_artifact, _lineage} ->
+        {:error,
+         {:conflicting_workspace_persistence, "workspace_persistence", "runtime_contract"}}
+
+      {"ephemeral", :goal, _lineage} ->
+        {:error,
+         {:conflicting_workspace_persistence, "workspace_persistence", "runtime_contract"}}
+
+      {"ephemeral", _contract, "resumed_from"} ->
+        {:error, {:conflicting_workspace_persistence, "workspace_persistence", "resumed_from"}}
+
+      {"ephemeral", _contract, "forked_from"} ->
+        {:error, {:conflicting_workspace_persistence, "workspace_persistence", "forked_from"}}
+
+      _allowed ->
+        :ok
+    end
+  end
+
+  defp runtime_contract(opts) do
+    case explicit_runtime_contract(Keyword.get(opts, :runtime_contract)) do
+      {:ok, contract} -> contract
+      :none -> mode_runtime_contract(Keyword.get(opts, :mode))
+    end
+  end
+
+  defp explicit_runtime_contract(nil), do: :none
+  defp explicit_runtime_contract(""), do: :none
+  defp explicit_runtime_contract("chat_turn"), do: {:ok, :chat_turn}
+  defp explicit_runtime_contract(:chat_turn), do: {:ok, :chat_turn}
+  defp explicit_runtime_contract("goal"), do: {:ok, :goal}
+  defp explicit_runtime_contract(:goal), do: {:ok, :goal}
+
+  defp mode_runtime_contract("chat"), do: :chat_turn
+  defp mode_runtime_contract(:chat), do: :chat_turn
+  defp mode_runtime_contract(_mode), do: :plan_artifact
+
+  defp chat_turn_contract?(opts), do: runtime_contract(opts) == :chat_turn
+  defp goal_contract?(opts), do: runtime_contract(opts) == :goal
+
+  defp pre_task_plan(opts, workspace_initialized?) do
+    contract = runtime_contract(opts)
+    intent = workspace_intent(opts)
+    {persistence, reason} = workspace_persistence_decision(opts, contract)
+    discovery = workspace_discovery_decision(persistence, intent, workspace_initialized?)
+
+    {:ok,
+     %{
+       "schema_version" => "holt_pre_task_plan/v1",
+       "runtime_contract" => Atom.to_string(contract),
+       "workspace_persistence" => persistence,
+       "workspace_discovery" => discovery,
+       "workspace_intent" => intent,
+       "reason" => reason
+     }}
+  end
+
+  defp workspace_intent(opts) do
+    case Keyword.get(opts, :workspace_intent) do
+      intent when is_binary(intent) and intent != "" -> intent
+      _missing -> "none"
+    end
+  end
+
+  defp workspace_persistence_decision(opts, contract) do
+    case Keyword.get(opts, :workspace_persistence) do
+      "workspace" ->
+        {"workspace", "explicit_workspace_persistence"}
+
+      "ephemeral" ->
+        {"ephemeral", "explicit_workspace_persistence"}
+
+      nil ->
+        default_workspace_persistence_decision(contract, run_lineage(opts))
+    end
+  end
+
+  defp default_workspace_persistence_decision(:plan_artifact, _lineage),
+    do: {"workspace", "runtime_contract_requires_workspace"}
+
+  defp default_workspace_persistence_decision(:goal, _lineage),
+    do: {"workspace", "runtime_contract_requires_workspace"}
+
+  defp default_workspace_persistence_decision(:chat_turn, "resumed_from"),
+    do: {"workspace", "run_lineage_requires_workspace"}
+
+  defp default_workspace_persistence_decision(:chat_turn, "forked_from"),
+    do: {"workspace", "run_lineage_requires_workspace"}
+
+  defp default_workspace_persistence_decision(:chat_turn, "none"),
+    do: {"ephemeral", "chat_turn_without_workspace_write"}
+
+  defp workspace_discovery_decision(_persistence, "explore_project", _workspace_initialized?),
+    do: "project_context"
+
+  defp workspace_discovery_decision("workspace", "none", true), do: "project_context"
+
+  defp workspace_discovery_decision(_persistence, "none", _workspace_initialized?),
+    do: "agent_instructions_only"
+
+  defp run_lineage(opts) do
+    case {Keyword.get(opts, :resumed_from), Keyword.get(opts, :forked_from)} do
+      {resumed_from, _forked_from} when resumed_from not in [nil, ""] -> "resumed_from"
+      {_resumed_from, forked_from} when forked_from not in [nil, ""] -> "forked_from"
+      _lineage -> "none"
+    end
+  end
+
+  defp maybe_init_workspace(root, %{"workspace_persistence" => "workspace"}),
+    do: Workspace.init(root)
+
+  defp maybe_init_workspace(_root, %{"workspace_persistence" => "ephemeral"}), do: :ok
+
+  defp start_run(objective, opts, %{"workspace_persistence" => "workspace"}),
+    do: Runs.start(objective, opts)
+
+  defp start_run(objective, opts, %{"workspace_persistence" => "ephemeral"}),
+    do: Runs.start_ephemeral(objective, opts)
+
+  defp runtime_provider(home, opts) do
+    provider =
+      case Keyword.get(opts, :provider) do
+        provider_id when is_binary(provider_id) and provider_id != "" ->
+          Models.provider(home, provider_id)
+
+        _default ->
+          Models.default_provider(home)
+      end
+
+    provider
+    |> maybe_put_provider_opt("model", Keyword.get(opts, :model))
+    |> maybe_put_provider_opt("base_url", Keyword.get(opts, :base_url))
+    |> maybe_put_provider_opt("api_key_env", Keyword.get(opts, :api_key_env))
+  end
+
+  defp maybe_put_provider_opt(provider, _key, value) when value in [nil, ""], do: provider
+  defp maybe_put_provider_opt(provider, key, value), do: Map.put(provider, key, value)
+
+  defp provider_id(%{"id" => id}) when is_binary(id) and id != "", do: id
+
+  defp provider_id(provider) do
+    raise ArgumentError, "runtime provider requires a non-empty id: #{inspect(provider)}"
+  end
+
+  defp provider_type(%{"type" => type}) when is_binary(type) and type != "", do: type
+
+  defp provider_type(provider) do
+    raise ArgumentError, "runtime provider requires a non-empty type: #{inspect(provider)}"
+  end
+
+  defp provider_model(%{"model" => model}) when is_binary(model) and model != "", do: model
+
+  defp provider_model(%{"type" => "unknown"} = provider), do: provider_id(provider)
+
+  defp provider_model(provider) do
+    raise ArgumentError, "runtime provider requires a non-empty model: #{inspect(provider)}"
+  end
+
+  defp provider_runtime_model(provider),
+    do: "#{provider_type(provider)}:#{provider_model(provider)}"
+
   defp execute_local_loop(objective, provider, run_dir, opts) do
-    progress(run_dir, opts, :reading, "Reading project context")
+    discovery_mode? = directory_discovery_mode?(opts)
+
+    reading_message =
+      if discovery_mode?, do: "Reading agent instructions", else: "Reading project context"
+
+    progress(run_dir, opts, :reading, reading_message)
     context = Context.build(objective, opts)
     Runs.append_event(run_dir, "context.built", context_event(context))
     Runs.append_transcript(run_dir, "user", objective)
     record_user_message(opts, objective, 0)
 
-    with {:ok, files_result} <- execute_tool(run_dir, "list_files", %{"limit" => 80}, opts),
-         {:ok, memory_result} <-
-           execute_tool(run_dir, "search_memory", %{"query" => objective}, opts),
+    with {:ok, files_result} <- discovery_files_result(run_dir, opts),
+         {:ok, memory_result} <- discovery_memory_result(objective, run_dir, opts),
          {:ok, files_result} <- maybe_enrich_chat_files(objective, run_dir, files_result, opts),
          {:ok, output} <-
            progress_then(run_dir, opts, :thinking, "Thinking through the request", fn ->
@@ -126,15 +379,55 @@ defmodule Holt.Runtime do
     end
   end
 
+  defp discovery_files_result(run_dir, opts) do
+    if directory_discovery_mode?(opts) do
+      {:ok,
+       %{
+         "files" => [],
+         "discovery_mode" => "agent_instructions_only",
+         "agent_instruction_file" => Workspace.agent_instruction_file()
+       }}
+    else
+      execute_action(run_dir, "list", %{"limit" => 80}, opts)
+    end
+  end
+
+  defp discovery_memory_result(objective, run_dir, opts) do
+    if directory_discovery_mode?(opts) do
+      {:ok, %{"matches" => [], "discovery_mode" => "agent_instructions_only"}}
+    else
+      execute_action(run_dir, "recall", %{"query" => objective}, opts)
+    end
+  end
+
+  defp put_pre_task_plan_opts(opts, pre_task_plan) do
+    opts
+    |> Keyword.put(:pre_task_plan, pre_task_plan)
+    |> Keyword.put(:workspace_persistence, pre_task_plan["workspace_persistence"])
+    |> Keyword.put(:workspace_discovery, pre_task_plan["workspace_discovery"])
+    |> Keyword.put(:workspace_intent, pre_task_plan["workspace_intent"])
+    |> put_workspace_discovery_mode(pre_task_plan)
+  end
+
+  defp put_workspace_discovery_mode(opts, %{"workspace_discovery" => "agent_instructions_only"}),
+    do: Keyword.put(opts, :directory_discovery_mode, "agent_instructions_only")
+
+  defp put_workspace_discovery_mode(opts, %{"workspace_discovery" => "project_context"}),
+    do: Keyword.delete(opts, :directory_discovery_mode)
+
+  defp directory_discovery_mode?(opts),
+    do: Keyword.get(opts, :directory_discovery_mode) == "agent_instructions_only"
+
   defp maybe_enrich_chat_files(objective, run_dir, files_result, opts) do
     intent = chat_intent(objective, opts)
 
     files_result =
       files_result
       |> Map.put("chat_intent", Atom.to_string(intent))
-      |> Map.put("chat_context", opts[:chat_context])
+      |> Map.put("chat_messages", chat_messages(opts))
 
-    if chat_mode?(opts) and intent == :workspace_overview do
+    if chat_turn_contract?(opts) and intent == :workspace_overview and
+         not directory_discovery_mode?(opts) do
       overview_files =
         files_result
         |> Map.get("files", [])
@@ -148,7 +441,7 @@ defmodule Holt.Runtime do
   end
 
   defp read_overview_file(run_dir, path, opts) do
-    case execute_tool(run_dir, "read_file", %{"path" => path}, opts) do
+    case execute_action(run_dir, "read", %{"path" => path}, opts) do
       {:ok, result} ->
         result
 
@@ -158,102 +451,16 @@ defmodule Holt.Runtime do
   end
 
   defp overview_file_candidates(files) do
-    root_docs_and_configs =
-      files
-      |> Enum.filter(&root_doc_or_config?/1)
-      |> Enum.sort_by(&root_file_rank/1)
-      |> Enum.take(6)
-
-    representative_sources =
-      files
-      |> Enum.filter(&source_file?/1)
-      |> one_per_top_level_area()
-      |> Enum.take(6)
-
-    representative_tests =
-      files
-      |> Enum.filter(&test_file?/1)
-      |> one_per_top_level_area()
-      |> Enum.take(3)
-
-    (root_docs_and_configs ++ representative_sources ++ representative_tests)
-    |> Enum.uniq()
-    |> Enum.take(8)
-  end
-
-  defp root_doc_or_config?(path) do
-    Path.dirname(path) == "." and text_extension?(Path.extname(path))
-  end
-
-  defp source_file?(path), do: source_extension?(Path.extname(path)) and not test_file?(path)
-
-  defp test_file?(path) do
-    path
-    |> Path.split()
-    |> Enum.any?(&(&1 in ["test", "tests", "spec", "specs", "__tests__"]))
-  end
-
-  defp root_file_rank(path) do
-    name = path |> Path.basename() |> String.downcase()
-
-    cond do
-      String.starts_with?(name, "readme") -> 0
-      Path.extname(name) == ".md" -> 1
-      true -> 2
-    end
-  end
-
-  defp one_per_top_level_area(files) do
     files
-    |> Enum.group_by(&top_level_area/1)
-    |> Enum.map(fn {_area, area_files} -> Enum.min_by(area_files, &file_depth/1) end)
-    |> Enum.sort_by(&file_depth/1)
-  end
-
-  defp top_level_area(path) do
-    path
-    |> Path.split()
-    |> case do
-      [single] -> single
-      [area | _rest] -> area
-      [] -> "."
-    end
-  end
-
-  defp file_depth(path), do: path |> Path.split() |> length()
-
-  defp text_extension?(extension) do
-    extension in [".md", ".txt", ".json", ".toml", ".yaml", ".yml", ".xml", ".env", ".ini"]
-  end
-
-  defp source_extension?(extension) do
-    extension in [
-      ".ex",
-      ".exs",
-      ".rs",
-      ".ts",
-      ".tsx",
-      ".js",
-      ".jsx",
-      ".py",
-      ".go",
-      ".rb",
-      ".java",
-      ".kt",
-      ".swift",
-      ".c",
-      ".h",
-      ".cpp",
-      ".hpp",
-      ".cs"
-    ]
+    |> Enum.filter(&(&1 == Workspace.agent_instruction_file()))
+    |> Enum.take(1)
   end
 
   defp persist_output(objective, provider, run_dir, output, opts) do
-    if chat_mode?(opts) do
-      complete_chat_run(provider, run_dir, output, opts)
-    else
-      persist_plan(objective, provider, run_dir, output, opts)
+    case runtime_contract(opts) do
+      :chat_turn -> complete_chat_run(provider, run_dir, output, opts)
+      :goal -> complete_goal_run(objective, provider, run_dir, output, opts)
+      :plan_artifact -> persist_plan(objective, provider, run_dir, output, opts)
     end
   end
 
@@ -264,8 +471,28 @@ defmodule Holt.Runtime do
 
     {:ok, run} =
       Runs.complete(run_dir, %{
-        "provider" => provider["id"] || provider["type"]
+        "provider" => provider_id(provider)
       })
+
+    {:ok, %{run: run, output: output, artifact: nil}}
+  end
+
+  defp complete_goal_run(objective, provider, run_dir, output, opts) do
+    Runs.append_transcript(run_dir, "assistant", output)
+    emit_stream_chunk(opts, output, turn: 0)
+    progress(run_dir, opts, :completed, "Completed")
+
+    {:ok, run} =
+      Runs.complete(run_dir, %{
+        "provider" => provider_id(provider),
+        "runtime_contract" => "goal"
+      })
+
+    Memory.save(
+      "goal",
+      objective,
+      Keyword.merge(opts, source_run_id: run["id"])
+    )
 
     {:ok, %{run: run, output: output, artifact: nil}}
   end
@@ -280,7 +507,7 @@ defmodule Holt.Runtime do
       "reason" => "Persist the first Holt run artifact."
     }
 
-    case execute_tool(run_dir, "write_file", write_args, opts) do
+    case execute_action(run_dir, "write", write_args, opts) do
       {:ok, write_result} ->
         Memory.save(
           "summary",
@@ -293,7 +520,7 @@ defmodule Holt.Runtime do
         {:ok, run} =
           Runs.complete(run_dir, %{
             "artifact" => Map.get(write_result, "path"),
-            "provider" => provider["id"] || provider["type"]
+            "provider" => provider_id(provider)
           })
 
         {:ok, %{run: run, output: plan, artifact: write_result}}
@@ -302,7 +529,7 @@ defmodule Holt.Runtime do
         progress(run_dir, opts, :blocked, "Waiting for approval")
 
         {:ok, run} =
-          Runs.block(run_dir, "write_file approval denied", %{
+          Runs.block(run_dir, "write approval denied", %{
             "failure_class" => "approval_denied",
             "blocker_code" => "approval_denied"
           })
@@ -316,75 +543,86 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp execute_tool(run_dir, name, args, opts) do
-    tool_call_id = Clock.id("tool_call")
+  defp execute_action(run_dir, name, args, opts) do
+    action_call_id = Clock.id("action_call")
 
-    emit_tool_event(
+    emit_action_event(
       run_dir,
       opts,
-      "tool.started",
-      ToolVisibility.started(name, args, tool_call_id, opts)
+      "action.started",
+      ActionVisibility.started(name, args, action_call_id, opts)
     )
 
-    approval_expected? = ToolVisibility.approval_expected?(name, args, opts)
+    approval_expected? = ActionVisibility.approval_expected?(name, args, opts)
 
     if approval_expected? do
-      emit_tool_event(
+      emit_action_event(
         run_dir,
         opts,
-        "tool.approval_requested",
-        ToolVisibility.approval_requested(name, args, tool_call_id, opts)
+        "action.approval_requested",
+        ActionVisibility.approval_requested(name, args, action_call_id, opts)
       )
     end
 
-    Runs.append_event(run_dir, "tool.requested", %{"tool" => name, "args" => redact_args(args)})
-    record_tool_invocation(opts, name, args, tool_call_id, 0)
+    Runs.append_event(run_dir, "action.requested", %{
+      "action" => name,
+      "args" => redact_args(args)
+    })
 
-    case Tools.execute(name, args, opts) do
+    record_action_invocation(opts, name, args, action_call_id, 0)
+
+    case LocalActions.execute(name, args, opts) do
       {:ok, result} ->
         if approval_expected? do
-          emit_tool_event(
+          emit_action_event(
             run_dir,
             opts,
-            "tool.approval_resolved",
-            ToolVisibility.approval_resolved(name, args, tool_call_id, "approved", opts)
+            "action.approval_resolved",
+            ActionVisibility.approval_resolved(name, args, action_call_id, "approved", opts)
           )
         end
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.completed",
-          ToolVisibility.completed(name, args, result, tool_call_id, opts)
+          "action.completed",
+          ActionVisibility.completed(name, args, result, action_call_id, opts)
           |> Map.merge(%{"result_status" => "ok", "result" => summarize_result(result)})
         )
 
-        record_tool_result(opts, name, %{"status" => "ok", "result" => result}, tool_call_id, 0)
+        record_action_result(
+          opts,
+          name,
+          %{"status" => "ok", "result" => result},
+          action_call_id,
+          0
+        )
+
         {:ok, result}
 
       {:error, reason} ->
         if approval_expected? and reason == :approval_denied do
-          emit_tool_event(
+          emit_action_event(
             run_dir,
             opts,
-            "tool.approval_resolved",
-            ToolVisibility.approval_resolved(name, args, tool_call_id, "denied", opts)
+            "action.approval_resolved",
+            ActionVisibility.approval_resolved(name, args, action_call_id, "denied", opts)
           )
         end
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.failed",
-          ToolVisibility.failed(name, args, reason, tool_call_id, opts)
+          "action.failed",
+          ActionVisibility.failed(name, args, reason, action_call_id, opts)
           |> Map.merge(%{"result_status" => "error", "reason" => inspect(reason)})
         )
 
-        record_tool_result(
+        record_action_result(
           opts,
           name,
           %{"status" => "error", "reason" => inspect(reason)},
-          tool_call_id,
+          action_call_id,
           0
         )
 
@@ -410,7 +648,7 @@ defmodule Holt.Runtime do
     :ok
   end
 
-  defp emit_tool_event(run_dir, opts, type, data) do
+  defp emit_action_event(run_dir, opts, type, data) do
     event = Runs.append_event(run_dir, type, data)
     emit_runtime_event(opts, event)
     event
@@ -447,7 +685,7 @@ defmodule Holt.Runtime do
 
     Objective: #{objective}
 
-    Provider: #{provider["type"]}:#{provider["model"] || "local-planner"}
+    Provider: #{provider_runtime_model(provider)}
 
     ## Workspace Snapshot
 
@@ -470,6 +708,30 @@ defmodule Holt.Runtime do
     """
   end
 
+  defp local_goal_response(objective, provider, context, files_result, memory_result) do
+    file_count = files_result |> Map.get("files", []) |> length()
+    memory_count = memory_result |> Map.get("matches", []) |> length()
+
+    skills =
+      context.skills
+      |> Enum.map(& &1.name)
+      |> case do
+        [] -> "no workspace skills loaded"
+        names -> Enum.join(names, ", ")
+      end
+
+    """
+    Goal: #{objective}
+
+    Runtime contract: goal
+    Provider: #{provider_runtime_model(provider)}
+    Context: #{file_count} workspace files, #{memory_count} memory matches, #{skills}.
+
+    Next action: start build mode with the first concrete change for this goal.
+    """
+    |> String.trim()
+  end
+
   defp local_chat_response(_objective, provider, context, files_result, memory_result) do
     case Map.get(files_result, "chat_intent") do
       "workspace_overview" ->
@@ -481,6 +743,19 @@ defmodule Holt.Runtime do
   end
 
   defp local_general_chat_response(_provider, context, files_result, memory_result) do
+    if files_result["discovery_mode"] == "agent_instructions_only" do
+      """
+      Hello. I'm Holt.
+
+      I loaded only #{context.agent_instruction_file} for this new directory. What should we work on next?
+      """
+      |> String.trim()
+    else
+      local_general_chat_response_loaded(context, files_result, memory_result)
+    end
+  end
+
+  defp local_general_chat_response_loaded(context, files_result, memory_result) do
     file_count =
       files_result
       |> Map.get("files", [])
@@ -508,6 +783,19 @@ defmodule Holt.Runtime do
   end
 
   defp local_workspace_overview_response(_provider, context, files_result, memory_result) do
+    if files_result["discovery_mode"] == "agent_instructions_only" do
+      """
+      I loaded only #{context.agent_instruction_file} for this new directory.
+
+      I have not read the workspace files yet. Tell me the file, area, or task you want inspected next.
+      """
+      |> String.trim()
+    else
+      local_workspace_overview_response_loaded(context, files_result, memory_result)
+    end
+  end
+
+  defp local_workspace_overview_response_loaded(context, files_result, memory_result) do
     files = Map.get(files_result, "files", [])
     overview_files = Map.get(files_result, "overview_files", [])
 
@@ -526,7 +814,7 @@ defmodule Holt.Runtime do
     key_files =
       overview_files
       |> Enum.map(&overview_file_row/1)
-      |> nonempty_rows("- no key files were readable")
+      |> nonempty_rows("- no agent instruction file was readable")
 
     skills = skill_summary(context)
 
@@ -536,14 +824,14 @@ defmodule Holt.Runtime do
       |> length()
 
     """
-    I scanned the workspace map and read #{length(overview_files)} key files.
+    I scanned the workspace map and read #{length(overview_files)} agent instruction files.
 
     Project shape: #{project_kind}. Holt can see #{length(files)} files, #{memories} memory matches, and #{skills}.
 
     Main areas:
     #{Enum.join(directories, "\n")}
 
-    Key files read:
+    Agent instructions read:
     #{Enum.join(key_files, "\n")}
 
     Good next drill-downs: main workflows, setup, data flow, tests, or release packaging.
@@ -643,8 +931,11 @@ defmodule Holt.Runtime do
           opts
         )
 
-      chat_mode?(opts) ->
+      chat_turn_contract?(opts) ->
         {:ok, local_chat_response(objective, provider, context, files_result, memory_result)}
+
+      goal_contract?(opts) ->
+        {:ok, local_goal_response(objective, provider, context, files_result, memory_result)}
 
       true ->
         {:ok, local_plan(objective, provider, context, files_result, memory_result)}
@@ -674,39 +965,36 @@ defmodule Holt.Runtime do
        ) do
     messages = model_messages(objective, context, files_result, memory_result, opts)
     actions = model_actions(opts)
-    tools = Enum.map(actions, &model_tool_definition/1)
-    max_turns = max_tool_turns(provider, opts)
+    actions = ProviderAdapter.openai_action_definitions(actions)
 
-    do_model_action_loop(provider, run_dir, opts, messages, tools, max_turns, 1)
+    do_model_action_loop(provider, run_dir, opts, messages, actions, 1)
   end
 
-  defp do_model_action_loop(_provider, _run_dir, _opts, _messages, _tools, max_turns, turn)
-       when turn > max_turns do
-    {:error, {:tool_turn_limit_exceeded, max_turns}}
-  end
-
-  defp do_model_action_loop(provider, run_dir, opts, messages, tools, max_turns, turn) do
+  defp do_model_action_loop(provider, run_dir, opts, messages, actions, turn) do
     progress(run_dir, opts, :thinking, "Thinking through the request", %{"turn" => turn})
 
     Runs.append_event(run_dir, "model.requested", %{
-      "provider" => provider["id"] || provider["type"],
+      "provider" => provider_id(provider),
       "model" => provider["model"],
       "turn" => turn,
-      "tool_count" => length(tools)
+      "action_count" => length(actions)
     })
 
-    record_llm_request(opts, provider, messages, tools, turn)
+    record_llm_request(opts, provider, messages, actions, turn)
 
     model_opts =
       opts
-      |> Keyword.put(:tools, tools)
+      |> Keyword.put(:actions, actions)
       |> Keyword.put(:tool_choice, "auto")
 
     case Models.chat(provider, messages, model_opts) do
       {:ok, response} ->
-        tool_calls = normalize_tool_calls(response["tool_calls"])
+        tool_calls = ProviderAdapter.normalize_calls(response["tool_calls"])
         content = Map.get(response, "content", "")
         content = OutputSanitizer.format_local_model_result(content)
+        thinking = model_thinking_text(response)
+
+        emit_model_thinking_event(run_dir, opts, response, thinking, turn)
 
         Runs.append_event(run_dir, "model.completed", %{
           "provider" => response["provider"],
@@ -718,29 +1006,29 @@ defmodule Holt.Runtime do
         })
         |> ignore_empty_event_fields()
 
-        record_llm_response(opts, response, content, tool_calls, turn)
+        record_llm_response(opts, response, content, tool_calls, thinking, turn)
 
         if tool_calls == [] do
           {:ok, maybe_ensure_plan_heading(content, opts)}
         else
           Runs.append_event(run_dir, "model.tool_calls", %{
             "turn" => turn,
-            "calls" => Enum.map(tool_calls, &tool_call_event/1)
+            "calls" => Enum.map(tool_calls, &ProviderAdapter.call_event/1)
           })
 
-          with {:ok, tool_messages} <- execute_tool_calls(run_dir, tool_calls, opts, turn) do
+          with {:ok, action_messages} <-
+                 execute_provider_action_calls(run_dir, tool_calls, opts, turn) do
             next_messages =
               messages ++
-                [assistant_tool_call_message(content, tool_calls)] ++
-                tool_messages
+                [ProviderAdapter.assistant_message(content, tool_calls, response)] ++
+                action_messages
 
             do_model_action_loop(
               provider,
               run_dir,
               opts,
               next_messages,
-              tools,
-              max_turns,
+              actions,
               turn + 1
             )
           end
@@ -750,7 +1038,7 @@ defmodule Holt.Runtime do
         progress(run_dir, opts, :failed, "Holt could not complete the model request")
 
         Runs.append_event(run_dir, "model.failed", %{
-          "provider" => provider["id"] || provider["type"],
+          "provider" => provider_id(provider),
           "model" => provider["model"],
           "turn" => turn,
           "reason" => inspect(reason)
@@ -761,51 +1049,78 @@ defmodule Holt.Runtime do
     end
   end
 
+  defp emit_model_thinking_event(_run_dir, _opts, _response, nil, _turn), do: :ok
+
+  defp emit_model_thinking_event(run_dir, opts, response, thinking, turn) do
+    event =
+      Runs.append_event(run_dir, "model.thinking", %{
+        "provider" => response["provider"],
+        "model" => response["model"],
+        "turn" => turn,
+        "block_type" => "thinking",
+        "content" => thinking,
+        "content_length" => String.length(thinking)
+      })
+
+    emit_runtime_event(opts, event)
+    :ok
+  end
+
+  defp model_thinking_text(%{"reasoning" => reasoning}) when is_binary(reasoning) do
+    reasoning
+    |> String.trim()
+    |> non_empty_thinking()
+  end
+
+  defp model_thinking_text(%{"reasoning_details" => details}) when is_list(details) do
+    details
+    |> Enum.flat_map(&thinking_detail_text/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n\n")
+    |> non_empty_thinking()
+  end
+
+  defp model_thinking_text(_response), do: nil
+
+  defp thinking_detail_text(%{"type" => "reasoning.text", "text" => text}) when is_binary(text),
+    do: [text]
+
+  defp thinking_detail_text(%{"type" => "reasoning.summary", "summary" => summary})
+       when is_binary(summary),
+       do: [summary]
+
+  defp thinking_detail_text(_detail), do: []
+
+  defp non_empty_thinking(""), do: nil
+  defp non_empty_thinking(thinking), do: thinking
+
   defp model_actions(opts) do
-    session = task_tool_session(opts)
+    session = action_session(opts)
     task_scoped? = task_ref(session) not in [nil, ""]
 
     opts =
       opts
-      |> Keyword.put(:task_tool_session, session)
+      |> Keyword.put(:action_session, session)
 
-    %{"task_tool_session" => session}
-    |> Actions.agent_tool_catalog(opts)
+    %{"action_session" => session}
+    |> Registry.catalog(opts)
     |> Enum.filter(fn action ->
-      get_in(action, ["availability", "route_status"]) == "accepted" and
-        (action["requires_task_ref"] != true or task_scoped?)
+      accepted_action_route?(action) and action_available_for_task_scope?(action, task_scoped?)
     end)
   end
 
-  defp model_tool_definition(action) do
-    %{
-      type: "function",
-      function: %{
-        name: action["name"],
-        description: tool_description(action),
-        parameters: action["input_schema"] || action["arguments_schema"] || empty_object_schema()
-      }
-    }
-  end
+  defp accepted_action_route?(action),
+    do: get_in(action, ["availability", "route_status"]) == "accepted"
 
-  defp tool_description(action) do
-    [
-      action["description"],
-      "effect_scope=#{action["effect_scope"]}",
-      "requires_approval=#{action["requires_approval"] == true}"
-    ]
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.join(" ")
-  end
+  defp action_available_for_task_scope?(%{"requires_task_ref" => true}, true), do: true
+  defp action_available_for_task_scope?(%{"requires_task_ref" => true}, false), do: false
+  defp action_available_for_task_scope?(_action, _task_scoped?), do: true
 
-  defp empty_object_schema do
-    %{"type" => "object", "properties" => %{}}
-  end
-
-  defp execute_tool_calls(run_dir, tool_calls, opts, turn) do
+  defp execute_provider_action_calls(run_dir, tool_calls, opts, turn) do
     tool_calls
     |> Enum.reduce_while({:ok, []}, fn call, {:ok, messages} ->
-      case execute_action_tool_call(run_dir, call, opts, turn) do
+      case execute_action_action_call(run_dir, call, opts, turn) do
         {:ok, message} ->
           {:cont, {:ok, [message | messages]}}
 
@@ -819,45 +1134,70 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp execute_action_tool_call(run_dir, call, opts, turn) do
-    tool_name = get_in(call, ["function", "name"])
-    tool_call_id = call["id"]
-    args = call |> get_in(["function", "arguments"]) |> decode_tool_arguments()
+  defp execute_action_action_call(run_dir, call, opts, turn) do
+    action_name = ProviderAdapter.action_name(call)
+    action_call_id = ProviderAdapter.call_id(call)
+    args = ProviderAdapter.arguments(call)
     args = maybe_put_default_task_ref(args, opts)
 
-    emit_tool_event(
+    emit_action_event(
       run_dir,
       opts,
-      "tool.started",
-      ToolVisibility.started(tool_name, args, tool_call_id, opts)
+      "action.started",
+      ActionVisibility.started(action_name, args, action_call_id, opts)
     )
 
-    approval_expected? = ToolVisibility.approval_expected?(tool_name, args, opts)
+    if directory_discovery_action_blocked?(action_name, args, opts) do
+      execution = %{
+        "status" => "error",
+        "action" => action_name,
+        "reason" => "directory_discovery_allows_only_agent_instructions"
+      }
 
-    if approval_expected? do
-      emit_tool_event(
+      emit_action_event(
         run_dir,
         opts,
-        "tool.approval_requested",
-        ToolVisibility.approval_requested(tool_name, args, tool_call_id, opts)
+        "action.failed",
+        ActionVisibility.failed(action_name, args, execution["reason"], action_call_id, opts)
+        |> Map.merge(%{"result_status" => "error", "reason" => execution["reason"]})
+      )
+
+      record_action_result(opts, action_name, execution, action_call_id, turn)
+      {:ok, ProviderAdapter.result_message(call, execution)}
+    else
+      execute_allowed_action_action_call(run_dir, call, action_name, args, opts, turn)
+    end
+  end
+
+  defp execute_allowed_action_action_call(run_dir, call, action_name, args, opts, turn) do
+    action_call_id = ProviderAdapter.call_id(call)
+
+    approval_expected? = ActionVisibility.approval_expected?(action_name, args, opts)
+
+    if approval_expected? do
+      emit_action_event(
+        run_dir,
+        opts,
+        "action.approval_requested",
+        ActionVisibility.approval_requested(action_name, args, action_call_id, opts)
       )
     end
 
-    Runs.append_event(run_dir, "tool.requested", %{
-      "tool" => tool_name,
-      "tool_call_id" => tool_call_id,
+    Runs.append_event(run_dir, "action.requested", %{
+      "action" => action_name,
+      "action_call_id" => action_call_id,
       "args" => redact_args(args)
     })
 
-    record_tool_invocation(opts, tool_name, args, tool_call_id, turn)
+    record_action_invocation(opts, action_name, args, action_call_id, turn)
 
-    if await_user_tool?(tool_name) and is_function(opts[:await_user_callback], 2) do
-      execute_await_user_tool_call(run_dir, call, tool_name, args, opts, turn)
+    if await_user_action?(action_name) and is_function(opts[:await_user_callback], 2) do
+      execute_await_user_action_call(run_dir, call, action_name, args, opts, turn)
     else
-      execute_regular_action_tool_call(
+      execute_regular_action_action_call(
         run_dir,
         call,
-        tool_name,
+        action_name,
         args,
         opts,
         turn,
@@ -866,55 +1206,70 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp execute_regular_action_tool_call(
+  defp directory_discovery_action_blocked?("search", _args, opts),
+    do: directory_discovery_mode?(opts)
+
+  defp directory_discovery_action_blocked?("read", args, opts) do
+    directory_discovery_mode?(opts) and args["path"] != Workspace.agent_instruction_file()
+  end
+
+  defp directory_discovery_action_blocked?(_action_name, _args, _opts), do: false
+
+  defp execute_regular_action_action_call(
          run_dir,
          call,
-         tool_name,
+         action_name,
          args,
          opts,
          turn,
          approval_expected?
        ) do
-    case Actions.execute(tool_name, args, opts) do
+    case Executor.run(action_name, args, opts) do
       {:ok, execution} ->
         if approval_expected? do
-          emit_tool_event(
+          emit_action_event(
             run_dir,
             opts,
-            "tool.approval_resolved",
-            ToolVisibility.approval_resolved(tool_name, args, call["id"], "approved", opts)
+            "action.approval_resolved",
+            ActionVisibility.approval_resolved(action_name, args, call["id"], "approved", opts)
           )
         end
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.completed",
-          ToolVisibility.completed(tool_name, args, execution, call["id"], opts)
+          "action.completed",
+          ActionVisibility.completed(action_name, args, execution, call["id"], opts)
           |> Map.merge(%{
             "result_status" => "ok",
             "result" => summarize_action_execution(execution)
           })
         )
 
-        record_tool_result(opts, tool_name, execution, call["id"], turn)
-        {:ok, tool_result_message(call, execution)}
+        record_action_result(opts, action_name, execution, call["id"], turn)
+        {:ok, ProviderAdapter.result_message(call, execution)}
 
       {:error, %{} = execution} ->
         if approval_expected? and execution["reason"] == "approval_denied" do
-          emit_tool_event(
+          emit_action_event(
             run_dir,
             opts,
-            "tool.approval_resolved",
-            ToolVisibility.approval_resolved(tool_name, args, call["id"], "denied", opts)
+            "action.approval_resolved",
+            ActionVisibility.approval_resolved(action_name, args, call["id"], "denied", opts)
           )
         end
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.failed",
-          ToolVisibility.failed(tool_name, args, Map.get(execution, "reason"), call["id"], opts)
+          "action.failed",
+          ActionVisibility.failed(
+            action_name,
+            args,
+            Map.get(execution, "reason"),
+            call["id"],
+            opts
+          )
           |> Map.merge(%{
             "result_status" => Map.get(execution, "status", "error"),
             "reason" => Map.get(execution, "reason"),
@@ -922,38 +1277,38 @@ defmodule Holt.Runtime do
           })
         )
 
-        record_tool_result(opts, tool_name, execution, call["id"], turn)
+        record_action_result(opts, action_name, execution, call["id"], turn)
 
         if execution["reason"] == "approval_denied" do
           {:error, :approval_denied}
         else
-          {:ok, tool_result_message(call, execution)}
+          {:ok, ProviderAdapter.result_message(call, execution)}
         end
 
       {:error, :approval_denied} ->
         if approval_expected? do
-          emit_tool_event(
+          emit_action_event(
             run_dir,
             opts,
-            "tool.approval_resolved",
-            ToolVisibility.approval_resolved(tool_name, args, call["id"], "denied", opts)
+            "action.approval_resolved",
+            ActionVisibility.approval_resolved(action_name, args, call["id"], "denied", opts)
           )
         end
 
         progress(run_dir, opts, :blocked, "Waiting for approval")
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.failed",
-          ToolVisibility.failed(tool_name, args, :approval_denied, call["id"], opts)
+          "action.failed",
+          ActionVisibility.failed(action_name, args, :approval_denied, call["id"], opts)
           |> Map.merge(%{"result_status" => "error", "reason" => "approval_denied"})
         )
 
-        record_tool_result(
+        record_action_result(
           opts,
-          tool_name,
-          %{"status" => "error", "tool_name" => tool_name, "reason" => "approval_denied"},
+          action_name,
+          %{"status" => "error", "action" => action_name, "reason" => "approval_denied"},
           call["id"],
           turn
         )
@@ -963,35 +1318,87 @@ defmodule Holt.Runtime do
       {:error, reason} ->
         execution = %{
           "status" => "error",
-          "tool_name" => tool_name,
+          "action" => action_name,
           "reason" => inspect(reason)
         }
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.failed",
-          ToolVisibility.failed(tool_name, args, reason, call["id"], opts)
+          "action.failed",
+          ActionVisibility.failed(action_name, args, reason, call["id"], opts)
           |> Map.merge(%{"result_status" => "error", "reason" => inspect(reason)})
         )
 
-        record_tool_result(opts, tool_name, execution, call["id"], turn)
-        {:ok, tool_result_message(call, execution)}
+        record_action_result(opts, action_name, execution, call["id"], turn)
+        {:ok, ProviderAdapter.result_message(call, execution)}
     end
   end
 
-  defp execute_await_user_tool_call(run_dir, call, tool_name, args, opts, turn) do
-    tool_call_id = call["id"]
-    question = user_question(args)
+  defp execute_await_user_action_call(run_dir, call, action_name, args, opts, turn) do
+    action_call_id = call["id"]
 
-    progress(run_dir, opts, :waiting_for_input, "Waiting for your input", %{"tool" => tool_name})
+    with {:ok, question} <- user_question(args),
+         {:ok, description} <- user_question_description(args),
+         {:ok, options} <- user_question_options(args["options"]) do
+      do_execute_await_user_action_call(
+        run_dir,
+        call,
+        action_name,
+        args,
+        opts,
+        turn,
+        action_call_id,
+        question,
+        description,
+        options
+      )
+    else
+      {:error, reason} ->
+        execution = %{
+          "status" => "error",
+          "action" => action_name,
+          "reason" => inspect(reason)
+        }
+
+        emit_action_event(
+          run_dir,
+          opts,
+          "action.failed",
+          ActionVisibility.failed(action_name, args, reason, action_call_id, opts)
+          |> Map.merge(%{"result_status" => "error", "reason" => inspect(reason)})
+        )
+
+        record_action_result(opts, action_name, execution, action_call_id, turn)
+        {:ok, ProviderAdapter.result_message(call, execution)}
+    end
+  end
+
+  defp do_execute_await_user_action_call(
+         run_dir,
+         call,
+         action_name,
+         args,
+         opts,
+         turn,
+         action_call_id,
+         question,
+         description,
+         options
+       ) do
+    progress(run_dir, opts, :waiting_for_input, "Waiting for your input", %{
+      "action" => action_name
+    })
+
     transition_run(run_dir, "awaiting_user")
-    record_awaiting_user(opts, question, tool_call_id, turn)
+    record_awaiting_user(opts, question, action_call_id, turn)
 
     metadata =
       %{
-        "tool_call_id" => tool_call_id,
+        "action_call_id" => action_call_id,
         "turn" => turn,
+        "description" => description,
+        "options" => options,
         "await_timeout_ms" => opts[:await_timeout_ms]
       }
       |> reject_empty()
@@ -999,37 +1406,42 @@ defmodule Holt.Runtime do
     case opts[:await_user_callback].(question, metadata) do
       {:ok, answer} ->
         transition_run(run_dir, "running")
-        record_user_response(opts, answer, tool_call_id, turn)
+        record_user_response(opts, answer, action_call_id, turn)
 
-        execution = %{
-          "status" => "completed",
-          "tool_name" => tool_name,
-          "result" => %{"answer" => to_string(answer || "")}
-        }
+        execution =
+          %{
+            "status" => "completed",
+            "action" => action_name,
+            "question" => question,
+            "options" => options,
+            "result" => %{"answer" => answer_text(answer)},
+            "continuation_policy" => ask_continuation_policy()
+          }
+          |> reject_empty()
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.completed",
-          ToolVisibility.completed(tool_name, args, execution, tool_call_id, opts)
+          "action.completed",
+          ActionVisibility.completed(action_name, args, execution, action_call_id, opts)
           |> Map.merge(%{
             "result_status" => "ok",
             "result" => summarize_action_execution(execution)
           })
         )
 
-        record_tool_result(opts, tool_name, execution, tool_call_id, turn)
-        {:ok, tool_result_message(call, execution)}
+        record_action_result(opts, action_name, execution, action_call_id, turn)
+        {:ok, ProviderAdapter.result_message(call, execution)}
 
       {:error, reason} ->
         transition_run(run_dir, "running")
         record_error(opts, "await_user_failed", reason)
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.failed",
-          ToolVisibility.failed(tool_name, args, reason, tool_call_id, opts)
+          "action.failed",
+          ActionVisibility.failed(action_name, args, reason, action_call_id, opts)
           |> Map.merge(%{"result_status" => "error", "reason" => inspect(reason)})
         )
 
@@ -1037,38 +1449,112 @@ defmodule Holt.Runtime do
 
       answer ->
         transition_run(run_dir, "running")
-        record_user_response(opts, answer, tool_call_id, turn)
+        record_user_response(opts, answer, action_call_id, turn)
 
         execution = %{
           "status" => "completed",
-          "tool_name" => tool_name,
-          "result" => %{"answer" => to_string(answer || "")}
+          "action" => action_name,
+          "result" => %{"answer" => answer_text(answer)}
         }
 
-        emit_tool_event(
+        emit_action_event(
           run_dir,
           opts,
-          "tool.completed",
-          ToolVisibility.completed(tool_name, args, execution, tool_call_id, opts)
+          "action.completed",
+          ActionVisibility.completed(action_name, args, execution, action_call_id, opts)
           |> Map.merge(%{
             "result_status" => "ok",
             "result" => summarize_action_execution(execution)
           })
         )
 
-        record_tool_result(opts, tool_name, execution, tool_call_id, turn)
-        {:ok, tool_result_message(call, execution)}
+        record_action_result(opts, action_name, execution, action_call_id, turn)
+        {:ok, ProviderAdapter.result_message(call, execution)}
     end
   end
 
-  defp await_user_tool?(tool_name), do: tool_name in ["ask_user", "ask_user_question"]
+  defp await_user_action?("ask"), do: true
+  defp await_user_action?(_action_name), do: false
+
+  defp answer_text(nil), do: ""
+  defp answer_text(answer), do: to_string(answer)
 
   defp user_question(args) do
-    args["question"] ||
-      args["prompt"] ||
-      args["message"] ||
-      "The agent needs user input to continue."
+    case canonical_text(args["question"]) do
+      nil -> {:error, {:missing_required, "question"}}
+      question -> {:ok, question}
+    end
   end
+
+  defp user_question_description(args) do
+    case Map.fetch(args, "description") do
+      {:ok, value} when value not in [nil, ""] ->
+        case canonical_text(value) do
+          nil -> {:error, {:invalid_field, "description"}}
+          description -> {:ok, description}
+        end
+
+      _missing_or_empty ->
+        {:ok, nil}
+    end
+  end
+
+  defp user_question_options(nil), do: {:ok, []}
+
+  defp user_question_options(options) when is_list(options) do
+    options
+    |> Enum.reduce_while({:ok, []}, fn option, {:ok, options} ->
+      case user_question_option(option) do
+        {:ok, option} -> {:cont, {:ok, options ++ [option]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp user_question_options(_options), do: {:error, {:invalid_field, "options"}}
+
+  defp user_question_option(%{} = option) do
+    with {:ok, label} <- required_option_text(option, "label"),
+         {:ok, value} <- required_option_text(option, "value"),
+         {:ok, description} <- optional_option_text(option, "description") do
+      {:ok,
+       %{
+         "label" => label,
+         "value" => value,
+         "description" => description
+       }
+       |> reject_empty()}
+    end
+  end
+
+  defp user_question_option(_option), do: {:error, {:invalid_field, "options[]"}}
+
+  defp required_option_text(option, key) do
+    case canonical_text(option[key]) do
+      nil -> {:error, {:missing_required, "options[].#{key}"}}
+      text -> {:ok, text}
+    end
+  end
+
+  defp optional_option_text(option, key) do
+    case Map.fetch(option, key) do
+      {:ok, value} when value not in [nil, ""] ->
+        case canonical_text(value) do
+          nil -> {:error, {:invalid_field, "options[].#{key}"}}
+          text -> {:ok, text}
+        end
+
+      _missing_or_empty ->
+        {:ok, nil}
+    end
+  end
+
+  defp canonical_text(value) when is_binary(value) do
+    value = String.trim(value)
+    if value == "", do: nil, else: value
+  end
+
+  defp canonical_text(_value), do: nil
 
   defp transition_run(run_dir, status) do
     case Runs.transition(run_dir, status) do
@@ -1076,55 +1562,6 @@ defmodule Holt.Runtime do
       {:error, _reason} -> :ok
     end
   end
-
-  defp normalize_tool_calls(tool_calls) when is_list(tool_calls) do
-    tool_calls
-    |> Enum.map(&RuntimeContracts.string_keys/1)
-    |> Enum.filter(&(get_in(&1, ["function", "name"]) not in [nil, ""]))
-  end
-
-  defp normalize_tool_calls(_tool_calls), do: []
-
-  defp assistant_tool_call_message(content, tool_calls) do
-    %{
-      "role" => "assistant",
-      "content" => content,
-      "tool_calls" => tool_calls
-    }
-  end
-
-  defp tool_result_message(call, execution) do
-    %{
-      "role" => "tool",
-      "tool_call_id" => call["id"],
-      "name" => get_in(call, ["function", "name"]),
-      "content" => Jason.encode!(execution)
-    }
-    |> reject_empty()
-  end
-
-  defp tool_call_event(call) do
-    %{
-      "id" => call["id"],
-      "tool" => get_in(call, ["function", "name"]),
-      "arguments_preview" =>
-        call
-        |> get_in(["function", "arguments"])
-        |> decode_tool_arguments()
-        |> redact_args()
-    }
-    |> reject_empty()
-  end
-
-  defp decode_tool_arguments(value) when is_binary(value) do
-    case Jason.decode(value) do
-      {:ok, decoded} when is_map(decoded) -> RuntimeContracts.string_keys(decoded)
-      _other -> %{}
-    end
-  end
-
-  defp decode_tool_arguments(value) when is_map(value), do: RuntimeContracts.string_keys(value)
-  defp decode_tool_arguments(_value), do: %{}
 
   defp maybe_put_default_task_ref(args, opts) do
     cond do
@@ -1139,29 +1576,36 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp task_tool_session(opts) do
+  defp action_session(opts) do
     attrs =
-      case opts[:task_tool_session] do
+      case opts[:action_session] do
         session when is_map(session) -> session
         _missing -> %{}
       end
 
-    attrs
-    |> RuntimeContracts.string_keys()
-    |> maybe_put_missing("task_id", opts[:task_id])
-    |> maybe_put_missing("task_ref", opts[:task_ref])
-    |> maybe_put_missing("workspace", Paths.workspace_root(opts))
-    |> TaskToolSession.build()
+    attrs =
+      attrs
+      |> Map.put("task", runtime_session_task(opts))
+      |> maybe_put_missing("workspace", Paths.workspace_root(opts))
+
+    ActionSession.build(attrs)
+  end
+
+  defp runtime_session_task(opts) do
+    %{
+      "id" => opts[:task_id],
+      "ref" => opts[:task_ref]
+    }
+    |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+    |> Map.new()
   end
 
   defp task_ref_from_opts(opts) do
-    opts[:task_ref] || opts[:task_id]
+    opts[:task_ref]
   end
 
   defp task_ref(map) when is_map(map) do
-    RuntimeContracts.value(map, "ref") ||
-      RuntimeContracts.value(map, "task_ref") ||
-      RuntimeContracts.value(map, "task_id")
+    Map.get(map, "ref")
   end
 
   defp task_ref(_value), do: nil
@@ -1175,26 +1619,18 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp max_tool_turns(provider, opts) do
-    (opts[:max_tool_turns] || provider["max_tool_turns"] || 8)
-    |> normalize_positive_integer(8)
-  end
-
-  defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0, do: value
-
-  defp normalize_positive_integer(value, default) when is_binary(value) do
-    case Integer.parse(value) do
-      {integer, ""} when integer > 0 -> integer
-      _other -> default
-    end
-  end
-
-  defp normalize_positive_integer(_value, default), do: default
-
   defp summarize_action_execution(execution) when is_map(execution) do
     execution
-    |> Map.take(["status", "tool_name", "reason", "result", "route"])
+    |> Map.take(["status", "action", "reason", "result", "route"])
     |> summarize_result()
+  end
+
+  defp ask_continuation_policy do
+    %{
+      "assistant_content_may_request_user_input" => false,
+      "follow_up_user_input_action" => "ask",
+      "requires_action_for_more_user_input" => true
+    }
   end
 
   defp ignore_empty_event_fields(event), do: event
@@ -1213,73 +1649,102 @@ defmodule Holt.Runtime do
       |> Enum.map(&Map.get(&1, "text", ""))
       |> Enum.join("\n")
 
-    chat_context = chat_context_section(opts)
+    chat_messages = chat_messages(opts)
     overview_files = overview_files_section(files_result)
 
-    system =
-      if chat_mode?(opts) do
-        """
-        You are Holt, a local project agent running inside a terminal.
-        Work through a plan internally, use available tools when fresh workspace, task, memory, or network state is needed, and return the final user-facing output.
-        Do not return NEXT_STEPS, implementation-plan boilerplate, run summaries, or artifact reports unless the user explicitly asks for a plan.
-        If the user greets you, respond naturally and ask how you can help.
-        If the user asks to read, inspect, understand, or summarize the repo/project/codebase/workspace, provide a concrete repository map from the supplied file list and key file excerpts instead of asking which file to start with.
-        Only claim tool results that are present in the supplied context or tool messages.
-        """
+    discovery_policy =
+      if directory_discovery_mode?(opts) do
+        "This is new-directory discovery. Read no workspace file except AGENTS.md; do not call read or search for any other path unless the user explicitly names that file in a later request."
       else
-        """
-        You are Holt, a local project agent.
-        Use available tools when fresh workspace, task, memory, or network state is needed.
-        Return concise Markdown that starts with "# NEXT STEPS".
-        Include: objective, workspace snapshot, skills used, relevant memory, and recommended next tasks.
-        Only claim tool results that are present in the supplied context or tool messages.
-        """
+        "Automatic repo overview may use the file list and AGENTS.md only. Do not auto-read README, source, test, or config files for directory discovery."
+      end
+
+    system =
+      case runtime_contract(opts) do
+        :chat_turn ->
+          """
+          You are Holt, a local project agent running inside a terminal.
+          Work through a plan internally, use available actions when fresh workspace, task, memory, or network state is needed, and return the final user-facing output.
+          Assistant content is terminal output. When you need the user to choose between options or answer a clarification question, call the ask action with canonical question/options fields instead of writing the question, numbered choices, or clarification request in assistant prose.
+          For generic example requests, choose a reasonable default and produce the example instead of asking the user to pick a subtype.
+          Do not call file, page, or device persistence actions unless the user explicitly asks to save, create, modify, or persist something outside the chat. If the request can be answered in chat, return it inline as Markdown.
+          Do not return NEXT_STEPS, implementation-plan boilerplate, run summaries, or artifact reports unless the user explicitly asks for a plan.
+          If the user greets you, respond naturally and ask how you can help.
+          If the user asks to read, inspect, understand, or summarize the repo/project/codebase/workspace during discovery, explain that only AGENTS.md was loaded and ask for the next specific file, area, or task.
+          #{discovery_policy}
+          Only claim action results that are present in the supplied context or action messages.
+          """
+
+        :goal ->
+          """
+          You are Holt, a local project agent running inside a terminal.
+          Runtime contract: goal.
+          Convert the user's request into a concise working goal with clear success criteria and the next concrete action.
+          Assistant content is terminal output. When you need the user to choose between options or answer a clarification question, call the ask action with canonical question/options fields instead of writing the question, numbered choices, or clarification request in assistant prose.
+          Do not write NEXT_STEPS.md or any planning artifact. Do not call file, page, or device persistence actions unless the user explicitly asks to save or modify a file.
+          #{discovery_policy}
+          Only claim action results that are present in the supplied context or action messages.
+          """
+
+        :plan_artifact ->
+          """
+          You are Holt, a local project agent.
+          Use available actions when fresh workspace, task, memory, or network state is needed.
+          Assistant content is terminal output. When you need the user to choose between options or answer a clarification question, call the ask action with canonical question/options fields instead of writing the question, numbered choices, or clarification request in assistant prose.
+          For generic example requests, choose a reasonable default and produce the example instead of asking the user to pick a subtype.
+          Do not call file, page, or device persistence actions unless the user explicitly asks to save, create, modify, or persist something outside the chat. If the request can be answered in chat, return it inline as Markdown.
+          Return concise Markdown that starts with "# NEXT STEPS".
+          Include: objective, workspace snapshot, skills used, relevant memory, and recommended next tasks.
+          #{discovery_policy}
+          Only claim action results that are present in the supplied context or action messages.
+          """
       end
 
     [
       %{
         "role" => "system",
         "content" => system
-      },
-      %{
-        "role" => "user",
-        "content" => """
-        Objective:
-        #{objective}
-
-        Workspace context:
-        #{Context.prompt_section(context)}
-
-        Prior chat context:
-        #{chat_context}
-
-        Files:
-        #{files}
-
-        Key file excerpts:
-        #{overview_files}
-
-        Relevant memory:
-        #{memories}
-        """
       }
-    ]
+    ] ++
+      chat_messages ++
+      [
+        %{
+          "role" => "user",
+          "content" => """
+          Current request:
+          #{objective}
+
+          Workspace context:
+          #{Context.prompt_section(context)}
+
+          Files:
+          #{files}
+
+          Key file excerpts:
+          #{overview_files}
+
+          Relevant memory:
+          #{memories}
+          """
+        }
+      ]
   end
 
   defp maybe_ensure_plan_heading(content, opts) do
-    if chat_mode?(opts) do
-      String.trim(to_string(content))
-    else
-      ensure_plan_heading(content)
+    case runtime_contract(opts) do
+      :plan_artifact -> ensure_plan_heading(content)
+      :chat_turn -> String.trim(to_string(content))
+      :goal -> String.trim(to_string(content))
     end
   end
 
-  defp chat_context_section(opts) do
+  defp chat_messages(opts) do
     opts
-    |> Keyword.get(:chat_context)
+    |> Keyword.get(:chat_messages, [])
+    |> ChatMessages.normalize()
     |> case do
-      value when value in [nil, ""] -> "none"
-      value -> String.slice(to_string(value), 0, 4_000)
+      {:ok, messages} -> Enum.take(messages, -8)
+      {:error, _reason} -> []
     end
   end
 
@@ -1319,44 +1784,17 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp chat_mode?(opts), do: opts[:mode] in ["chat", :chat]
-
-  defp chat_intent(objective, opts) do
-    all_tokens = chat_tokens([opts[:chat_context], objective])
-    objective_tokens = chat_tokens([objective])
-
-    workspace_target? =
-      any_token?(all_tokens, ~w(repo repository project codebase workspace folder directory))
-
-    overview_action? =
-      any_token?(all_tokens, ~w(read inspect review scan understand summarize map analyze))
-
-    broad_scope? = any_token?(objective_tokens, ~w(entire whole all everything full))
-
-    if workspace_target? and (overview_action? or broad_scope?) do
-      :workspace_overview
-    else
-      :general
+  defp chat_intent(_objective, opts) do
+    case workspace_intent(opts) do
+      "explore_project" -> :workspace_overview
+      "none" -> :general
     end
   end
-
-  defp chat_tokens(values) do
-    values
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.flat_map(fn value ->
-      value
-      |> to_string()
-      |> String.downcase()
-      |> String.split([" ", "\n", "\t", "\r", ".", ",", "?", "!", ":", ";", "(", ")", "[", "]"])
-    end)
-    |> Enum.reject(&(&1 == ""))
-  end
-
-  defp any_token?(tokens, candidates), do: Enum.any?(tokens, &(&1 in candidates))
 
   defp context_event(context) do
     %{
       "workspace" => context.workspace,
+      "agent_instruction_file" => context.agent_instruction_file,
       "skills" => Enum.map(context.skills, & &1.name),
       "memory_count" => length(context.memories)
     }
@@ -1385,29 +1823,67 @@ defmodule Holt.Runtime do
 
   defp summarize_result(result), do: result
 
-  defp agent_event_runtime_opts(opts, run, provider, root) do
+  defp agent_event_runtime_opts(opts, run, provider, root, pre_task_plan) do
     opts
     |> Keyword.put(:workspace, root)
     |> Keyword.put(:run_id, run["id"])
     |> Keyword.put(:run_dir, run["run_dir"])
-    |> Keyword.put(:agent_event_session_id, opts[:agent_event_session_id] || run["id"])
+    |> maybe_put_agent_event_session_id(run, pre_task_plan)
     |> Keyword.put(:trace_id, "trace:#{run["id"]}")
-    |> Keyword.put_new(:agent_id, run["agent"] || "default")
-    |> Keyword.put(:provider, provider["id"] || provider["type"])
+    |> Keyword.put_new(:agent_id, run_agent_id(run))
+    |> Keyword.put(:provider, provider_id(provider))
   end
+
+  defp maybe_put_agent_event_session_id(opts, run, %{"workspace_persistence" => "workspace"}) do
+    Keyword.put(opts, :agent_event_session_id, workspace_session_id(opts, run))
+  end
+
+  defp maybe_put_agent_event_session_id(opts, _run, %{"workspace_persistence" => "ephemeral"}) do
+    Keyword.delete(opts, :agent_event_session_id)
+  end
+
+  defp workspace_session_id(opts, run) do
+    case Keyword.get(opts, :agent_event_session_id) do
+      session_id when is_binary(session_id) and session_id != "" -> session_id
+      _missing -> run["id"]
+    end
+  end
+
+  defp run_agent_id(%{"agent_id" => agent_id}) when is_binary(agent_id) and agent_id != "",
+    do: agent_id
+
+  defp run_agent_id(_run), do: "default"
+
+  defp completed_run_status(%{"status" => status}) when is_binary(status) and status != "",
+    do: status
+
+  defp completed_run_status(_run), do: "completed"
+
+  defp failed_run_status(%{"status" => status}) when is_binary(status) and status != "",
+    do: status
+
+  defp failed_run_status(_run), do: "failed"
+
+  defp maybe_record_session_started(nil, _opts), do: :ok
+
+  defp maybe_record_session_started(session_id, opts) when is_binary(session_id) do
+    EventRecorder.session_started(session_id, opts)
+  end
+
+  defp record_session_result(nil, _result, _opts), do: :ok
 
   defp record_session_result(session_id, result, opts) do
     case result do
       {:ok, %{run: %{} = run}} ->
         EventRecorder.session_ended(
           session_id,
-          run["status"] || "completed",
+          completed_run_status(run),
           agent_event_opts(opts)
         )
 
       {:error, %{run: %{} = run, reason: reason}} ->
         EventRecorder.error(session_id, "runtime_failed", reason, agent_event_opts(opts))
-        EventRecorder.session_ended(session_id, run["status"] || "failed", agent_event_opts(opts))
+        EventRecorder.session_ended(session_id, failed_run_status(run), agent_event_opts(opts))
 
       {:error, reason} ->
         EventRecorder.error(session_id, "runtime_failed", reason, agent_event_opts(opts))
@@ -1424,29 +1900,30 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp record_llm_request(opts, provider, messages, tools, turn) do
+  defp record_llm_request(opts, provider, messages, actions, turn) do
     with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
       EventRecorder.llm_request(
         session_id,
         agent_event_opts(opts,
-          provider: provider["id"] || provider["type"],
+          provider: provider_id(provider),
           model: provider["model"],
           message_count: length(messages),
-          tool_count: length(tools),
+          action_count: length(actions),
           turn: turn
         )
       )
     end
   end
 
-  defp record_llm_response(opts, response, content, tool_calls, turn) do
+  defp record_llm_response(opts, response, content, tool_calls, thinking, turn) do
     with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
       EventRecorder.llm_response(
         session_id,
         agent_event_opts(opts,
           provider: response["provider"],
           model: response["model"],
-          content_length: String.length(content || ""),
+          content_length: text_length(content),
+          thinking_length: thinking_length(thinking),
           tool_calls_count: length(tool_calls),
           finish_reason: response["finish_reason"],
           turn: turn
@@ -1455,44 +1932,51 @@ defmodule Holt.Runtime do
     end
   end
 
-  defp record_tool_invocation(opts, tool_name, args, tool_call_id, turn) do
+  defp thinking_length(thinking) when is_binary(thinking), do: String.length(thinking)
+  defp thinking_length(_thinking), do: nil
+
+  defp text_length(value) when is_binary(value), do: String.length(value)
+  defp text_length(nil), do: 0
+  defp text_length(value), do: value |> to_string() |> String.length()
+
+  defp record_action_invocation(opts, action_name, args, action_call_id, turn) do
     with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
-      EventRecorder.tool_invocation(
+      EventRecorder.action_invocation(
         session_id,
-        tool_name,
+        action_name,
         args,
-        agent_event_opts(opts, tool_call_id: tool_call_id, turn: turn)
+        agent_event_opts(opts, action_call_id: action_call_id, turn: turn)
       )
     end
   end
 
-  defp record_tool_result(opts, tool_name, result, tool_call_id, turn) do
+  defp record_action_result(opts, action_name, result, action_call_id, turn) do
     with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
-      EventRecorder.tool_result(
+      EventRecorder.action_result(
         session_id,
-        tool_name,
+        action_name,
         result,
-        agent_event_opts(opts, tool_call_id: tool_call_id, turn: turn)
+        agent_event_opts(opts, action_call_id: action_call_id, turn: turn)
       )
     end
   end
 
-  defp record_awaiting_user(opts, question, tool_call_id, turn) do
+  defp record_awaiting_user(opts, question, action_call_id, turn) do
     with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
       EventRecorder.awaiting_user(
         session_id,
         question,
-        agent_event_opts(opts, tool_call_id: tool_call_id, turn: turn)
+        agent_event_opts(opts, action_call_id: action_call_id, turn: turn)
       )
     end
   end
 
-  defp record_user_response(opts, answer, tool_call_id, turn) do
+  defp record_user_response(opts, answer, action_call_id, turn) do
     with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
       EventRecorder.user_response(
         session_id,
         answer,
-        agent_event_opts(opts, tool_call_id: tool_call_id, turn: turn)
+        agent_event_opts(opts, action_call_id: action_call_id, turn: turn)
       )
     end
   end
@@ -1504,7 +1988,7 @@ defmodule Holt.Runtime do
   end
 
   defp emit_stream_chunk(opts, content, extra) do
-    content = to_string(content || "")
+    content = stream_content(content)
 
     if content != "" do
       with session_id when is_binary(session_id) <- agent_event_session_id(opts) do
@@ -1516,6 +2000,9 @@ defmodule Holt.Runtime do
 
     :ok
   end
+
+  defp stream_content(nil), do: ""
+  defp stream_content(content), do: to_string(content)
 
   defp emit_runtime_event(opts, event) do
     case opts[:runtime_event_callback] do
@@ -1532,7 +2019,7 @@ defmodule Holt.Runtime do
       run_id: opts[:run_id],
       run_dir: opts[:run_dir],
       trace_id: opts[:trace_id],
-      agent_id: opts[:agent_id] || opts[:agent],
+      agent_id: opts[:agent_id],
       provider: opts[:provider]
     ]
     |> Keyword.merge(extra)
@@ -1548,6 +2035,24 @@ defmodule Holt.Runtime do
     case opts[:resumed_from] do
       nil -> opts
       id -> Keyword.put(opts, :resumed_from, id)
+    end
+  end
+
+  defp fork_objective(opts, run) do
+    case Keyword.get(opts, :objective) do
+      objective when is_binary(objective) ->
+        objective = String.trim(objective)
+        if objective == "", do: run["objective"], else: objective
+
+      _ ->
+        run["objective"]
+    end
+  end
+
+  defp maybe_put_forked_from(opts) do
+    case opts[:forked_from] do
+      nil -> opts
+      id -> Keyword.put(opts, :forked_from, id)
     end
   end
 end

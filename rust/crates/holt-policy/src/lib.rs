@@ -1,6 +1,6 @@
-//! Runtime policy decisions for tools and agent actions.
+//! Runtime policy decisions for actions and agent actions.
 
-use holt_protocol::{ApprovalMode, EffectRisk, ToolSpec};
+use holt_protocol::{ApprovalMode, EffectRisk, ActionSpec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -10,8 +10,8 @@ pub struct PolicyDecision {
     pub reason_code: String,
 }
 
-pub fn decide_tool(tool: &ToolSpec, approval_mode: &ApprovalMode) -> PolicyDecision {
-    match (approval_mode, &tool.risk) {
+pub fn decide_action(action: &ActionSpec, approval_mode: &ApprovalMode) -> PolicyDecision {
+    match (approval_mode, &action.risk) {
         (
             ApprovalMode::DenyWrites,
             EffectRisk::Write | EffectRisk::Execute | EffectRisk::Network,
@@ -32,7 +32,7 @@ pub fn decide_tool(tool: &ToolSpec, approval_mode: &ApprovalMode) -> PolicyDecis
         },
         _ => PolicyDecision {
             allowed: true,
-            approval_required: tool.approval_required,
+            approval_required: action.approval_required,
             reason_code: "approval_required".to_string(),
         },
     }
@@ -40,19 +40,19 @@ pub fn decide_tool(tool: &ToolSpec, approval_mode: &ApprovalMode) -> PolicyDecis
 
 #[cfg(test)]
 mod tests {
-    use super::decide_tool;
-    use holt_protocol::{ApprovalMode, EffectRisk, ToolSpec};
+    use super::decide_action;
+    use holt_protocol::{ApprovalMode, EffectRisk, ActionSpec};
 
     #[test]
-    fn denies_write_tools_in_deny_writes_mode() {
-        let tool = ToolSpec {
-            name: "write_file".to_string(),
+    fn denies_write_actions_in_deny_writes_mode() {
+        let action = ActionSpec {
+            name: "write".to_string(),
             description: "write".to_string(),
             risk: EffectRisk::Write,
             approval_required: true,
         };
 
-        let decision = decide_tool(&tool, &ApprovalMode::DenyWrites);
+        let decision = decide_action(&action, &ApprovalMode::DenyWrites);
         assert!(!decision.allowed);
         assert_eq!(decision.reason_code, "policy_denied_side_effect");
     }

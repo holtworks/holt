@@ -13,8 +13,8 @@ defmodule Holt.Tasks.AgentWorkLiveness do
   def enrich(entry, now \\ Holt.Clock.now())
 
   def enrich(entry, %DateTime{} = now) when is_map(entry) do
-    status = value(entry, "status")
-    last_activity_at = last_activity_at(entry)
+    status = text_field(entry, "status")
+    last_activity_at = timestamp(entry, "last_activity_at")
     quiet_seconds = quiet_seconds(last_activity_at, now)
     liveness_status = liveness_status(status, quiet_seconds)
 
@@ -44,15 +44,6 @@ defmodule Holt.Tasks.AgentWorkLiveness do
 
   defp liveness_status(_status, _quiet_seconds), do: "inactive"
 
-  defp last_activity_at(entry) do
-    value(entry, "last_heartbeat_at") ||
-      value(entry, "completed_at") ||
-      value(entry, "started_at") ||
-      value(entry, "scheduled_start_at") ||
-      value(entry, "queued_at") ||
-      value(entry, "created_at")
-  end
-
   defp quiet_seconds(nil, _now), do: nil
 
   defp quiet_seconds(%DateTime{} = last_activity_at, %DateTime{} = now) do
@@ -60,10 +51,17 @@ defmodule Holt.Tasks.AgentWorkLiveness do
     |> max(0)
   end
 
-  defp value(map, key) do
+  defp timestamp(map, key) do
     map
     |> Map.get(key)
     |> parse_datetime()
+  end
+
+  defp text_field(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) -> String.trim(value)
+      _value -> nil
+    end
   end
 
   defp parse_datetime(%DateTime{} = datetime), do: datetime
@@ -71,13 +69,12 @@ defmodule Holt.Tasks.AgentWorkLiveness do
   defp parse_datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, datetime, _offset} -> datetime
-      _error -> value
+      _error -> nil
     end
   end
 
-  defp parse_datetime(value), do: value
+  defp parse_datetime(_value), do: nil
 
   defp format_datetime(nil), do: nil
   defp format_datetime(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
-  defp format_datetime(value), do: value
 end

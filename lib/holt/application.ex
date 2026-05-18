@@ -8,7 +8,9 @@ defmodule Holt.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      Holt.Boot,
       Holt.Gateway,
+      {DynamicSupervisor, strategy: :one_for_one, name: Holt.Runtime.RunSupervisor},
       {Registry, keys: :unique, name: Holt.Runtime.SessionRegistry},
       {DynamicSupervisor, strategy: :one_for_one, name: Holt.Runtime.SessionSupervisor},
       {Task.Supervisor, name: Holt.Runtime.SessionTaskSupervisor},
@@ -16,7 +18,6 @@ defmodule Holt.Application do
     ]
 
     opts = [strategy: :one_for_one, name: Holt.Supervisor]
-    Holt.Actions.ProviderRegistry.init()
     Supervisor.start_link(children, opts)
   end
 end

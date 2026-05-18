@@ -14,8 +14,8 @@ defmodule HoltTest do
     Runtime,
     Skills,
     Tasks,
-    ToolVisibility,
-    Tools,
+    ActionVisibility,
+    LocalActions,
     Workspace
   }
 
@@ -57,13 +57,12 @@ defmodule HoltTest do
     assert File.exists?(Path.join(home, "providers.json"))
     assert File.exists?(Path.join([workspace, ".holtworks", "HOLT.md"]))
     assert File.exists?(Path.join([workspace, ".holtworks", "AGENTS.md"]))
-    assert File.exists?(Path.join([workspace, ".holtworks", "TOOLS.md"]))
+    assert File.exists?(Path.join([workspace, ".holtworks", "ACTIONS.md"]))
   end
 
   test "runtime chat mode completes a run without writing a planning artifact" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
-    Workspace.init(workspace)
 
     assert {:ok, %{run: run, artifact: artifact, output: output}} =
              Runtime.run("hello",
@@ -74,28 +73,33 @@ defmodule HoltTest do
              )
 
     assert run["status"] == "completed"
+    assert run["workspace_persistence"] == "ephemeral"
+    assert run["workspace_discovery"] == "agent_instructions_only"
+    assert get_in(run, ["pre_task_plan", "schema_version"]) == "holt_pre_task_plan/v1"
+    assert get_in(run, ["pre_task_plan", "reason"]) == "chat_turn_without_workspace_write"
     assert artifact == nil
     assert output =~ "Hello"
     refute output =~ "NEXT_STEPS"
     refute File.exists?(Path.join(workspace, "NEXT_STEPS.md"))
+    refute File.exists?(Path.join(workspace, ".holtworks"))
 
     events = Runs.events(run["run_dir"])
     assert Enum.any?(events, &(Map.get(&1, "type") == "context.built"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "tool.requested"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "tool.completed"))
+    refute Enum.any?(events, &(Map.get(&1, "type") == "action.requested"))
+    refute Enum.any?(events, &(Map.get(&1, "type") == "action.completed"))
 
     progress_events =
       Enum.filter(events, &(Map.get(&1, "type", "") |> String.starts_with?("progress.")))
 
-    tool_events =
+    action_events =
       Enum.filter(
         events,
         &(Map.get(&1, "type", "") in [
-            "tool.started",
-            "tool.completed",
-            "tool.failed",
-            "tool.approval_requested",
-            "tool.approval_resolved"
+            "action.started",
+            "action.completed",
+            "action.failed",
+            "action.approval_requested",
+            "action.approval_resolved"
           ])
       )
 
@@ -105,16 +109,112 @@ defmodule HoltTest do
     assert Enum.any?(progress_events, &(Map.get(&1, "type") == "progress.completed"))
     assert Enum.all?(progress_events, &(is_binary(&1["stage"]) and is_binary(&1["message"])))
 
-    assert Enum.any?(tool_events, &(Map.get(&1, "type") == "tool.started"))
-    assert Enum.any?(tool_events, &(Map.get(&1, "type") == "tool.completed"))
-
     assert Enum.all?(
-             tool_events,
-             &(is_binary(&1["tool"]) and is_binary(&1["label"]) and is_binary(&1["status"]))
+             action_events,
+             &(is_binary(&1["action"]) and is_binary(&1["label"]) and is_binary(&1["status"]))
            )
   end
 
-  test "runtime emits structured product progress and tool callback events" do
+  test "runtime goal contract completes without writing a planning artifact" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    assert {:ok, %{run: run, artifact: nil, output: output}} =
+             Runtime.run("make the CLI experience comparable",
+               home: home,
+               workspace: workspace,
+               runtime_contract: "goal",
+               approval: :always_approve
+             )
+
+    assert run["status"] == "completed"
+    assert run["runtime_contract"] == "goal"
+    assert output =~ "Runtime contract: goal"
+    refute output =~ "NEXT_STEPS"
+    refute File.exists?(Path.join(workspace, "NEXT_STEPS.md"))
+
+    assert Enum.any?(
+             Memory.all(workspace: workspace),
+             &(&1["kind"] == "goal" and &1["text"] == "make the CLI experience comparable")
+           )
+  end
+
+  test "action registry and executor expose the runtime action boundary" do
+    %{workspace: workspace} = tmp_env()
+    Workspace.init(workspace)
+
+    assert %{"name" => "read", "source" => "builtin"} = Holt.Actions.Registry.get("read")
+    assert %{"description" => write_description} = Holt.Actions.Registry.get("write")
+    assert write_description =~ "explicitly asks"
+    assert write_description =~ "returned directly in chat"
+
+    assert [%{"name" => "read"} | _rest] =
+             Holt.Actions.Registry.search(%{"names" => ["read"]})
+
+    assert %{"description" => ask_description} = Holt.Actions.Registry.get("ask")
+    assert ask_description =~ "follow-up question"
+    assert ask_description =~ "assistant content is terminal output"
+
+    assert {:ok, %{"result" => %{"files" => files}, "status" => "ok"}} =
+             Holt.Actions.Executor.run("list", %{"limit" => 10}, workspace: workspace)
+
+    assert is_list(files)
+  end
+
+  test "provider adapter keeps provider action protocol at the boundary" do
+    call = %{
+      "id" => "call_read",
+      "type" => "function",
+      "function" => %{"name" => "read", "arguments" => Jason.encode!(%{"path" => "README.md"})}
+    }
+
+    assert [normalized] = Holt.Actions.ProviderAdapter.normalize_calls([call])
+    assert Holt.Actions.ProviderAdapter.action_name(normalized) == "read"
+    assert Holt.Actions.ProviderAdapter.arguments(normalized) == %{"path" => "README.md"}
+    assert Holt.Actions.ProviderAdapter.call_event(normalized)["action"] == "read"
+
+    assert Holt.Actions.ProviderAdapter.decode_arguments(%{path: "README.md"}) == %{}
+    assert Holt.Actions.ProviderAdapter.normalize_calls([%{id: "call_read"}]) == []
+
+    legacy_schema_action =
+      Holt.Actions.ProviderAdapter.openai_action(%{
+        "name" => "legacy",
+        "arguments_schema" => %{"required" => ["path"]}
+      })
+
+    assert legacy_schema_action.function.parameters == %{"type" => "object", "properties" => %{}}
+
+    provider_message =
+      Holt.Actions.ProviderAdapter.result_message(normalized, %{"status" => "completed"})
+
+    assert provider_message["role"] == "action"
+    assert provider_message["tool_call_id"] == "call_read"
+  end
+
+  test "supervised run process can be observed and awaited" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    assert {:ok, pid} =
+             Holt.Runtime.RunServer.start("hello",
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               mode: "chat"
+             )
+
+    assert {:ok, %{run: run, output: output}} = Holt.Runtime.RunServer.await(pid, 5_000)
+    assert run["status"] == "completed"
+    assert output =~ "Hello"
+
+    status = Holt.Runtime.RunServer.status(pid)
+    assert status.status == "completed"
+    assert status.result
+  end
+
+  test "runtime emits structured product progress and action callback events" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -126,6 +226,7 @@ defmodule HoltTest do
                workspace: workspace,
                approval: :always_approve,
                mode: "chat",
+               workspace_intent: "explore_project",
                runtime_event_callback: fn event -> send(test_pid, {:runtime_event, event}) end
              )
 
@@ -147,22 +248,22 @@ defmodule HoltTest do
 
     assert_received {:runtime_event,
                      %{
-                       "type" => "tool.started",
-                       "tool" => "list_files",
+                       "type" => "action.started",
+                       "action" => "list",
                        "status" => "running",
                        "label" => "Reading workspace"
                      }}
 
     assert_received {:runtime_event,
                      %{
-                       "type" => "tool.completed",
-                       "tool" => "list_files",
+                       "type" => "action.completed",
+                       "action" => "list",
                        "status" => "completed",
                        "label" => "Read workspace"
                      }}
   end
 
-  test "runtime emits tool approval visibility for denied writes" do
+  test "runtime emits action approval visibility for denied writes" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -180,23 +281,24 @@ defmodule HoltTest do
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.approval_requested" and
-                 Map.get(&1, "tool") == "write_file" and
+             &(Map.get(&1, "type") == "action.approval_requested" and
+                 Map.get(&1, "action") == "write" and
                  Map.get(&1, "status") == "awaiting_approval" and
+                 Map.get(&1, "approval_subject") != nil and
                  Map.get(&1, "risk") == "write")
            )
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.approval_resolved" and
-                 Map.get(&1, "tool") == "write_file" and
+             &(Map.get(&1, "type") == "action.approval_resolved" and
+                 Map.get(&1, "action") == "write" and
                  Map.get(&1, "status") == "denied")
            )
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.failed" and
-                 Map.get(&1, "tool") == "write_file" and
+             &(Map.get(&1, "type") == "action.failed" and
+                 Map.get(&1, "action") == "write" and
                  Map.get(&1, "status") == "failed")
            )
   end
@@ -205,6 +307,12 @@ defmodule HoltTest do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
+
+    File.write!(
+      Path.join(workspace, "AGENTS.md"),
+      "# Agent rules\n\nRead only this during discovery."
+    )
+
     File.write!(Path.join(workspace, "README.md"), "# Example\n\nA small test workspace.")
     File.mkdir_p!(Path.join(workspace, "src"))
     File.write!(Path.join([workspace, "src", "app.ex"]), "defmodule Example.App do\nend\n")
@@ -220,15 +328,17 @@ defmodule HoltTest do
                home: home,
                workspace: workspace,
                approval: :always_approve,
-               mode: "chat"
+               mode: "chat",
+               workspace_intent: "explore_project"
              )
 
     assert run["status"] == "completed"
     assert artifact == nil
     assert output =~ "I scanned the workspace map"
     assert output =~ "Project shape:"
-    assert output =~ "Key files read:"
-    assert output =~ "README.md"
+    assert output =~ "Agent instructions read:"
+    assert output =~ "AGENTS.md"
+    refute output =~ "README.md"
     refute output =~ "NEXT_STEPS"
     refute File.exists?(Path.join(workspace, "NEXT_STEPS.md"))
 
@@ -236,14 +346,17 @@ defmodule HoltTest do
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.completed" and Map.get(&1, "tool") == "read_file")
+             &(Map.get(&1, "type") == "action.completed" and
+                 Map.get(&1, "action") == "read" and
+                 get_in(&1, ["result", "path"]) == "AGENTS.md")
            )
   end
 
-  test "runtime chat mode uses prior chat context for broad follow-up requests" do
+  test "runtime chat mode uses prior chat messages for broad follow-up requests" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
+    File.write!(Path.join(workspace, "AGENTS.md"), "# Agent rules")
     File.write!(Path.join(workspace, "README.md"), "# Example\n\nA small test workspace.")
 
     assert {:ok, %{artifact: artifact, output: output}} =
@@ -252,12 +365,15 @@ defmodule HoltTest do
                workspace: workspace,
                approval: :always_approve,
                mode: "chat",
-               chat_context: "user: read this repo"
+               workspace_intent: "explore_project",
+               chat_messages: [%{"role" => "user", "content" => "read this repo"}]
              )
 
     assert artifact == nil
     assert output =~ "I scanned the workspace map"
-    assert output =~ "Key files read:"
+    assert output =~ "Agent instructions read:"
+    assert output =~ "AGENTS.md"
+    refute output =~ "README.md"
     refute output =~ "Hello. What should we work on next?"
   end
 
@@ -293,7 +409,50 @@ defmodule HoltTest do
 
     assert_received {:chat_mode_messages, [%{"role" => "system", "content" => system} | _]}
     assert system =~ "return the final user-facing output"
+    assert system =~ "If the request can be answered in chat, return it inline as Markdown"
+    assert system =~ "choose a reasonable default and produce the example"
     refute system =~ "starts with \"# NEXT STEPS\""
+  end
+
+  test "runtime chat mode preserves assistant context for short option replies" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    test_pid = self()
+
+    model_chat = fn _provider, messages, _opts ->
+      send(test_pid, {:option_reply_messages, messages})
+
+      {:ok,
+       %{
+         "provider" => "local",
+         "model" => "local-planner",
+         "content" => "Let's inspect code structure and organization."
+       }}
+    end
+
+    assert {:ok, %{artifact: nil, output: output}} =
+             Runtime.run("1",
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               mode: "chat",
+               chat_messages: [
+                 %{"role" => "user", "content" => "ask me a real question and give me options"},
+                 %{
+                   "role" => "assistant",
+                   "content" =>
+                     "What area should we explore?\n\n1. Code structure and organization"
+                 }
+               ],
+               model_chat: model_chat
+             )
+
+    assert output == "Let's inspect code structure and organization."
+    assert_received {:option_reply_messages, messages}
+    assert Enum.any?(messages, &(&1["role"] == "assistant" and &1["content"] =~ "Code structure"))
+    assert List.last(messages)["content"] =~ "Current request:\n1"
   end
 
   test "native command run chat mode returns output and progress summary without an artifact" do
@@ -315,12 +474,13 @@ defmodule HoltTest do
 
     assert output =~ "Hello"
     assert output =~ "Progress: Starting request"
-    assert output =~ "Tool: Reading workspace"
-    assert output =~ "Tool: Read workspace"
-    assert output =~ "Tool: Searching memory"
+    assert output =~ "Progress: Reading agent instructions"
+    refute output =~ "Action: Reading workspace"
+    refute output =~ "Action: Searching memory"
     assert output =~ "Progress: Thinking through the request"
     assert output =~ "Progress: Completed"
     assert output =~ "Run:"
+    assert output =~ "Workspace persistence: ephemeral"
     assert output =~ "Status: completed"
     refute output =~ "Artifact:"
     refute output =~ "NEXT_STEPS.md"
@@ -329,6 +489,118 @@ defmodule HoltTest do
     refute output =~ "Rust"
     refute output =~ "TUI"
     refute File.exists?(Path.join(workspace, "NEXT_STEPS.md"))
+    refute File.exists?(Path.join(workspace, ".holtworks"))
+  end
+
+  test "native command goal uses the goal runtime contract without an artifact" do
+    %{home: home, workspace: workspace} = tmp_env()
+
+    output =
+      capture_io(fn ->
+        assert Bridge.NativeCommand.run(%{
+                 "command" => "goal",
+                 "params" => %{
+                   "yes" => true,
+                   "home" => home,
+                   "workspace" => workspace,
+                   "objective" => "improve cli ux"
+                 }
+               }) == 0
+      end)
+
+    assert output =~ "Goal: improve cli ux"
+    assert output =~ "Runtime contract: goal"
+    assert output =~ "Status: completed"
+    refute output =~ "Artifact:"
+    refute output =~ "NEXT_STEPS.md"
+    refute File.exists?(Path.join(workspace, "NEXT_STEPS.md"))
+    assert Runs.latest(workspace)["runtime_contract"] == "goal"
+  end
+
+  test "native command run honors provider override" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+
+    home
+    |> Config.load_providers()
+    |> Map.put("default_provider", "openrouter")
+    |> then(&Config.save_providers(home, &1))
+
+    output =
+      capture_io(fn ->
+        assert Bridge.NativeCommand.run(%{
+                 "command" => "run",
+                 "params" => %{
+                   "yes" => true,
+                   "mode" => "chat",
+                   "home" => home,
+                   "workspace" => workspace,
+                   "provider" => "local",
+                   "objective" => "hello"
+                 }
+               }) == 0
+      end)
+
+    assert output =~ "Hello"
+    refute output =~ "OPENROUTER_API_KEY"
+    assert output =~ "Workspace persistence: ephemeral"
+    refute File.exists?(Path.join(workspace, ".holtworks"))
+  end
+
+  test "native command rejects obsolete chat context parameter" do
+    %{home: home, workspace: workspace} = tmp_env()
+
+    output =
+      capture_io(:stderr, fn ->
+        assert Bridge.NativeCommand.run(%{
+                 "command" => "run",
+                 "params" => %{
+                   "yes" => true,
+                   "mode" => "chat",
+                   "home" => home,
+                   "workspace" => workspace,
+                   "objective" => "1",
+                   "chat_context" => "user: pick one"
+                 }
+               }) == 64
+      end)
+
+    assert output =~ ~s({:obsolete_param, "chat_context", "chat_messages"})
+  end
+
+  test "native command rejects unsupported workspace persistence contracts" do
+    %{home: home, workspace: workspace} = tmp_env()
+
+    output =
+      capture_io(:stderr, fn ->
+        assert Bridge.NativeCommand.run(%{
+                 "command" => "run",
+                 "params" => %{
+                   "yes" => true,
+                   "mode" => "chat",
+                   "home" => home,
+                   "workspace" => workspace,
+                   "objective" => "hello",
+                   "workspace_persistence" => "forever"
+                 }
+               }) == 64
+      end)
+
+    assert output =~ ~s({:unsupported_workspace_persistence, "forever"})
+  end
+
+  test "runtime rejects ephemeral persistence for writing contracts" do
+    %{home: home, workspace: workspace} = tmp_env()
+
+    assert {:error,
+            {:conflicting_workspace_persistence, "workspace_persistence", "runtime_contract"}} =
+             Runtime.run("write a plan",
+               home: home,
+               workspace: workspace,
+               workspace_persistence: "ephemeral"
+             )
+
+    refute File.exists?(Path.join(workspace, ".holtworks"))
   end
 
   test "native command run streams jsonl events for interactive clients" do
@@ -356,21 +628,38 @@ defmodule HoltTest do
 
     assert List.first(events)["type"] == "turn.started"
     assert Enum.any?(events, &(Map.get(&1, "type") == "progress.started"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "tool.started"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "tool.completed"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "answer.delta"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "turn.completed"))
 
-    assert %{"type" => "run.result", "output" => final_output, "status" => "completed"} =
-             List.last(events)
+    assert Enum.any?(
+             events,
+             &(Map.get(&1, "type") == "progress.reading" and
+                 Map.get(&1, "message") == "Reading agent instructions")
+           )
+
+    refute Enum.any?(events, &(Map.get(&1, "type") == "action.started"))
+    refute Enum.any?(events, &(Map.get(&1, "type") == "action.completed"))
+    assert Enum.any?(events, &(Map.get(&1, "type") == "answer.delta"))
+
+    assert Enum.any?(
+             events,
+             &(Map.get(&1, "type") == "turn.completed" and
+                 Map.get(&1, "workspace_persistence") == "ephemeral")
+           )
+
+    assert %{
+             "type" => "run.result",
+             "output" => final_output,
+             "status" => "completed",
+             "workspace_persistence" => "ephemeral"
+           } = List.last(events)
 
     assert final_output =~ "Hello"
     refute output =~ "Progress:"
-    refute output =~ "Tool:"
+    refute output =~ "Action:"
     refute output =~ "Run:"
+    refute File.exists?(Path.join(workspace, ".holtworks"))
   end
 
-  test "native command logs render product tool history by default" do
+  test "native command logs render product action history by default" do
     %{home: home, workspace: workspace} = tmp_env()
 
     capture_io(fn ->
@@ -379,6 +668,7 @@ defmodule HoltTest do
                "params" => %{
                  "yes" => true,
                  "mode" => "chat",
+                 "workspace_persistence" => "workspace",
                  "home" => home,
                  "workspace" => workspace,
                  "objective" => "hello"
@@ -395,14 +685,14 @@ defmodule HoltTest do
       end)
 
     assert output =~ "Progress: Starting request"
-    assert output =~ "Tool: Reading workspace"
-    assert output =~ "Tool: Read workspace"
+    assert output =~ "Progress: Reading agent instructions"
+    refute output =~ "Action:"
     refute output =~ ~s("type")
     refute output =~ ["Holt", "Works"] |> Enum.join()
     refute output =~ "backend"
   end
 
-  test "native command logs json emits machine-readable tool events" do
+  test "native command logs json records agent-instruction-only discovery" do
     %{home: home, workspace: workspace} = tmp_env()
 
     capture_io(fn ->
@@ -411,6 +701,7 @@ defmodule HoltTest do
                "params" => %{
                  "yes" => true,
                  "mode" => "chat",
+                 "workspace_persistence" => "workspace",
                  "home" => home,
                  "workspace" => workspace,
                  "objective" => "hello"
@@ -426,24 +717,22 @@ defmodule HoltTest do
                }) == 0
       end)
 
-    events =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.map(&Jason.decode!/1)
+    log = Jason.decode!(output)
+    events = log["events"]
+
+    assert log["schema_version"] == "holt_run_log/v1"
+    assert log["run"]["status"] == "completed"
+    assert log["latest_answer"] =~ "Hello"
+    assert Enum.any?(log["transcript"], &(&1["role"] == "assistant"))
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.started" and
-                 Map.get(&1, "tool") == "list_files" and
-                 Map.get(&1, "status") == "running")
+             &(Map.get(&1, "type") == "context.built" and
+                 Map.get(&1, "agent_instruction_file") == "AGENTS.md")
            )
 
-    assert Enum.any?(
-             events,
-             &(Map.get(&1, "type") == "tool.completed" and
-                 Map.get(&1, "tool") == "list_files" and
-                 Map.get(&1, "status") == "completed")
-           )
+    refute Enum.any?(events, &(Map.get(&1, "type") == "action.started"))
+    refute Enum.any?(events, &(Map.get(&1, "type") == "action.completed"))
   end
 
   test "runtime run records events and writes approved artifact" do
@@ -465,26 +754,26 @@ defmodule HoltTest do
 
     events = Runs.events(run["run_dir"])
     assert Enum.any?(events, &(Map.get(&1, "type") == "run.created"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "tool.requested"))
-    assert Enum.any?(events, &(Map.get(&1, "type") == "tool.completed"))
+    assert Enum.any?(events, &(Map.get(&1, "type") == "action.requested"))
+    assert Enum.any?(events, &(Map.get(&1, "type") == "action.completed"))
   end
 
-  test "runtime executes model tool calls through the action loop" do
+  test "runtime executes model action calls through the action loop" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
-    File.write!(Path.join(workspace, "source.txt"), "tool loop content")
+    File.write!(Path.join(workspace, "source.txt"), "action loop content")
     test_pid = self()
 
     model_chat = fn _provider, messages, opts ->
-      send(test_pid, {:model_call, messages, opts[:tools]})
+      send(test_pid, {:model_call, messages, opts[:actions]})
 
-      if Enum.any?(messages, &(Map.get(&1, "role") == "tool")) do
+      if Enum.any?(messages, &(Map.get(&1, "role") == "action")) do
         {:ok,
          %{
            "provider" => "local",
            "model" => "local-planner",
-           "content" => "# NEXT STEPS\n\nRead `source.txt` through the tool loop."
+           "content" => "# NEXT STEPS\n\nRead `source.txt` through the action loop."
          }}
       else
         {:ok,
@@ -497,7 +786,7 @@ defmodule HoltTest do
                "id" => "call_read_source",
                "type" => "function",
                "function" => %{
-                 "name" => "read_file",
+                 "name" => "read",
                  "arguments" => Jason.encode!(%{"path" => "source.txt"})
                }
              }
@@ -518,18 +807,18 @@ defmodule HoltTest do
     assert output =~ "source.txt"
     assert File.read!(Path.join(workspace, "NEXT_STEPS.md")) =~ "source.txt"
 
-    assert_received {:model_call, _initial_messages, initial_tools}
-    assert Enum.any?(initial_tools, &(get_in(&1, [:function, :name]) == "read_file"))
-    assert Enum.any?(initial_tools, &(get_in(&1, [:function, :name]) == "write_file"))
-    assert_received {:model_call, tool_messages, _tools}
-    assert Enum.any?(tool_messages, &(Map.get(&1, "role") == "tool"))
+    assert_received {:model_call, _initial_messages, initial_actions}
+    assert Enum.any?(initial_actions, &(get_in(&1, [:function, :name]) == "read"))
+    assert Enum.any?(initial_actions, &(get_in(&1, [:function, :name]) == "write"))
+    assert_received {:model_call, action_messages, _actions}
+    assert Enum.any?(action_messages, &(Map.get(&1, "role") == "action"))
 
     events = Runs.events(run["run_dir"])
     assert Enum.any?(events, &(Map.get(&1, "type") == "model.tool_calls"))
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.completed" and Map.get(&1, "tool") == "read_file")
+             &(Map.get(&1, "type") == "action.completed" and Map.get(&1, "action") == "read")
            )
 
     assert {:ok, agent_events} = AgentEvents.list_by_session(run["id"], workspace: workspace)
@@ -538,8 +827,8 @@ defmodule HoltTest do
     assert "user_message" in event_types
     assert "llm_request" in event_types
     assert "llm_response" in event_types
-    assert "tool_invocation" in event_types
-    assert "tool_result" in event_types
+    assert "action_invocation" in event_types
+    assert "action_result" in event_types
     assert "session_end" in event_types
 
     assert Enum.map(agent_events, & &1["sequence"]) == Enum.to_list(0..(length(agent_events) - 1))
@@ -547,13 +836,13 @@ defmodule HoltTest do
     assert {:ok, summary} = AgentEvents.get_session_summary(run["id"], workspace: workspace)
     assert summary["status"] == "completed"
     assert summary["event_counts"]["llm_request"] == 2
-    assert "read_file" in summary["tools"]
+    assert "read" in summary["actions"]
 
     assert {:ok, tree} = AgentEvents.get_session_tree(run["id"], workspace: workspace)
     nodes = flatten_agent_event_tree(tree["root"])
     assert Enum.any?(nodes, &(&1["type"] == "turn"))
     assert Enum.any?(nodes, &(&1["type"] == "llm"))
-    assert Enum.any?(nodes, &(&1["type"] == "tool" and &1["name"] == "Read file"))
+    assert Enum.any?(nodes, &(&1["type"] == "action" and &1["name"] == "Read"))
 
     assert %{"ok" => true, "result" => bridge_summary} =
              Bridge.Stdio.handle_request(
@@ -562,6 +851,195 @@ defmodule HoltTest do
              )
 
     assert bridge_summary["total_events"] == summary["total_events"]
+  end
+
+  test "runtime sends actionable missing argument errors back to the model" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+    test_pid = self()
+
+    model_chat = fn _provider, messages, _opts ->
+      case Enum.find(messages, &(Map.get(&1, "role") == "action")) do
+        nil ->
+          {:ok,
+           %{
+             "provider" => "local",
+             "model" => "local-planner",
+             "content" => "",
+             "tool_calls" => [
+               %{
+                 "id" => "call_write_empty",
+                 "type" => "function",
+                 "function" => %{"name" => "write"}
+               }
+             ]
+           }}
+
+        action_message ->
+          action_result = Jason.decode!(action_message["content"])
+          send(test_pid, {:empty_write_result, action_result})
+
+          {:ok,
+           %{
+             "provider" => "local",
+             "model" => "local-planner",
+             "content" => "# NEXT STEPS\n\nThe write action reported missing arguments."
+           }}
+      end
+    end
+
+    assert {:ok, %{run: run, output: output}} =
+             Runtime.run("write a file",
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat
+             )
+
+    assert run["status"] == "completed"
+    assert output =~ "missing arguments"
+
+    assert_received {:empty_write_result,
+                     %{
+                       "action" => "write",
+                       "status" => "error",
+                       "reason" => "missing_required_arguments",
+                       "missing_arguments" => ["path", "content"],
+                       "required_arguments" => ["path", "content"],
+                       "received_arguments" => []
+                     }}
+
+    events = Runs.events(run["run_dir"])
+
+    assert Enum.any?(
+             events,
+             &(Map.get(&1, "type") == "action.failed" and Map.get(&1, "action") == "write" and
+                 Map.get(&1, "reason") == "missing_required_arguments")
+           )
+  end
+
+  test "runtime action loop has no fixed turn cap" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+    File.write!(Path.join(workspace, "source.txt"), "repeatable action loop content")
+
+    model_chat = fn _provider, messages, _opts ->
+      action_turn = Enum.count(messages, &(Map.get(&1, "role") == "action"))
+
+      if action_turn < 9 do
+        {:ok,
+         %{
+           "provider" => "local",
+           "model" => "local-planner",
+           "content" => "",
+           "tool_calls" => [
+             %{
+               "id" => "call_read_source_#{action_turn + 1}",
+               "type" => "function",
+               "function" => %{
+                 "name" => "read",
+                 "arguments" => Jason.encode!(%{"path" => "source.txt"})
+               }
+             }
+           ]
+         }}
+      else
+        {:ok,
+         %{
+           "provider" => "local",
+           "model" => "local-planner",
+           "content" => "# NEXT STEPS\n\nCompleted after nine action turns."
+         }}
+      end
+    end
+
+    assert {:ok, %{run: run, output: output}} =
+             Runtime.run("keep reading until ready",
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat
+             )
+
+    assert run["status"] == "completed"
+    assert output =~ "nine action turns"
+
+    events = Runs.events(run["run_dir"])
+    assert Enum.count(events, &(Map.get(&1, "type") == "model.requested")) == 10
+
+    assert Enum.count(
+             events,
+             &(Map.get(&1, "type") == "action.completed" and Map.get(&1, "action") == "read")
+           ) == 9
+  end
+
+  test "new directory discovery blocks model reads outside agent instructions" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "source.txt"), "private source content")
+    test_pid = self()
+
+    model_chat = fn _provider, messages, _opts ->
+      if Enum.any?(messages, &(Map.get(&1, "role") == "action")) do
+        action_message = Enum.find(messages, &(Map.get(&1, "role") == "action"))
+        send(test_pid, {:blocked_discovery_action, action_message["content"]})
+
+        {:ok,
+         %{
+           "provider" => "local",
+           "model" => "local-planner",
+           "content" => "# NEXT STEPS\n\nAsk which file to inspect next."
+         }}
+      else
+        {:ok,
+         %{
+           "provider" => "local",
+           "model" => "local-planner",
+           "content" => "",
+           "tool_calls" => [
+             %{
+               "id" => "call_read_source",
+               "type" => "function",
+               "function" => %{
+                 "name" => "read",
+                 "arguments" => Jason.encode!(%{"path" => "source.txt"})
+               }
+             }
+           ]
+         }}
+      end
+    end
+
+    assert {:ok, %{run: run, output: output}} =
+             Runtime.run("inspect this folder",
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat
+             )
+
+    assert run["status"] == "completed"
+    assert output =~ "Ask which file to inspect next"
+
+    assert_received {:blocked_discovery_action, action_result}
+    assert action_result =~ "directory_discovery_allows_only_agent_instructions"
+    refute action_result =~ "private source content"
+
+    events = Runs.events(run["run_dir"])
+
+    refute Enum.any?(
+             events,
+             &(Map.get(&1, "type") == "action.completed" and Map.get(&1, "action") == "read")
+           )
+
+    assert Enum.any?(
+             events,
+             &(Map.get(&1, "type") == "action.failed" and Map.get(&1, "action") == "read" and
+                 Map.get(&1, "reason") == "directory_discovery_allows_only_agent_instructions")
+           )
   end
 
   test "runtime session streams final output and checkpoints status" do
@@ -603,7 +1081,32 @@ defmodule HoltTest do
     assert bridge_status["status"] == "completed"
   end
 
-  test "runtime session pauses on ask_user tool call and resumes with answer" do
+  test "stdio session start rejects obsolete agent parameter" do
+    %{workspace: workspace} = tmp_env()
+
+    assert %{"ok" => false, "error" => error} =
+             Bridge.Stdio.handle_request(
+               %{
+                 "method" => "agent_sessions/start",
+                 "params" => %{"objective" => "hello", "agent" => "legacy-agent"}
+               },
+               workspace: workspace
+             )
+
+    assert error == ~s({:obsolete_param, "agent", "agent_id"})
+  end
+
+  test "stdio session routes reject singular session method aliases" do
+    assert Bridge.Stdio.handle_request(
+             %{
+               "method" => "agent_session/start",
+               "params" => %{"objective" => "hello"}
+             },
+             []
+           ) == %{"ok" => false, "error" => "unknown_method"}
+  end
+
+  test "runtime session pauses on structured ask action and resumes with answer" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -613,9 +1116,14 @@ defmodule HoltTest do
     model_chat = fn _provider, messages, _opts ->
       send(test_pid, {:session_model_messages, messages})
 
-      if Enum.any?(messages, &(Map.get(&1, "role") == "tool")) do
-        tool_message = Enum.find(messages, &(Map.get(&1, "role") == "tool"))
-        assert tool_message["content"] =~ "approved"
+      if Enum.any?(messages, &(Map.get(&1, "role") == "action")) do
+        action_message = Enum.find(messages, &(Map.get(&1, "role") == "action"))
+        action_content = Jason.decode!(action_message["content"])
+        assert get_in(action_content, ["result", "answer"]) == "approved"
+        assert action_content["continuation_policy"]["follow_up_user_input_action"] == "ask"
+
+        assert action_content["continuation_policy"]["requires_action_for_more_user_input"] ==
+                 true
 
         {:ok,
          %{
@@ -634,7 +1142,7 @@ defmodule HoltTest do
                "id" => "call_need_user",
                "type" => "function",
                "function" => %{
-                 "name" => "ask_user",
+                 "name" => "ask",
                  "arguments" => Jason.encode!(%{"question" => "Continue with the task?"})
                }
              }
@@ -653,10 +1161,10 @@ defmodule HoltTest do
 
     session_id = session["session_id"]
 
-    assert_receive {:awaiting_user, "Continue with the task?"}, 2_000
+    assert_receive {:awaiting_user, "Continue with the task?"}, 10_000
     assert {:ok, awaiting} = Session.status(session_id, workspace: workspace)
     assert awaiting["status"] == "awaiting_user"
-    assert awaiting["awaiting_user"]["tool_call_id"] == "call_need_user"
+    assert awaiting["awaiting_user"]["action_call_id"] == "call_need_user"
 
     assert {:ok, running} = Session.respond(session_id, "approved", workspace: workspace)
     assert running["status"] == "running"
@@ -667,8 +1175,8 @@ defmodule HoltTest do
     assert done =~ "user approved"
 
     assert_received {:session_model_messages, _initial_messages}
-    assert_received {:session_model_messages, tool_messages}
-    assert Enum.any?(tool_messages, &(Map.get(&1, "role") == "tool"))
+    assert_received {:session_model_messages, action_messages}
+    assert Enum.any?(action_messages, &(Map.get(&1, "role") == "action"))
 
     assert {:ok, completed} = Session.status(session_id, workspace: workspace)
     assert completed["status"] == "completed"
@@ -680,7 +1188,7 @@ defmodule HoltTest do
     assert "stream_chunk" in event_types
   end
 
-  test "runtime session pauses on ask_user_question tool call and resumes with answer" do
+  test "runtime session pauses on ask action call and resumes with answer" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -690,10 +1198,14 @@ defmodule HoltTest do
     model_chat = fn _provider, messages, _opts ->
       send(test_pid, {:question_model_messages, messages})
 
-      if Enum.any?(messages, &(Map.get(&1, "role") == "tool")) do
-        tool_message = Enum.find(messages, &(Map.get(&1, "role") == "tool"))
-        assert tool_message["name"] == "ask_user_question"
-        assert tool_message["content"] =~ "go"
+      if Enum.any?(messages, &(Map.get(&1, "role") == "action")) do
+        action_message = Enum.find(messages, &(Map.get(&1, "role") == "action"))
+        assert action_message["name"] == "ask"
+        action_content = Jason.decode!(action_message["content"])
+        assert get_in(action_content, ["result", "answer"]) == "go"
+        assert action_content["question"] == "Choose a path"
+        assert action_content["options"] == [%{"label" => "Go", "value" => "go"}]
+        assert action_content["continuation_policy"]["follow_up_user_input_action"] == "ask"
 
         {:ok,
          %{
@@ -712,7 +1224,7 @@ defmodule HoltTest do
                "id" => "call_question",
                "type" => "function",
                "function" => %{
-                 "name" => "ask_user_question",
+                 "name" => "ask",
                  "arguments" =>
                    Jason.encode!(%{
                      "question" => "Choose a path",
@@ -735,10 +1247,11 @@ defmodule HoltTest do
 
     session_id = session["session_id"]
 
-    assert_receive {:awaiting_user, "Choose a path"}, 2_000
+    assert_receive {:awaiting_user, "Choose a path"}, 10_000
     assert {:ok, awaiting} = Session.status(session_id, workspace: workspace)
     assert awaiting["status"] == "awaiting_user"
-    assert awaiting["awaiting_user"]["tool_call_id"] == "call_question"
+    assert awaiting["awaiting_user"]["action_call_id"] == "call_question"
+    assert awaiting["awaiting_user"]["options"] == [%{"label" => "Go", "value" => "go"}]
 
     assert {:ok, running} = Session.respond(session_id, "go", workspace: workspace)
     assert running["status"] == "running"
@@ -747,8 +1260,8 @@ defmodule HoltTest do
     assert done =~ "selected path"
 
     assert_received {:question_model_messages, _initial_messages}
-    assert_received {:question_model_messages, tool_messages}
-    assert Enum.any?(tool_messages, &(Map.get(&1, "role") == "tool"))
+    assert_received {:question_model_messages, action_messages}
+    assert Enum.any?(action_messages, &(Map.get(&1, "role") == "action"))
   end
 
   test "runtime blocks when approval is denied" do
@@ -767,7 +1280,7 @@ defmodule HoltTest do
     refute File.exists?(Path.join(workspace, "NEXT_STEPS.md"))
   end
 
-  test "runtime blocks denied model write tool calls" do
+  test "runtime blocks denied model write action calls" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -783,7 +1296,7 @@ defmodule HoltTest do
              "id" => "call_write_notes",
              "type" => "function",
              "function" => %{
-               "name" => "write_file",
+               "name" => "write",
                "arguments" => Jason.encode!(%{"path" => "notes.txt", "content" => "denied write"})
              }
            }
@@ -807,8 +1320,8 @@ defmodule HoltTest do
 
     assert Enum.any?(
              events,
-             &(Map.get(&1, "type") == "tool.failed" and
-                 Map.get(&1, "tool") == "write_file" and
+             &(Map.get(&1, "type") == "action.failed" and
+                 Map.get(&1, "action") == "write" and
                  Map.get(&1, "reason") == "approval_denied")
            )
   end
@@ -835,7 +1348,38 @@ defmodule HoltTest do
     assert resumed["objective"] == original["objective"]
   end
 
-  test "action catalog exposes transport-neutral provider-filtered tools" do
+  test "fork starts a branched run without mutating the source run" do
+    %{home: home, workspace: workspace} = tmp_env()
+
+    assert {:ok, %{run: original}} =
+             Runtime.run("inspect this folder",
+               home: home,
+               workspace: workspace,
+               approval: :always_approve
+             )
+
+    original_event_count = length(Runs.events(original["run_dir"]))
+
+    assert {:ok, %{run: forked}} =
+             Runtime.fork(original["id"],
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               objective: "try a different implementation path"
+             )
+
+    assert forked["status"] == "completed"
+    assert forked["forked_from"] == original["id"]
+    refute Map.has_key?(forked, "resumed_from")
+    assert forked["objective"] == "try a different implementation path"
+
+    reloaded_original = Runs.load_run!(original["run_dir"])
+    assert reloaded_original["id"] == original["id"]
+    refute Map.has_key?(reloaded_original, "forked_from")
+    assert length(Runs.events(original["run_dir"])) == original_event_count
+  end
+
+  test "action catalog exposes transport-neutral provider-filtered actions" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
@@ -844,42 +1388,57 @@ defmodule HoltTest do
     context = %{
       "task_ref" => task["ref"],
       "action_provider_ids" => ["workspace"],
-      "excluded_actions" => ["write_file"]
+      "excluded_actions" => ["write"]
     }
 
     catalog = Tasks.action_catalog(context, workspace: workspace)
     names = Enum.map(catalog, & &1["name"])
-    assert "read_file" in names
-    refute "write_file" in names
+    assert "read" in names
+    refute "write" in names
     refute "add_comment" in names
 
-    read_entry = Enum.find(catalog, &(&1["name"] == "read_file"))
-    assert read_entry["schema_version"] == "holtworks_tool_catalog_entry/v1"
+    read_entry = Enum.find(catalog, &(&1["name"] == "read"))
+    assert read_entry["schema_version"] == "holt_action_catalog_entry/v1"
     assert read_entry["surface"] == "agent"
     assert read_entry["source"] == "action"
     assert read_entry["provider_id"] == "workspace"
     assert read_entry["input_schema"]["type"] == "object"
+    assert read_entry["metadata"]["task_ref"] == task["ref"]
+    refute Map.has_key?(read_entry, "action_name")
+    assert Holt.Actions.ActionCatalog.provider_context(%{task_ref: task["ref"]}) == %{}
 
-    openai_tools = Tasks.agent_tool_definitions(context, workspace: workspace)
+    task_id_context =
+      context
+      |> Map.delete("task_ref")
+      |> Map.put("task_id", task["ref"])
+
+    task_id_read_entry =
+      task_id_context
+      |> Tasks.action_catalog(workspace: workspace)
+      |> Enum.find(&(&1["name"] == "read"))
+
+    refute Map.has_key?(task_id_read_entry["metadata"], "task_ref")
+
+    openai_action_definitions = Tasks.agent_action_definitions(context, workspace: workspace)
 
     assert Enum.any?(
-             openai_tools,
-             &(get_in(&1, ["function", "name"]) == "read_file" and
+             openai_action_definitions,
+             &(get_in(&1, ["function", "name"]) == "read" and
                  get_in(&1, ["function", "parameters", "type"]) == "object")
            )
 
-    assert [%{"id" => "workspace", "tool_count" => tool_count}] =
+    assert [%{"id" => "workspace", "action_count" => action_count}] =
              Tasks.action_provider_metadata(context, workspace: workspace)
 
-    assert tool_count > 0
+    assert action_count > 0
 
     assert [%{"provider_id" => "workspace", "content" => prompt_section}] =
              Tasks.action_provider_prompt_sections(context, workspace: workspace)
 
-    assert prompt_section =~ "Workspace tools"
+    assert prompt_section =~ "Workspace actions"
 
     assert {:ok, execution} =
-             Tasks.dispatch_agent_tool(
+             Tasks.dispatch_agent_action(
                "add_comment",
                %{"body" => "catalog dispatch"},
                %{"task_ref" => task["ref"]},
@@ -892,22 +1451,22 @@ defmodule HoltTest do
     assert %{"ok" => true, "result" => bridge_catalog} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "agent_tools/catalog",
+                 "method" => "agent_actions/catalog",
                  "params" => context
                },
                workspace: workspace
              )
 
-    assert Enum.any?(bridge_catalog, &(&1["name"] == "read_file"))
+    assert Enum.any?(bridge_catalog, &(&1["name"] == "read"))
   end
 
-  test "agent tool definitions use provider-compatible array schemas" do
+  test "agent action definitions use provider-compatible array schemas" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
     errors =
-      %{"task_tool_session" => Holt.Tasks.TaskToolSession.build(%{})}
-      |> Tasks.agent_tool_definitions(workspace: workspace)
+      %{"action_session" => Holt.Tasks.ActionSession.build(%{})}
+      |> Tasks.agent_action_definitions(workspace: workspace)
       |> Enum.flat_map(&array_schema_errors/1)
 
     assert errors == []
@@ -948,13 +1507,13 @@ defmodule HoltTest do
              )
 
     assert execution["status"] == "ok"
-    assert execution["tool_name"] == "search_web"
+    assert execution["action"] == "search_web"
     assert execution["result"]["text"] =~ "## Search Results"
     assert execution["result"]["research_claim_saved"] == true
 
     claim = execution["result"]["research_claim"]
-    assert claim["schema_version"] == "holtworks_research_claim/v1"
-    assert claim["source"]["tool"] == "search_web"
+    assert claim["schema_version"] == "holt_research_claim/v1"
+    assert claim["source"]["action"] == "search_web"
     assert claim["source"]["query"] == "holtworks runtime"
     assert claim["source"]["urls"] == ["https://holtworks.ai/docs/runtime"]
     assert claim["source_type"] == "official_docs"
@@ -1053,7 +1612,9 @@ defmodule HoltTest do
                task["ref"],
                %{
                  "summary" => "All structured checks passed.",
-                 "checks" => [%{"name" => "tests", "status" => "passed"}]
+                 "checks" => [
+                   %{"name" => "tests", "check_type" => "regression_check", "status" => "passed"}
+                 ]
                },
                workspace: workspace
              )
@@ -1081,7 +1642,9 @@ defmodule HoltTest do
                task["ref"],
                %{
                  "summary" => "Tests passed, but billing behavior changed.",
-                 "checks" => [%{"name" => "tests", "status" => "passed"}],
+                 "checks" => [
+                   %{"name" => "tests", "check_type" => "regression_check", "status" => "passed"}
+                 ],
                  "risk_flags" => ["billing"]
                },
                workspace: workspace
@@ -1128,7 +1691,9 @@ defmodule HoltTest do
                task["ref"],
                %{
                  "summary" => "A generic check passed, but required evidence is missing.",
-                 "checks" => [%{"name" => "tests", "status" => "passed"}]
+                 "checks" => [
+                   %{"name" => "tests", "check_type" => "unit_check", "status" => "passed"}
+                 ]
                },
                workspace: workspace
              )
@@ -1316,7 +1881,7 @@ defmodule HoltTest do
     assert agent_run["run_id"] == run["id"]
     assert agent_run["lifecycle_state"] == "awaiting_verification"
     assert agent_run["objective_status"] == "needs_verification"
-    assert agent_run["agent_loop"]["schema_version"] == "holtworks_agent_loop/v1"
+    assert agent_run["agent_loop"]["schema_version"] == "holt_agent_loop/v1"
     assert agent_run["agent_loop"]["mode"] == "continuous_until_verified"
 
     assert {:ok, fetched} = Tasks.get(task["ref"], workspace: workspace)
@@ -1372,7 +1937,7 @@ defmodule HoltTest do
 
     assert wake["action"] == "wake_queued"
     assert wake["reason"] == "process_exited"
-    assert wake["process_wake_packet"]["schema_version"] == "holtworks_agent_process_wake/v1"
+    assert wake["process_wake_packet"]["schema_version"] == "holt_agent_process_wake/v1"
     assert wake["process_wake_packet"]["previous_agent_run_id"] == agent_run["id"]
 
     assert {:ok, updated_task} = Tasks.get(task["ref"], workspace: workspace)
@@ -1390,8 +1955,8 @@ defmodule HoltTest do
                %{
                  "method" => "record_process_started",
                  "params" => %{
-                   "agent_run_id" => agent_run["id"],
-                   "managed_process_id" => "proc2"
+                   "context" => %{"agent_run_id" => agent_run["id"]},
+                   "process" => %{"managed_process_id" => "proc2"}
                  }
                },
                workspace: workspace
@@ -1443,7 +2008,7 @@ defmodule HoltTest do
              Tasks.record_agent_run_plan_contract(
                agent_run["id"],
                %{
-                 "schema_version" => "holtworks_plan_contract/v1",
+                 "schema_version" => "holt_plan_contract/v1",
                  "plan_id" => "plan-1",
                  "steps" => [%{"id" => "step-1", "status" => "planned"}]
                },
@@ -1452,21 +2017,20 @@ defmodule HoltTest do
 
     assert plan_event["kind"] == "plan.contract"
 
-    assert {:ok, _run, tool_event} =
-             Tasks.record_agent_run_tool_event(
+    assert {:ok, _run, action_event} =
+             Tasks.record_agent_run_action_event(
                agent_run["id"],
                %{
-                 "tool_name" => "update_task",
-                 "tool_call_id" => "tool-call-1",
-                 "result_status" => "ok",
-                 "result_preview" => "Updated task state",
+                 "action" => "update_task",
+                 "action_call_id" => "action-call-1",
+                 "result" => %{"status" => "ok", "preview" => "Updated task state"},
                  "action_runtime_envelope" => %{"envelope_id" => "env-1"}
                },
                workspace: workspace
              )
 
-    assert tool_event["metadata"]["schema_version"] == "holtworks_agent_run_tool_event/v1"
-    assert tool_event["metadata"]["effective_work"] == true
+    assert action_event["metadata"]["schema_version"] == "holt_agent_run_action_event/v1"
+    assert action_event["metadata"]["effective_work"] == true
 
     assert {:ok, _run, child_contract_event} =
              Tasks.record_agent_run_child_contract(
@@ -1480,7 +2044,12 @@ defmodule HoltTest do
     assert {:ok, _run, child_completion_event} =
              Tasks.record_agent_run_child_completion(
                agent_run["id"],
-               %{"child_agent_id" => "agent-child-1", "child_run_id" => "child-run-1"},
+               %{
+                 "child_agent_id" => "agent-child-1",
+                 "child_run_id" => "child-run-1",
+                 "status" => "completed",
+                 "message" => "Child run completed."
+               },
                workspace: workspace
              )
 
@@ -1489,7 +2058,11 @@ defmodule HoltTest do
     assert {:ok, _run, objective_event} =
              Tasks.record_agent_run_objective_evaluation(
                agent_run["id"],
-               %{"route" => %{"can_finish" => true}, "verification_status" => "passed"},
+               %{
+                 "route" => %{"can_finish" => true},
+                 "verification_status" => "passed",
+                 "message" => "Objective evaluation passed."
+               },
                workspace: workspace
              )
 
@@ -1499,6 +2072,8 @@ defmodule HoltTest do
              Tasks.record_agent_run_continuation_packet(
                agent_run["id"],
                %{
+                 "schema_version" => "holt_continuation_packet/v1",
+                 "packet_id" => "packet-1",
                  "previous_agent_run_id" => agent_run["id"],
                  "continuation_depth" => 1,
                  "source" => "test"
@@ -1515,47 +2090,47 @@ defmodule HoltTest do
     |> assert_event_types([
       "agent.narration",
       "plan.contract",
-      "tool.completed",
+      "action.completed",
       "child_agent.contract",
       "child_agent.completed",
       "objective.evaluated",
       "agent_run.continuation_packet"
     ])
 
-    assert [tool_search_event] =
+    assert [action_search_event] =
              Tasks.agent_run_events_by_agent(
                agent_run["agent_id"],
-               %{"kind" => "tool.completed"},
+               %{"kind" => "action.completed"},
                workspace: workspace
              )
 
-    assert tool_search_event["metadata"]["tool_call_id"] == "tool-call-1"
+    assert action_search_event["metadata"]["action_call_id"] == "action-call-1"
 
     assert {:ok, replay} =
              Tasks.agent_run_replay(agent_run["agent_id"], agent_run["id"], workspace: workspace)
 
-    assert replay["schema_version"] == "holtworks_agent_run_replay/v1"
+    assert replay["schema_version"] == "holt_agent_run_replay/v1"
     assert replay["event_count"] == length(events)
 
     assert %{"ok" => true, "result" => %{"action" => "event_recorded", "event" => stdio_event}} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "record_tool_event",
+                 "method" => "record_action_event",
                  "params" => %{
                    "agent_run_id" => agent_run["id"],
-                   "tool_name" => "save_task_spec",
-                   "tool_call_id" => "tool-call-2",
-                   "result_status" => "ok"
+                   "action" => "save_task_spec",
+                   "action_call_id" => "action-call-2",
+                   "result" => %{"status" => "ok"}
                  }
                },
                workspace: workspace
              )
 
-    assert stdio_event["kind"] == "tool.completed"
+    assert stdio_event["kind"] == "action.completed"
 
     assert Enum.any?(
              Tasks.agent_run_events(workspace: workspace),
-             &(&1["type"] == "tool.completed")
+             &(&1["type"] == "action.completed")
            )
   end
 
@@ -1567,7 +2142,7 @@ defmodule HoltTest do
 
     assert {:ok, graph} = Tasks.create_task_graph(task["ref"], %{}, workspace: workspace)
 
-    assert graph["schema_version"] == "holtworks_task_graph/v1"
+    assert graph["schema_version"] == "holt_task_graph/v1"
     assert graph_node(graph, "plan")["status"] == "scheduled"
     assert graph_node(graph, "work")["status"] == "pending"
     assert graph_node(graph, "verify")["status"] == "pending"
@@ -1578,7 +2153,7 @@ defmodule HoltTest do
     assert "verification_gate_not_satisfied" in blocker_codes(graph)
 
     assert {:ok, planned} =
-             Tasks.complete_task_graph_node(graph["id"], "plan", %{"summary" => "Plan ready."},
+             Tasks.complete_task_graph_node(graph["id"], "plan", %{"output" => "Plan ready."},
                workspace: workspace
              )
 
@@ -1586,7 +2161,7 @@ defmodule HoltTest do
     assert graph_node(planned, "work")["status"] == "scheduled"
 
     assert {:ok, worked} =
-             Tasks.complete_task_graph_node(graph["id"], "work", %{"summary" => "Work ready."},
+             Tasks.complete_task_graph_node(graph["id"], "work", %{"output" => "Work ready."},
                workspace: workspace
              )
 
@@ -1599,7 +2174,9 @@ defmodule HoltTest do
                %{
                  "graph_id" => graph["id"],
                  "summary" => "Graph checks passed.",
-                 "checks" => [%{"name" => "tests", "status" => "passed"}]
+                 "checks" => [
+                   %{"name" => "tests", "check_type" => "regression_check", "status" => "passed"}
+                 ]
                },
                workspace: workspace
              )
@@ -1632,7 +2209,7 @@ defmodule HoltTest do
     assert {:ok, graph} = Tasks.create_task_graph(task["ref"], %{}, workspace: workspace)
 
     assert {:ok, _planned} =
-             Tasks.complete_task_graph_node(graph["id"], "plan", %{"summary" => "Plan ready."},
+             Tasks.complete_task_graph_node(graph["id"], "plan", %{"output" => "Plan ready."},
                workspace: workspace
              )
 
@@ -1665,8 +2242,8 @@ defmodule HoltTest do
                %{
                  "title" => "Verifier route task",
                  "assignees" => [
-                   %{"id" => "builder_agent", "kind" => "agent", "work_role" => "worker"},
-                   %{"id" => "verifier_agent", "kind" => "agent", "work_role" => "verifier"}
+                   %{"agent_id" => "builder_agent", "kind" => "agent", "work_role" => "worker"},
+                   %{"agent_id" => "verifier_agent", "kind" => "agent", "work_role" => "verifier"}
                  ]
                },
                workspace: workspace
@@ -1679,12 +2256,12 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert route["schema_version"] == "holtworks_verifier_routing/v1"
+    assert route["schema_version"] == "holt_verifier_routing/v1"
     assert route["status"] == "requested"
     assert route["target_agent_id"] == "verifier_agent"
     assert route["child_agent_contract"]["authority_boundary"]["may_delegate_further"] == false
 
-    assert route["child_agent_contract"]["job_contract"]["gate_tool"] ==
+    assert route["child_agent_contract"]["job_contract"]["gate_action"] ==
              "route_verification_review"
 
     assert route["start_agent_work_params"]["graph_id"] == graph["id"]
@@ -1708,8 +2285,8 @@ defmodule HoltTest do
                %{
                  "title" => "Verifier operation task",
                  "assignees" => [
-                   %{"id" => "agent_worker", "kind" => "agent", "work_role" => "worker"},
-                   %{"id" => "agent_verify", "kind" => "agent", "work_role" => "verifier"}
+                   %{"agent_id" => "agent_worker", "kind" => "agent", "work_role" => "worker"},
+                   %{"agent_id" => "agent_verify", "kind" => "agent", "work_role" => "verifier"}
                  ]
                },
                opts
@@ -1720,9 +2297,9 @@ defmodule HoltTest do
     assert {:ok, contract} =
              Tasks.verification_contract(task["ref"], %{"graph_id" => graph["id"]}, opts)
 
-    assert contract["schema_version"] == "holtworks_verification_contract/v1"
+    assert contract["schema_version"] == "holt_verification_contract/v1"
     assert contract["required"] == true
-    assert contract["gate_tool"] == "route_verification_review"
+    assert contract["gate_action"] == "route_verification_review"
     assert contract["artifact_kinds"] == ["verification_report"]
 
     assignment_attrs = %{
@@ -1733,7 +2310,7 @@ defmodule HoltTest do
     assert {:ok, assignment} =
              Tasks.verifier_assignment(task["ref"], assignment_attrs, opts)
 
-    assert assignment["schema_version"] == "holtworks_verifier_assignment/v1"
+    assert assignment["schema_version"] == "holt_verifier_assignment/v1"
     assert assignment["assignment_result"] == "assigned"
     assert assignment["actor_agent_ids"] == ["agent_worker"]
     assert assignment["selected_verifier"]["agent_id"] == "agent_verify"
@@ -1748,7 +2325,7 @@ defmodule HoltTest do
     assert {:ok, dispatch} =
              Tasks.verifier_dispatch(task["ref"], assignment_attrs, opts)
 
-    assert dispatch["schema_version"] == "holtworks_verifier_dispatch/v1"
+    assert dispatch["schema_version"] == "holt_verifier_dispatch/v1"
     assert dispatch["status"] == "claimed"
     assert dispatch["target_agent_id"] == "agent_verify"
     assert dispatch["source"] == "verifier_dispatcher"
@@ -1776,7 +2353,7 @@ defmodule HoltTest do
                opts
              )
 
-    assert calibration["schema_version"] == "holtworks_verifier_calibration/v1"
+    assert calibration["schema_version"] == "holt_verifier_calibration/v1"
     assert calibration["verifier_agent_id"] == "agent_verify"
     assert calibration["verdict"] == "approved"
     assert calibration["later_outcome"] == "matched"
@@ -1800,51 +2377,51 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "assign_verifier",
-                 "params" => Map.put(assignment_attrs, "task_id", task["ref"])
+                 "params" => Map.put(assignment_attrs, "ref", task["ref"])
                },
                opts
              )
 
-    assert stdio_assignment["schema_version"] == "holtworks_verifier_assignment/v1"
+    assert stdio_assignment["schema_version"] == "holt_verifier_assignment/v1"
     assert stdio_assignment["selected_verifier"]["agent_id"] == "agent_verify"
 
     assert %{"ok" => true, "result" => stdio_dispatch} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "dispatch_verifier",
-                 "params" => Map.put(assignment_attrs, "task_id", task["ref"])
+                 "params" => Map.put(assignment_attrs, "ref", task["ref"])
                },
                opts
              )
 
-    assert stdio_dispatch["schema_version"] == "holtworks_verifier_dispatch/v1"
+    assert stdio_dispatch["schema_version"] == "holt_verifier_dispatch/v1"
     assert stdio_dispatch["target_agent_id"] == "agent_verify"
   end
 
-  test "agent runtime facade exposes provider safety tool and context contracts" do
-    tools =
-      AgentRuntime.tool_availability(%{
-        "tool_names" => ["get_task", "write_file", "unknown_tool"],
+  test "agent runtime facade exposes provider safety action and context contracts" do
+    actions =
+      AgentRuntime.action_availability(%{
+        "action_names" => ["get_task", "write", "unknown_action"],
         "approval_status" => "denied"
       })
 
-    read_tool = Enum.find(tools, &(&1["name"] == "get_task"))
-    write_tool = Enum.find(tools, &(&1["name"] == "write_file"))
-    unknown_tool = Enum.find(tools, &(&1["name"] == "unknown_tool"))
+    read_action = Enum.find(actions, &(&1["name"] == "get_task"))
+    write_action = Enum.find(actions, &(&1["name"] == "write"))
+    unknown_action = Enum.find(actions, &(&1["name"] == "unknown_action"))
 
-    assert read_tool["schema_version"] == "holtworks_tool_availability/v1"
-    assert read_tool["available"] == true
-    assert write_tool["available"] == false
-    assert write_tool["unavailable_reason"] == "approval_required"
-    assert unknown_tool["available"] == false
-    assert unknown_tool["unavailable_reason"] == "tool_not_registered"
+    assert read_action["schema_version"] == "holt_action_availability/v1"
+    assert read_action["available"] == true
+    assert write_action["available"] == false
+    assert write_action["unavailable_reason"] == "approval_required"
+    assert unknown_action["available"] == false
+    assert unknown_action["unavailable_reason"] == "action_not_registered"
 
-    doctor = AgentRuntime.doctor(%{"tool_names" => ["get_task", "unknown_tool"]})
-    assert doctor["schema_version"] == "holtworks_agent_runtime_doctor/v1"
+    doctor = AgentRuntime.doctor(%{"action_names" => ["get_task", "unknown_action"]})
+    assert doctor["schema_version"] == "holt_agent_runtime_doctor/v1"
     assert doctor["status"] == "degraded"
 
-    provider = AgentRuntime.provider_profile("gpt-5.2", %{})
-    assert provider["schema_version"] == "holtworks_provider_profile/v1"
+    provider = AgentRuntime.provider_profile("gpt-5.2", %{"provider" => "openai"})
+    assert provider["schema_version"] == "holt_provider_profile/v1"
     assert provider["provider"] == "openai"
     assert provider["runtime_kind"] == "hosted_llm"
     assert provider["context_window"] == 128_000
@@ -1857,31 +2434,33 @@ defmodule HoltTest do
         "max_continuation_depth" => 2
       })
 
-    assert safety["schema_version"] == "holtworks_safety_policy/v1"
+    assert safety["schema_version"] == "holt_safety_policy/v1"
     assert safety["permission_mode"] == "least_privilege"
-    assert safety["command_policy"] == "structured_tool_ingress_only"
+    assert safety["command_policy"] == "structured_action_ingress_only"
     assert safety["sandbox_policy"] == "required_for_code_or_services"
     assert safety["retry_policy"]["max_attempts"] == 3
     assert safety["retry_policy"]["max_continuation_depth"] == 2
 
     budget =
       AgentRuntime.context_budget(%{
-        "policy" => %{"max_total_tokens" => 64_000, "max_tool_calls" => 40},
+        "policy" => %{"max_total_tokens" => 64_000, "max_action_calls" => 40},
         "provider_profile" => provider,
         "run_token_budget" => 32_000,
         "estimated_input_tokens" => 96_000
       })
 
-    assert budget["schema_version"] == "holtworks_context_budget/v1"
+    assert budget["schema_version"] == "holt_context_budget/v1"
     assert budget["provider_context_window"] == 128_000
     assert budget["compression"]["strategy"] == "file_backed_task_memory_packet"
     assert budget["compression"]["summary_token_target"] == 1_200
-    assert budget["governor"]["schema_version"] == "holtworks_context_budget_governor/v1"
+    assert budget["governor"]["schema_version"] == "holt_context_budget_governor/v1"
     assert budget["governor"]["budget_state"] in ["soft_limit", "critical", "overflow"]
 
-    assert Tasks.provider_profile("local-planner", %{})["provider"] == "local"
-    assert Tasks.safety_policy(%{})["schema_version"] == "holtworks_safety_policy/v1"
-    assert Tasks.runtime_context_budget(%{})["schema_version"] == "holtworks_context_budget/v1"
+    assert Tasks.provider_profile("local-planner", %{"provider" => "local"})["provider"] ==
+             "local"
+
+    assert Tasks.safety_policy(%{})["schema_version"] == "holt_safety_policy/v1"
+    assert Tasks.runtime_context_budget(%{})["schema_version"] == "holt_context_budget/v1"
   end
 
   test "work graph orchestration derives schedule budget dispatch team and child contracts" do
@@ -1894,10 +2473,10 @@ defmodule HoltTest do
                  "title" => "Orchestrated graph task",
                  "estimate" => 8,
                  "assignees" => [
-                   %{"id" => "agent_one", "kind" => "agent", "work_role" => "worker"},
-                   %{"id" => "agent_two", "kind" => "agent", "work_role" => "worker"},
-                   %{"id" => "agent_three", "kind" => "agent", "work_role" => "worker"},
-                   %{"id" => "agent_verify", "kind" => "agent", "work_role" => "verifier"}
+                   %{"agent_id" => "agent_one", "kind" => "agent", "work_role" => "worker"},
+                   %{"agent_id" => "agent_two", "kind" => "agent", "work_role" => "worker"},
+                   %{"agent_id" => "agent_three", "kind" => "agent", "work_role" => "worker"},
+                   %{"agent_id" => "agent_verify", "kind" => "agent", "work_role" => "verifier"}
                  ]
                },
                workspace: workspace
@@ -1908,7 +2487,7 @@ defmodule HoltTest do
     assert {:ok, work_graph} =
              Tasks.work_graph(task["ref"], %{"graph_id" => graph["id"]}, workspace: workspace)
 
-    assert work_graph["schema_version"] == "holtworks_work_graph/v1"
+    assert work_graph["schema_version"] == "holt_work_graph/v1"
     assert work_graph["source"] == "task_graph"
     assert work_graph["task_graph_id"] == graph["id"]
     assert work_graph["completion_gate"]["status"] == "blocked"
@@ -1920,7 +2499,7 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert schedule["schema_version"] == "holtworks_work_graph_schedule/v1"
+    assert schedule["schema_version"] == "holt_work_graph_schedule/v1"
     assert schedule["status"] == "ready"
     assert [%{"node_key" => "plan", "schedule_status" => "ready"}] = schedule["ready_nodes"]
 
@@ -1932,11 +2511,11 @@ defmodule HoltTest do
     assert {:ok, budget} =
              Tasks.work_graph_budget(
                task["ref"],
-               %{"group_token_budget" => 80_000, "max_concurrent_agents" => 2},
+               %{"max_total_tokens" => 80_000, "max_concurrent_agents" => 2},
                workspace: workspace
              )
 
-    assert budget["schema_version"] == "holtworks_work_graph_budget/v1"
+    assert budget["schema_version"] == "holt_work_graph_budget/v1"
     assert budget["max_total_tokens"] == 80_000
     assert budget["max_concurrent_agents"] == 2
     assert budget["allocation"]["verification_reserve_tokens"] == 16_000
@@ -1948,7 +2527,7 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert dispatch["schema_version"] == "holtworks_agent_dispatch/v1"
+    assert dispatch["schema_version"] == "holt_agent_dispatch/v1"
     assert dispatch["selected_agent_ids"] == ["agent_one", "agent_two"]
     assert dispatch["selected_count"] == 2
     assert dispatch["suppressed_count"] == 2
@@ -1957,7 +2536,7 @@ defmodule HoltTest do
     assert Enum.map(dispatch["verifier_shards"], & &1["shard_id"]) == ~w(evidence policy outcome)
 
     assert {:ok, team} = Tasks.team_orchestration(task["ref"], %{}, workspace: workspace)
-    assert team["schema_version"] == "holtworks_team_orchestration/v1"
+    assert team["schema_version"] == "holt_team_orchestration/v1"
     assert team["mode"] == "planner_executor_verifier_team"
     assert team["max_concurrent_agents"] == 4
 
@@ -1965,23 +2544,24 @@ defmodule HoltTest do
              Tasks.child_agent_contract(
                task["ref"],
                %{
-                 "tool_name" => "start_agent_work",
+                 "action" => "start_agent_work",
                  "arguments" => %{
+                   "child_ref" => "agent_one",
                    "target_agent_id" => "agent_one",
                    "work_role" => "worker",
-                   "allowed_tools" => ["get_task"]
+                   "allowed_actions" => ["get_task"]
                  }
                },
                workspace: workspace
              )
 
-    assert child["schema_version"] == "holtworks_child_agent_contract/v1"
+    assert child["schema_version"] == "holt_child_agent_contract/v1"
     assert child["child"]["target_agent_id"] == "agent_one"
     assert child["authority_boundary"]["may_delegate_further"] == false
     assert child["verification_contract"]["verifier_required"] == true
   end
 
-  test "stdio orchestration aliases accept Inktrail-style task identifiers" do
+  test "stdio orchestration methods require canonical task refs" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
     opts = [workspace: workspace]
@@ -1990,7 +2570,7 @@ defmodule HoltTest do
              Tasks.create(
                %{
                  "title" => "Stdio orchestration task",
-                 "assignees" => [%{"id" => "agent_one", "kind" => "agent"}]
+                 "assignees" => [%{"agent_id" => "agent_one", "kind" => "agent"}]
                },
                workspace: workspace
              )
@@ -2001,48 +2581,48 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "work_graph",
-                 "params" => %{"task_id" => task["ref"]}
+                 "params" => %{"ref" => task["ref"]}
                },
                opts
              )
 
-    assert work_graph["schema_version"] == "holtworks_work_graph/v1"
+    assert work_graph["schema_version"] == "holt_work_graph/v1"
 
     assert %{"ok" => true, "result" => dispatch} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "agent_dispatch_plan",
-                 "params" => %{"task_id" => task["ref"], "max_agents_per_event" => 1}
+                 "params" => %{"ref" => task["ref"], "max_agents_per_event" => 1}
                },
                opts
              )
 
-    assert dispatch["schema_version"] == "holtworks_agent_dispatch/v1"
+    assert dispatch["schema_version"] == "holt_agent_dispatch/v1"
     assert dispatch["selected_agent_ids"] == ["agent_one"]
 
     assert %{"ok" => true, "result" => schedule} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "schedule_work_graph",
-                 "params" => %{"task_id" => task["ref"]}
+                 "params" => %{"ref" => task["ref"]}
                },
                opts
              )
 
-    assert schedule["schema_version"] == "holtworks_work_graph_schedule/v1"
+    assert schedule["schema_version"] == "holt_work_graph_schedule/v1"
   end
 
-  test "stdio runtime aliases expose Inktrail-style runtime contracts" do
+  test "stdio runtime methods require canonical runtime fields" do
     assert %{"ok" => true, "result" => provider} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "provider_profile",
-                 "params" => %{"model" => "gpt-5.2"}
+                 "params" => %{"model_id" => "gpt-5.2", "provider" => "openai"}
                },
                []
              )
 
-    assert provider["schema_version"] == "holtworks_provider_profile/v1"
+    assert provider["schema_version"] == "holt_provider_profile/v1"
     assert provider["provider"] == "openai"
 
     assert %{"ok" => true, "result" => safety} =
@@ -2054,19 +2634,19 @@ defmodule HoltTest do
                []
              )
 
-    assert safety["schema_version"] == "holtworks_safety_policy/v1"
+    assert safety["schema_version"] == "holt_safety_policy/v1"
 
-    assert %{"ok" => true, "result" => tools} =
+    assert %{"ok" => true, "result" => actions} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "tool_availability",
-                 "params" => %{"tool_names" => ["get_task"]}
+                 "method" => "action_availability",
+                 "params" => %{"action_names" => ["get_task"]}
                },
                []
              )
 
-    assert [%{"schema_version" => "holtworks_tool_availability/v1", "available" => true}] =
-             tools
+    assert [%{"schema_version" => "holt_action_availability/v1", "available" => true}] =
+             actions
 
     assert %{"ok" => true, "result" => budget} =
              Bridge.Stdio.handle_request(
@@ -2080,18 +2660,18 @@ defmodule HoltTest do
                []
              )
 
-    assert budget["schema_version"] == "holtworks_context_budget/v1"
+    assert budget["schema_version"] == "holt_context_budget/v1"
 
     assert %{"ok" => true, "result" => doctor} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "runtime_doctor",
-                 "params" => %{"tool_names" => ["get_task"]}
+                 "params" => %{"action_names" => ["get_task"]}
                },
                []
              )
 
-    assert doctor["schema_version"] == "holtworks_agent_runtime_doctor/v1"
+    assert doctor["schema_version"] == "holt_agent_runtime_doctor/v1"
     assert doctor["status"] == "ready"
 
     assert %{"ok" => true, "result" => recovery} =
@@ -2099,14 +2679,14 @@ defmodule HoltTest do
                %{
                  "method" => "recovery_contract",
                  "params" => %{
-                   "tool_name" => "update_task",
+                   "action" => "update_task",
                    "effect_scope" => "task_durable"
                  }
                },
                []
              )
 
-    assert recovery["schema_version"] == "holtworks_recovery_contract/v1"
+    assert recovery["schema_version"] == "holt_recovery_contract/v1"
     assert recovery["rollback_plan"]["strategy"] == "compensating_task_update"
 
     assert %{"ok" => true, "result" => debugger} =
@@ -2115,7 +2695,7 @@ defmodule HoltTest do
                []
              )
 
-    assert debugger["schema_version"] == "holtworks_run_debugger/v1"
+    assert debugger["schema_version"] == "holt_run_debugger/v1"
 
     assert %{"ok" => true, "result" => learning} =
              Bridge.Stdio.handle_request(
@@ -2123,13 +2703,13 @@ defmodule HoltTest do
                []
              )
 
-    assert learning["schema_version"] == "holtworks_meta_learning_snapshot/v1"
+    assert learning["schema_version"] == "holt_meta_learning_snapshot/v1"
 
     assert %{"ok" => true, "result" => %{"content" => sanitized}} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "format_local_model_result",
-                 "params" => %{"content" => ~s({"command":"run","error":"boom"})}
+                 "params" => %{"result" => ~s({"command":"run","error":"boom"})}
                },
                []
              )
@@ -2140,21 +2720,21 @@ defmodule HoltTest do
   test "agent runtime facade builds recovery debug sanitizer and meta-learning contracts" do
     recovery =
       AgentRuntime.recovery_contract(%{
-        "tool_name" => "update_task",
+        "action" => "update_task",
         "effect_scope" => "task_durable",
         "risk_level" => "medium",
         "target_refs" => %{"task_ref" => "HW-01"}
       })
 
-    assert recovery["schema_version"] == "holtworks_recovery_contract/v1"
+    assert recovery["schema_version"] == "holt_recovery_contract/v1"
     assert recovery["rollback_plan"]["strategy"] == "compensating_task_update"
     assert recovery["requires_recovery_observation"] == true
     assert recovery["requires_rollback_verification"] == true
 
     envelope = %{
       "envelope_id" => "env1",
-      "tool_name" => "update_task",
-      "tool_call_id" => "call1",
+      "action" => "update_task",
+      "action_call_id" => "call1",
       "runtime_status" => "completed_repair_required",
       "execution_decision" => "execute",
       "approval_request" => %{"status" => "pending"},
@@ -2171,14 +2751,14 @@ defmodule HoltTest do
         "run" => %{"id" => "run1", "agent_run_id" => "agent-run1"},
         "events" => [
           %{
-            "type" => "action.completed",
-            "at" => "2026-05-17T00:00:00Z",
+            "kind" => "action.completed",
+            "inserted_at" => "2026-05-17T00:00:00Z",
             "metadata" => %{"action_runtime_envelope" => envelope}
           }
         ]
       })
 
-    assert debugger["schema_version"] == "holtworks_run_debugger/v1"
+    assert debugger["schema_version"] == "holt_run_debugger/v1"
     assert debugger["event_count"] == 1
     assert debugger["action_envelope_count"] == 1
     assert debugger["approval_wait_count"] == 1
@@ -2213,19 +2793,19 @@ defmodule HoltTest do
         "decision" => %{"action" => "continue", "depth" => 2}
       })
 
-    assert loop["schema_version"] == "holtworks_agent_loop/v1"
+    assert loop["schema_version"] == "holt_agent_loop/v1"
     assert loop["status"] == "running"
     assert loop["continuation_depth"] == 1
 
     meta =
       AgentRuntime.meta_learning_snapshot(%{
         "outcome_calibrations" => [
-          %{"calibration_id" => "cal1", "tool_name" => "update_task", "matched" => false}
+          %{"calibration_id" => "cal1", "action" => "update_task", "matched" => false}
         ],
         "repair_effectiveness" => [
           %{
             "repair_id" => "rep1",
-            "source_tool_name" => "update_task",
+            "source_action" => "update_task",
             "effectiveness_status" => "pending_repair",
             "repair_required" => true
           }
@@ -2238,7 +2818,7 @@ defmodule HoltTest do
         ]
       })
 
-    assert meta["schema_version"] == "holtworks_meta_learning_snapshot/v1"
+    assert meta["schema_version"] == "holt_meta_learning_snapshot/v1"
     assert meta["metrics"]["prediction_mismatch_count"] == 1
     assert meta["metrics"]["repair_required_count"] == 1
 
@@ -2250,18 +2830,18 @@ defmodule HoltTest do
     assert length(meta["proposed_policy_updates"]) == 4
   end
 
-  test "task tool sessions scope direct tools and route action contracts" do
+  test "task action sessions scope direct actions and route action contracts" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
-    assert {:ok, task} = Tasks.create(%{"title" => "Tool session task"}, workspace: workspace)
+    assert {:ok, task} = Tasks.create(%{"title" => "Action session task"}, workspace: workspace)
 
     assert {:ok, session} =
-             Tasks.task_tool_session(
+             Tasks.action_session(
                task["ref"],
                %{
-                 "agent_id" => "agent_tools",
-                 "disabled_tools" => ["write_file"],
+                 "agent_id" => "agent_actions",
+                 "disabled_actions" => ["write"],
                  "connected_accounts" => %{
                    "github" => %{"connected_account_id" => "acct_github"}
                  }
@@ -2269,21 +2849,21 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert session["schema_version"] == "holtworks_task_tool_session/v1"
+    assert session["schema_version"] == "holt_action_session/v1"
     assert session["task_ref"] == task["ref"]
-    assert "get_task" in session["direct_tools"]
-    assert "read_file" in session["direct_tools"]
-    refute "write_file" in session["direct_tools"]
-    assert Enum.any?(session["meta_tools"], &(&1["name"] == "search_tools"))
-    assert Enum.any?(session["meta_tools"], &(&1["name"] == "manage_connection"))
-    assert Enum.any?(session["meta_tools"], &(&1["name"] == "use_workbench"))
+    assert "get_task" in session["direct_actions"]
+    assert "read" in session["direct_actions"]
+    refute "write" in session["direct_actions"]
+    assert Enum.any?(session["meta_actions"], &(&1["name"] == "search_actions"))
+    assert Enum.any?(session["meta_actions"], &(&1["name"] == "manage_connection"))
+    assert Enum.any?(session["meta_actions"], &(&1["name"] == "use_workbench"))
     assert session["connected_accounts"]["github"]["connected_account_id"] == "acct_github"
     assert session["workbench"]["enabled"] == true
 
     assert {:ok, read_route} =
-             Tasks.route_task_tool(
+             Tasks.route_action(
                task["ref"],
-               %{"tool_name" => "get_task", "task_tool_session" => session},
+               %{"action" => "get_task", "action_session" => session},
                workspace: workspace
              )
 
@@ -2293,63 +2873,57 @@ defmodule HoltTest do
     assert read_route["action_contract"]["effect_scope"] == "read_only"
 
     assert {:ok, disabled_route} =
-             Tasks.route_task_tool(
+             Tasks.route_action(
                task["ref"],
-               %{"tool_name" => "write_file", "task_tool_session" => session},
+               %{"action" => "write", "action_session" => session},
                workspace: workspace
              )
 
     assert disabled_route["status"] == "rejected"
-    assert disabled_route["reason"] == "tool_disabled_for_session"
+    assert disabled_route["reason"] == "action_disabled_for_session"
 
     assert {:ok, command_route} =
-             Tasks.route_task_tool(task["ref"], %{"tool_name" => "run_command"},
-               workspace: workspace
-             )
+             Tasks.route_action(task["ref"], %{"action" => "run"}, workspace: workspace)
 
     assert command_route["status"] == "accepted"
     assert command_route["requires_approval"] == true
     assert command_route["action_contract"]["effect_scope"] == "workspace_durable"
   end
 
-  test "task plan contracts gate tool actions before preflight" do
+  test "task plan contracts gate action actions before preflight" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
-    assert {:ok, task} = Tasks.create(%{"title" => "Plan gated tools"}, workspace: workspace)
+    assert {:ok, task} = Tasks.create(%{"title" => "Plan gated actions"}, workspace: workspace)
 
     assert {:ok, plan} = Tasks.plan_contract(task["ref"], %{}, workspace: workspace)
-    assert plan["schema_version"] == "holtworks_plan_contract/v1"
-    assert "get_task" in plan["allowed_tools"]
-    refute "run_command" in plan["allowed_tools"]
+    assert plan["schema_version"] == "holt_plan_contract/v1"
+    assert "get_task" in plan["allowed_actions"]
+    refute "run" in plan["allowed_actions"]
     refute "workspace_durable" in plan["allowed_effect_scopes"]
 
     assert {:ok, read_gate} =
-             Tasks.plan_gate(task["ref"], %{"tool_name" => "get_task"}, workspace: workspace)
+             Tasks.plan_gate(task["ref"], %{"action" => "get_task"}, workspace: workspace)
 
-    assert read_gate["schema_version"] == "holtworks_plan_gate/v1"
+    assert read_gate["schema_version"] == "holt_plan_gate/v1"
     assert read_gate["action"] == "approved"
     assert read_gate["reason"] == "active_plan_allows_action"
 
     assert {:ok, blocked_gate} =
-             Tasks.plan_gate(task["ref"], %{"tool_name" => "run_command"}, workspace: workspace)
+             Tasks.plan_gate(task["ref"], %{"action" => "run"}, workspace: workspace)
 
     assert blocked_gate["action"] == "rejected"
-    assert blocked_gate["reason"] == "tool_not_in_active_plan"
+    assert blocked_gate["reason"] == "action_not_in_active_plan"
 
     assert {:ok, read_preflight} =
-             Tasks.action_preflight(task["ref"], %{"tool_name" => "get_task"},
-               workspace: workspace
-             )
+             Tasks.action_preflight(task["ref"], %{"action" => "get_task"}, workspace: workspace)
 
-    assert read_preflight["schema_version"] == "holtworks_action_preflight/v1"
+    assert read_preflight["schema_version"] == "holt_action_preflight/v1"
     assert read_preflight["result"] == "passed"
     assert read_preflight["blocked_checks"] == []
 
     assert {:ok, blocked_preflight} =
-             Tasks.action_preflight(task["ref"], %{"tool_name" => "run_command"},
-               workspace: workspace
-             )
+             Tasks.action_preflight(task["ref"], %{"action" => "run"}, workspace: workspace)
 
     assert blocked_preflight["result"] == "blocked"
     assert "active_plan_allows_action" in blocked_preflight["blocked_checks"]
@@ -2361,12 +2935,12 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert "run_command" in approved_workspace_plan["allowed_tools"]
+    assert "run" in approved_workspace_plan["allowed_actions"]
 
     assert {:ok, approval_preflight} =
              Tasks.action_preflight(
                task["ref"],
-               %{"tool_name" => "run_command", "allow_workspace_durable" => true},
+               %{"action" => "run", "allow_workspace_durable" => true},
                workspace: workspace
              )
 
@@ -2379,34 +2953,32 @@ defmodule HoltTest do
     Workspace.init(workspace)
 
     assert {:ok, task} =
-             Tasks.create(%{"title" => "Runtime envelope for tool actions"},
+             Tasks.create(%{"title" => "Runtime envelope for action actions"},
                workspace: workspace
              )
 
     assert {:ok, gate} =
-             Tasks.consequence_gate(task["ref"], %{"tool_name" => "get_task"},
-               workspace: workspace
-             )
+             Tasks.consequence_gate(task["ref"], %{"action" => "get_task"}, workspace: workspace)
 
-    assert gate["schema_version"] == "holtworks_consequence_gate/v1"
+    assert gate["schema_version"] == "holt_consequence_gate/v1"
     assert gate["action"] == "approved"
-    assert gate["policy_decision"]["schema_version"] == "holtworks_policy_decision/v1"
-    assert gate["prediction"]["schema_version"] == "holtworks_consequence_prediction/v1"
-    assert gate["state_snapshot"]["schema_version"] == "holtworks_world_state_snapshot/v1"
+    assert gate["policy_decision"]["schema_version"] == "holt_policy_decision/v1"
+    assert gate["prediction"]["schema_version"] == "holt_consequence_prediction/v1"
+    assert gate["state_snapshot"]["schema_version"] == "holt_world_state_snapshot/v1"
 
     assert gate["state_transition_prediction"]["schema_version"] ==
-             "holtworks_state_transition_prediction/v1"
+             "holt_state_transition_prediction/v1"
 
     assert gate["state_invariant_check"]["status"] == "passed"
     assert gate["plan_gate"]["action_contract_id"] == gate["action_contract"]["contract_id"]
     assert gate["plan_gate"]["plan_id"] == gate["plan_contract"]["plan_id"]
 
     assert {:ok, envelope} =
-             Tasks.action_runtime_envelope(task["ref"], %{"tool_name" => "get_task"},
+             Tasks.action_runtime_envelope(task["ref"], %{"action" => "get_task"},
                workspace: workspace
              )
 
-    assert envelope["schema_version"] == "holtworks_action_runtime_envelope/v1"
+    assert envelope["schema_version"] == "holt_action_runtime_envelope/v1"
     assert envelope["execution_decision"] == "execute"
     assert envelope["runtime_status"] == "ready_to_execute"
     assert "observe" in envelope["required_lifecycle"]
@@ -2425,18 +2997,18 @@ defmodule HoltTest do
     assert completed["runtime_status"] == "completed_continue"
 
     assert completed["execution_observation"]["schema_version"] ==
-             "holtworks_execution_observation/v1"
+             "holt_execution_observation/v1"
 
-    assert completed["prediction_error"]["schema_version"] == "holtworks_prediction_error/v1"
+    assert completed["prediction_error"]["schema_version"] == "holt_prediction_error/v1"
     assert completed["prediction_error"]["matched"] == true
 
     assert completed["state_reconciliation"]["schema_version"] ==
-             "holtworks_state_reconciliation/v1"
+             "holt_state_reconciliation/v1"
 
     assert completed["state_reconciliation"]["matched"] == true
 
     assert completed["outcome_calibration"]["schema_version"] ==
-             "holtworks_outcome_calibration/v1"
+             "holt_outcome_calibration/v1"
 
     assert completed["outcome_calibration"]["matched"] == true
     assert completed["repair_orchestration"]["status"] == "not_required"
@@ -2463,11 +3035,11 @@ defmodule HoltTest do
     assert {:ok, request} =
              Tasks.action_approval_request(
                task["ref"],
-               %{"tool_name" => "run_command", "allow_workspace_durable" => true},
+               %{"action" => "run", "allow_workspace_durable" => true},
                workspace: workspace
              )
 
-    assert request["schema_version"] == "holtworks_human_approval_request/v1"
+    assert request["schema_version"] == "holt_human_approval_request/v1"
     assert request["status"] == "pending"
     assert request["effect_scope"] == "workspace_durable"
     assert request["reason"] == "action_preflight_requires_approval"
@@ -2484,22 +3056,22 @@ defmodule HoltTest do
              )
 
     assert resolved["status"] == "approved"
-    assert resolved["resolution"]["schema_version"] == "holtworks_human_approval_resolution/v1"
+    assert resolved["resolution"]["schema_version"] == "holt_human_approval_resolution/v1"
     assert resolved["resolution"]["can_resume"] == true
 
     assert {:ok, ledger} =
              Tasks.action_evidence_ledger(
                task["ref"],
                %{
-                 "tool_name" => "get_task",
+                 "action" => "get_task",
                  "result_status" => "ok",
                  "result_preview" => "task read",
-                 "artifact_ref" => "artifact://tool/get_task"
+                 "artifact_ref" => "artifact://action/get_task"
                },
                workspace: workspace
              )
 
-    assert ledger["schema_version"] == "holtworks_evidence_ledger/v1"
+    assert ledger["schema_version"] == "holt_evidence_ledger/v1"
     assert ledger["task_ref"] == task["ref"]
     assert ledger["coverage"]["has_prediction"] == true
     assert ledger["coverage"]["has_observation"] == true
@@ -2545,7 +3117,7 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert artifact["schema_version"] == "holtworks_task_memory_artifact/v1"
+    assert artifact["schema_version"] == "holt_task_memory_artifact/v1"
     assert artifact["chunk_count"] >= 1
 
     assert {:ok, read_artifact} =
@@ -2560,7 +3132,7 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert packet["schema_version"] == "holtworks_task_memory_context_packet/v1"
+    assert packet["schema_version"] == "holt_task_memory_context_packet/v1"
     assert packet["memory_state"]["runtime_spec_count"] == 1
     assert packet["memory_state"]["artifact_count"] == 1
     assert packet["context_budget"]["budget_state"] == "soft_limit"
@@ -2577,7 +3149,7 @@ defmodule HoltTest do
     assert {:ok, continuation_packet} =
              Tasks.continuation_packet(task["ref"], %{}, opts)
 
-    assert continuation_packet["schema_version"] == "holtworks_continuation_packet/v1"
+    assert continuation_packet["schema_version"] == "holt_continuation_packet/v1"
     assert continuation_packet["previous_runtime_run_id"] == first_run[:run]["id"]
     assert continuation_packet["context_packet_id"]
     assert continuation_packet["required_loop"]["load_task_memory_context"] == true
@@ -2588,7 +3160,7 @@ defmodule HoltTest do
     assert continued[:agent_work]["kind"] == "continuation"
 
     assert continued[:agent_work]["continuation_packet"]["schema_version"] ==
-             "holtworks_continuation_packet/v1"
+             "holt_continuation_packet/v1"
 
     assert continued[:agent_work]["context_packet_id"]
   end
@@ -2603,7 +3175,7 @@ defmodule HoltTest do
                  "title" => "Capability routed work",
                  "assignees" => [
                    %{
-                     "id" => "agent-a",
+                     "agent_id" => "agent-a",
                      "display_name" => "Agent A",
                      "work_role" => "worker"
                    }
@@ -2613,38 +3185,36 @@ defmodule HoltTest do
              )
 
     assert {:ok, entry} = Tasks.capability_registry("get_task", %{})
-    assert entry["schema_version"] == "holtworks_capability_registry_entry/v1"
-    assert entry["tool_name"] == "get_task"
+    assert entry["schema_version"] == "holt_capability_registry_entry/v1"
+    assert entry["action"] == "get_task"
     assert entry["effect_scope"] == "read_only"
     assert entry["registered"] == true
 
     assert {:ok, contract} =
-             Tasks.capability_contract(task["ref"], %{"tool_name" => "get_task"},
+             Tasks.capability_contract(task["ref"], %{"action" => "get_task"},
                workspace: workspace
              )
 
-    assert contract["schema_version"] == "holtworks_capability_contract/v1"
-    assert contract["required_tools"] == ["get_task"]
-    assert "tool:get_task" in contract["required_capabilities"]
+    assert contract["schema_version"] == "holt_capability_contract/v1"
+    assert contract["required_actions"] == ["get_task"]
+    assert "action:get_task" in contract["required_capabilities"]
     assert "effect_scope:read_only" in contract["required_capabilities"]
 
     assert {:ok, route} =
-             Tasks.capability_route(task["ref"], %{"tool_name" => "get_task"},
-               workspace: workspace
-             )
+             Tasks.capability_route(task["ref"], %{"action" => "get_task"}, workspace: workspace)
 
-    assert route["schema_version"] == "holtworks_capability_route/v1"
+    assert route["schema_version"] == "holt_capability_route/v1"
     assert route["status"] == "routed"
     assert route["execution_mode"] == "persisted_agent"
     assert route["target_agent_id"] == "agent-a"
 
     assert {:ok, plan} = Tasks.generic_plan(task["ref"], %{}, workspace: workspace)
-    assert plan["schema_version"] == "holtworks_generic_work_graph/v1"
+    assert plan["schema_version"] == "holt_generic_work_graph/v1"
     assert plan["node_types"] == ~w(research propose act verify repair)
     assert Enum.map(plan["nodes"], & &1["phase"]) == ~w(research propose act verify repair)
     assert graph_node(plan, "research")["status"] == "scheduled"
-    assert "get_task" in graph_node(plan, "research")["allowed_tools"]
-    assert "route_verification_review" in graph_node(plan, "verify")["allowed_tools"]
+    assert "get_task" in graph_node(plan, "research")["allowed_actions"]
+    assert "route_verification_review" in graph_node(plan, "verify")["allowed_actions"]
   end
 
   test "task continuation resumes from latest task run and appends agent work" do
@@ -2699,26 +3269,32 @@ defmodule HoltTest do
     assert {:ok, alpha} =
              Tasks.create_agent(
                %{
-                 "id" => "agent_alpha",
+                 "agent_id" => "agent_alpha",
                  "display_name" => "Alpha Builder",
                  "agent_handle" => "alpha",
                  "work_roles" => ["worker", "verifier"],
                  "skills" => [
-                   %{"name" => "Planning", "tool_names" => ["plan_contract"]},
+                   %{"name" => "Planning", "action_names" => ["plan_contract"]},
                    "Implementation"
                  ],
+                 "instructions" => "Build and verify local tasks.",
                  "model" => "local-planner"
                },
                workspace: workspace
              )
 
-    assert alpha["schema_version"] == "holtworks_agent_profile/v1"
+    assert alpha["schema_version"] == "holt_agent_profile/v1"
     assert alpha["agent_handle"] == "@alpha"
     assert Enum.map(alpha["skills"], & &1["id"]) == ["planning", "implementation"]
 
     assert {:ok, beta} =
              Tasks.create_agent(
-               %{"id" => "agent_beta", "display_name" => "Beta Reviewer"},
+               %{
+                 "agent_id" => "agent_beta",
+                 "display_name" => "Beta Reviewer",
+                 "instructions" => "Review local task work.",
+                 "skills" => ["Review"]
+               },
                workspace: workspace
              )
 
@@ -2728,7 +3304,7 @@ defmodule HoltTest do
     assert suspended_beta["status"] == "suspended"
 
     assert {:ok, card} = Tasks.agent_card("agent_alpha", workspace: workspace)
-    assert card["schema_version"] == "holtworks_agent_card/v1"
+    assert card["schema_version"] == "holt_agent_card/v1"
     assert card["skills"] |> Enum.map(& &1["name"]) == ["Planning", "Implementation"]
 
     assert {:ok, skills} = Tasks.agent_skills("agent_alpha", workspace: workspace)
@@ -2746,7 +3322,7 @@ defmodule HoltTest do
     assert {:ok, fetched} = Tasks.get(task["ref"], workspace: workspace)
     assert [enriched_alpha, enriched_beta] = fetched["assignees"]
     assert enriched_alpha["display_name"] == "Alpha Builder"
-    assert enriched_alpha["agent_card"]["schema_version"] == "holtworks_agent_card/v1"
+    assert enriched_alpha["agent_card"]["schema_version"] == "holt_agent_card/v1"
     assert enriched_beta["status"] == "suspended"
 
     assert {:ok, result} =
@@ -2772,8 +3348,9 @@ defmodule HoltTest do
                %{
                  "method" => "create_agent",
                  "params" => %{
-                   "id" => "agent_gamma",
+                   "agent_id" => "agent_gamma",
                    "display_name" => "Gamma Specialist",
+                   "instructions" => "Research local task work.",
                    "skills" => ["Research"]
                  }
                },
@@ -2798,7 +3375,164 @@ defmodule HoltTest do
     assert "Gamma Specialist" in agent_names
   end
 
-  test "agent profile tools are exposed through the action catalog" do
+  test "mob colleague flow creates live observation comments and starts the observer" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    assert {:ok, task} =
+             Tasks.create(
+               %{
+                 "title" => "Build compact task dashboard",
+                 "description" => "Implement the dashboard without drifting into marketing UI."
+               },
+               workspace: workspace
+             )
+
+    test_pid = self()
+
+    model_chat = fn _provider, messages, opts ->
+      prompt = Enum.map_join(messages, "\n", & &1["content"])
+      send(test_pid, {:mob_model_request, opts[:agent_id], prompt})
+
+      {:ok,
+       %{
+         "provider" => "local",
+         "model" => "local-observer",
+         "content" => "Observed and left course-correction notes."
+       }}
+    end
+
+    assert {:ok, execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "schedule_mob_colleague_flow",
+               mob_colleague_attrs(),
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat
+             )
+
+    assert execution["status"] == "ok"
+    result = execution["result"]
+    assert result["schema_version"] == "holt_mob_colleague_flow_schedule/v1"
+    assert result["colleague_agent"]["id"] == "agent_mob_ui"
+    assert result["observation_task"]["origin"] == "mob_colleague_observation"
+    assert result["observation_start"]["kind"] == "observation"
+
+    assert_receive {:mob_model_request, "agent_mob_ui", observation_prompt}
+    assert observation_prompt =~ "Work as a live mob colleague"
+    assert observation_prompt =~ "Parent task: #{task["ref"]}"
+    assert observation_prompt =~ "docs/ui-review.md"
+
+    assert {:ok, updated_task} = Tasks.get(task["ref"], workspace: workspace)
+    assert [flow] = updated_task["mob_colleague_flows"]
+    assert flow["status"] == "observing"
+    assert flow["observation_agent_work_id"] not in [nil, ""]
+
+    assert Enum.any?(updated_task["comments"], fn comment ->
+             comment["author"] == "agent:agent_mob_ui" and
+               comment["body"] =~ "Keep the dashboard dense" and
+               get_in(comment, ["metadata", "kind"]) == "mob_colleague_feedback"
+           end)
+
+    assert Enum.any?(Tasks.action_definitions(workspace: workspace), fn action ->
+             action["name"] == "schedule_mob_colleague_flow" and
+               action["effect_scope"] == "agent_orchestration"
+           end)
+  end
+
+  test "mob colleague reviews completed groundwork and its comments feed worker context" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    assert {:ok, task} =
+             Tasks.create(
+               %{
+                 "title" => "Refine task runner",
+                 "description" => "Make the task runner adapt to live specialist feedback."
+               },
+               workspace: workspace
+             )
+
+    test_pid = self()
+
+    model_chat = fn _provider, messages, opts ->
+      prompt = Enum.map_join(messages, "\n", & &1["content"])
+      send(test_pid, {:mob_model_request, opts[:agent_id], prompt})
+
+      {:ok,
+       %{
+         "provider" => "local",
+         "model" => "local-worker",
+         "content" => "Completed this pass."
+       }}
+    end
+
+    assert {:ok, _scheduled} =
+             Tasks.schedule_mob_colleague_flow(task["ref"], mob_colleague_attrs(),
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat
+             )
+
+    assert_receive {:mob_model_request, "agent_mob_ui", _observation_prompt}
+
+    assert {:ok, result} =
+             Tasks.start_agent_work(
+               task["ref"],
+               %{"agent_ids" => ["agent_worker"], "message" => "Implement the groundwork."},
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat
+             )
+
+    assert [%{"kind" => "review", "task_ref" => review_ref}] =
+             result[:mob_colleague_review_starts]
+
+    requests =
+      for _ <- 1..2 do
+        receive do
+          {:mob_model_request, agent_id, prompt} -> {agent_id, prompt}
+        after
+          1_000 -> flunk("missing mob colleague model request")
+        end
+      end
+
+    assert Enum.any?(requests, fn {agent_id, prompt} ->
+             agent_id == "agent_worker" and
+               prompt =~ "Recent task comments:" and
+               prompt =~ "Keep the dashboard dense"
+           end)
+
+    assert Enum.any?(requests, fn {agent_id, prompt} ->
+             agent_id == "agent_mob_ui" and
+               prompt =~ "Review the completed groundwork" and prompt =~ task["ref"]
+           end)
+
+    tasks = Tasks.list(workspace: workspace)
+    review_task = Enum.find(tasks, &(&1["ref"] == review_ref))
+    assert review_task["origin"] == "mob_colleague_review"
+    assert [review_assignee] = review_task["assignees"]
+    assert review_assignee["id"] == "agent_mob_ui"
+
+    assert {:ok, updated_task} = Tasks.get(task["ref"], workspace: workspace)
+    assert [flow] = updated_task["mob_colleague_flows"]
+    assert flow["status"] == "review_started"
+    assert flow["review_task_ref"] == review_ref
+    assert flow["review_agent_work_id"] not in [nil, ""]
+
+    assert Enum.any?(updated_task["comments"], fn comment ->
+             get_in(comment, ["metadata", "kind"]) == "mob_colleague_review_started" and
+               comment["body"] =~ review_ref
+           end)
+  end
+
+  test "agent profile actions are exposed through the action catalog" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
     action_opts = [workspace: workspace, approval: :always_approve]
@@ -2807,12 +3541,13 @@ defmodule HoltTest do
              Tasks.execute_action(
                "create_agent",
                %{
-                 "id" => "agent_delta",
+                 "agent_id" => "agent_delta",
                  "display_name" => "Delta Planner",
                  "agent_handle" => "delta",
                  "agent_ref" => "DELTA-1",
                  "work_roles" => ["planner", "verifier"],
-                 "skills" => [%{"name" => "Planning", "tool_names" => ["plan_contract"]}],
+                 "skills" => [%{"name" => "Planning", "action_names" => ["plan_contract"]}],
+                 "instructions" => "Plan local task work.",
                  "model" => "local-planner"
                },
                action_opts
@@ -2828,13 +3563,15 @@ defmodule HoltTest do
     assert Enum.any?(list_execution["result"]["agents"], &(&1["id"] == "agent_delta"))
 
     assert {:ok, card_execution} =
-             Tasks.execute_action("get_agent_card", %{"handle" => "delta"}, workspace: workspace)
+             Tasks.execute_action("get_agent_card", %{"agent_id" => "agent_delta"},
+               workspace: workspace
+             )
 
     assert card_execution["result"]["id"] == "agent_delta"
     assert card_execution["result"]["work_roles"] == ["planner", "verifier"]
 
     assert {:ok, skill_execution} =
-             Tasks.execute_action("list_agent_skills", %{"agent_ref" => "DELTA-1"},
+             Tasks.execute_action("list_agent_skills", %{"agent_id" => "agent_delta"},
                workspace: workspace
              )
 
@@ -2892,15 +3629,15 @@ defmodule HoltTest do
                  "target_skill" => "planning",
                  "work_role" => "planner",
                  "validation_contract" => "Return a bounded handoff.",
-                 "allowed_tools" => ["read_file", "search_files"]
+                 "allowed_actions" => ["read", "search"]
                },
                action_opts
              )
 
-    assert invoke_execution["result"]["schema_version"] == "holtworks_agent_invocation/v1"
+    assert invoke_execution["result"]["schema_version"] == "holt_agent_invocation/v1"
     assert invoke_execution["result"]["agent_id"] == "agent_delta"
 
-    assert get_in(invoke_execution, ["result", "child_agent_contract", "tool_name"]) ==
+    assert get_in(invoke_execution, ["result", "child_agent_contract", "action"]) ==
              "invoke_agent"
 
     catalog =
@@ -2909,11 +3646,31 @@ defmodule HoltTest do
     names = Enum.map(catalog, & &1["name"])
     assert "list_agents" in names
     assert "create_agent" in names
-    assert "invoke_agent" in names
+
+    create_entry = Enum.find(catalog, &(&1["name"] == "create_agent"))
+
+    assert create_entry["input_schema"]["required"] == [
+             "agent_id",
+             "display_name",
+             "instructions",
+             "skills"
+           ]
+
+    refute Map.has_key?(create_entry["input_schema"]["properties"], "id")
+    refute Map.has_key?(create_entry["input_schema"]["properties"], "handle")
+    refute Map.has_key?(create_entry["input_schema"]["properties"], "skill")
 
     delete_entry = Enum.find(catalog, &(&1["name"] == "delete_agent"))
     assert delete_entry["requires_approval"] == true
     assert delete_entry["input_schema"]["required"] == ["agent_id", "confirm"]
+
+    orchestration_catalog =
+      Tasks.action_catalog(%{"action_provider_ids" => ["agent_orchestration"]},
+        workspace: workspace
+      )
+
+    orchestration_names = Enum.map(orchestration_catalog, & &1["name"])
+    assert "invoke_agent" in orchestration_names
 
     assert %{"ok" => true, "result" => stdio_invoke} =
              Bridge.Stdio.handle_request(
@@ -2946,14 +3703,14 @@ defmodule HoltTest do
     refute Enum.any?(after_delete_execution["result"]["agents"], &(&1["id"] == "agent_delta"))
   end
 
-  test "core UI tools manage structured questions delegation pages and documents" do
+  test "core UI actions manage structured questions delegation pages and documents" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
     action_opts = [workspace: workspace, approval: :always_approve]
 
     assert {:ok, question_execution} =
              Tasks.execute_action(
-               "ask_user_question",
+               "ask",
                %{
                  "question" => "Which path should continue?",
                  "description" => "Pick one.",
@@ -2962,7 +3719,7 @@ defmodule HoltTest do
                action_opts
              )
 
-    assert question_execution["result"]["schema_version"] == "holtworks_user_question/v1"
+    assert question_execution["result"]["schema_version"] == "holt_user_question/v1"
     assert question_execution["result"]["status"] == "await_user"
     assert question_execution["result"]["options"] == [%{"label" => "Plan", "value" => "plan"}]
 
@@ -2976,16 +3733,16 @@ defmodule HoltTest do
                  "instructions" => "Find the relevant facts.",
                  "target_skill" => "research.web",
                  "validation_contract" => "Return sources and unresolved risks.",
-                 "allowed_tools" => ["search_web"]
+                 "allowed_actions" => ["search_web"]
                },
                action_opts
              )
 
     delegation = delegation_execution["result"]
-    assert delegation["schema_version"] == "holtworks_agent_delegation/v1"
+    assert delegation["schema_version"] == "holt_agent_delegation/v1"
     assert delegation["status"] == "ready"
     assert delegation["role"] == "researcher"
-    assert get_in(delegation, ["child_agent_contract", "tool_name"]) == "delegate_to_agent"
+    assert get_in(delegation, ["child_agent_contract", "action"]) == "delegate_to_agent"
     assert get_in(delegation, ["child_agent_contract", "child", "work_role"]) == "researcher"
 
     assert {:ok, create_execution} =
@@ -3000,7 +3757,7 @@ defmodule HoltTest do
              )
 
     page = create_execution["result"]["page"]
-    assert page["schema_version"] == "holtworks_page/v1"
+    assert page["schema_version"] == "holt_page/v1"
     assert page["title"] == "Spec Draft"
 
     assert {:ok, title_execution} =
@@ -3047,21 +3804,281 @@ defmodule HoltTest do
       Tasks.action_catalog(%{"action_provider_ids" => ["workspace"]}, workspace: workspace)
 
     names = Enum.map(catalog, & &1["name"])
-    assert "ask_user_question" in names
-    assert "delegate_to_agent" in names
+    assert "ask" in names
     assert "create_page" in names
     assert "write_to_document" in names
+
+    orchestration_catalog =
+      Tasks.action_catalog(%{"action_provider_ids" => ["agent_orchestration"]},
+        workspace: workspace
+      )
+
+    orchestration_names = Enum.map(orchestration_catalog, & &1["name"])
+    assert "delegate_to_agent" in orchestration_names
 
     create_entry = Enum.find(catalog, &(&1["name"] == "create_page"))
     assert create_entry["requires_approval"] == true
     assert create_entry["input_schema"]["required"] == ["page_type", "title"]
 
+    title_entry = Enum.find(catalog, &(&1["name"] == "set_page_title"))
+    assert title_entry["requires_approval"] == true
+    assert title_entry["input_schema"]["required"] == ["page_id", "title"]
+
     write_entry = Enum.find(catalog, &(&1["name"] == "write_to_document"))
     assert write_entry["requires_approval"] == true
-    assert write_entry["input_schema"]["required"] == ["action", "content"]
+    assert write_entry["input_schema"]["required"] == ["page_id", "action", "content"]
   end
 
-  test "repair run tools manage a structured repair workflow" do
+  test "task-scoped agent delegation starts real task agent work" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    assert {:ok, _agent} =
+             Tasks.create_agent(
+               %{
+                 "agent_id" => "agent_delta",
+                 "display_name" => "Delta",
+                 "work_roles" => ["planner"],
+                 "skills" => ["planning"],
+                 "instructions" => "Plan in bounded handoffs."
+               },
+               workspace: workspace
+             )
+
+    assert {:ok, _current_agent} =
+             Tasks.create_agent(
+               %{
+                 "agent_id" => "agent_current",
+                 "display_name" => "Current",
+                 "work_roles" => ["researcher"],
+                 "skills" => ["research"],
+                 "instructions" => "Research in bounded handoffs."
+               },
+               workspace: workspace
+             )
+
+    assert {:ok, task} =
+             Tasks.create(
+               %{
+                 "title" => "Coordinate child agents",
+                 "description" => "Use child agents through the task system."
+               },
+               workspace: workspace
+             )
+
+    action_opts = [home: home, workspace: workspace, approval: :always_approve]
+
+    assert {:ok, delegation_execution} =
+             Tasks.execute_action(
+               "delegate_to_agent",
+               %{
+                 "ref" => task["ref"],
+                 "role" => "researcher",
+                 "work_role" => "researcher",
+                 "system_prompt" => "Research with structured evidence only.",
+                 "instructions" => "Find the relevant facts.",
+                 "target_skill" => "research",
+                 "validation_contract" => "Return sources and unresolved risks.",
+                 "allowed_actions" => ["read", "search"]
+               },
+               Keyword.put(action_opts, :agent_id, "agent_current")
+             )
+
+    delegation = delegation_execution["result"]
+    assert delegation["schema_version"] == "holt_task_agent_delegation/v1"
+    assert delegation["status"] == "completed"
+    assert delegation["agent_work"]["source"] == "delegate_to_agent"
+    assert delegation["agent_work"]["delegation_id"] == delegation["delegation_id"]
+    assert delegation["agent_work"]["work_role"] == "researcher"
+    assert delegation["agent_run"]["status"] == "completed"
+    assert delegation["created_task"]["parent_id"] == task["id"]
+
+    assert [%{"id" => "agent_current", "kind" => "agent", "work_role" => "researcher"}] =
+             delegation["created_task"]["assignees"]
+
+    assert get_in(delegation, ["child_agent_contract", "action"]) == "delegate_to_agent"
+
+    assert get_in(delegation_execution, [
+             "action_contract",
+             "effect_scope"
+           ]) == "agent_orchestration"
+
+    assert {:ok, invoke_execution} =
+             Tasks.execute_action(
+               "invoke_agent",
+               %{
+                 "ref" => task["ref"],
+                 "agent_id" => "agent_delta",
+                 "instructions" => "Plan the next implementation slice.",
+                 "target_skill" => "planning",
+                 "work_role" => "planner",
+                 "validation_contract" => "Return a bounded handoff.",
+                 "allowed_actions" => ["read", "search"]
+               },
+               action_opts
+             )
+
+    invocation = invoke_execution["result"]
+    assert invocation["schema_version"] == "holt_task_agent_invocation/v1"
+    assert invocation["status"] == "completed"
+    assert invocation["agent_id"] == "agent_delta"
+    assert invocation["agent_work"]["source"] == "invoke_agent"
+    assert invocation["agent_work"]["agent_id"] == "agent_delta"
+    assert invocation["agent_run"]["status"] == "completed"
+    assert invocation["created_task"]["parent_id"] == task["id"]
+
+    assert [%{"id" => "agent_delta", "kind" => "agent", "work_role" => "planner"}] =
+             invocation["created_task"]["assignees"]
+
+    assert get_in(invocation, ["child_agent_contract", "action"]) == "invoke_agent"
+
+    [parent | child_tasks] = Tasks.list(workspace: workspace)
+    assert parent["id"] == task["id"]
+
+    assert Enum.map(child_tasks, & &1["parent_id"]) == [task["id"], task["id"]]
+
+    assert Enum.map(child_tasks, &List.first(&1["assignees"])["id"]) == [
+             "agent_current",
+             "agent_delta"
+           ]
+
+    assert Enum.map(child_tasks, &List.first(&1["agent_work"])["source"]) == [
+             "delegate_to_agent",
+             "invoke_agent"
+           ]
+  end
+
+  test "delegated task completion streams notification to current task agent UI" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    assert {:ok, _parent_agent} =
+             Tasks.create_agent(
+               %{
+                 "agent_id" => "agent_parent",
+                 "display_name" => "Parent",
+                 "work_roles" => ["coordinator"],
+                 "skills" => ["coordination"],
+                 "instructions" => "Coordinate delegated task-agent work."
+               },
+               workspace: workspace
+             )
+
+    assert {:ok, _child_agent} =
+             Tasks.create_agent(
+               %{
+                 "agent_id" => "agent_child",
+                 "display_name" => "Child",
+                 "work_roles" => ["reviewer"],
+                 "skills" => ["review"],
+                 "instructions" => "Review delegated work and finish."
+               },
+               workspace: workspace
+             )
+
+    assert {:ok, task} =
+             Tasks.create(
+               %{
+                 "title" => "Delegate UI notification test",
+                 "description" => "The current agent should see child completion."
+               },
+               workspace: workspace
+             )
+
+    test_pid = self()
+
+    model_chat = fn _provider, messages, opts ->
+      has_action_result? = Enum.any?(messages, &(Map.get(&1, "role") == "action"))
+      prompt = Enum.map_join(messages, "\n", &to_string(&1["content"]))
+      send(test_pid, {:delegation_model_request, opts[:agent_id], has_action_result?, prompt})
+
+      cond do
+        opts[:agent_id] == "agent_child" ->
+          {:ok,
+           %{
+             "provider" => "local",
+             "model" => "local-child",
+             "content" => "Child task complete."
+           }}
+
+        has_action_result? ->
+          {:ok,
+           %{
+             "provider" => "local",
+             "model" => "local-parent",
+             "content" => "Parent received delegated child completion."
+           }}
+
+        true ->
+          {:ok,
+           %{
+             "provider" => "local",
+             "model" => "local-parent",
+             "content" => "",
+             "tool_calls" => [
+               %{
+                 "id" => "call_delegate_child",
+                 "type" => "function",
+                 "function" => %{
+                   "name" => "delegate_to_agent",
+                   "arguments" =>
+                     Jason.encode!(%{
+                       "ref" => task["ref"],
+                       "role" => "reviewer",
+                       "work_role" => "reviewer",
+                       "target_agent_id" => "agent_child",
+                       "system_prompt" => "Review through the task system only.",
+                       "instructions" => "Review the implementation and finish.",
+                       "target_skill" => "review",
+                       "validation_contract" => "Return a completion statement.",
+                       "allowed_actions" => ["get_task"]
+                     })
+                 }
+               }
+             ]
+           }}
+      end
+    end
+
+    assert {:ok, result} =
+             Tasks.start_agent_work(
+               task["ref"],
+               %{"agent_ids" => ["agent_parent"], "message" => "Delegate the review."},
+               home: home,
+               workspace: workspace,
+               approval: :always_approve,
+               model_chat: model_chat,
+               runtime_event_callback: fn event -> send(test_pid, {:runtime_event, event}) end
+             )
+
+    assert result[:output] =~ "Parent received delegated child completion"
+    parent_agent_run_id = result[:agent_work]["agent_run_id"]
+
+    assert_receive {:runtime_event,
+                    %{
+                      "type" => "child_agent.completed",
+                      "agent_run_id" => ^parent_agent_run_id,
+                      "child_agent_id" => "agent_child",
+                      "child_agent_work_id" => child_work_id,
+                      "child_run_id" => child_run_id,
+                      "status" => "completed"
+                    }},
+                   5_000
+
+    assert child_work_id not in [nil, ""]
+    assert child_run_id not in [nil, ""]
+
+    assert_receive {:delegation_model_request, "agent_parent", true, parent_followup_prompt}
+    assert parent_followup_prompt =~ "holt_task_agent_delegation/v1"
+    assert parent_followup_prompt =~ "completed"
+
+    assert {:ok, events} = Tasks.agent_run_event_log(parent_agent_run_id, workspace: workspace)
+    assert Enum.any?(events, &(&1["kind"] == "child_agent.completed"))
+  end
+
+  test "repair run actions manage a structured repair workflow" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
     action_opts = [workspace: workspace, approval: :always_approve]
@@ -3082,7 +4099,7 @@ defmodule HoltTest do
              )
 
     run = start_execution["result"]["repair_run"]
-    assert run["schema_version"] == "holtworks_repair_run/v1"
+    assert run["schema_version"] == "holt_repair_run/v1"
     assert run["approval_status"] == "required"
 
     repair_run_id = run["id"]
@@ -3181,7 +4198,7 @@ defmodule HoltTest do
              )
 
     assert blast_execution["result"]["blast_radius_draft"]["schema_version"] ==
-             "holtworks_repair_blast_radius/v1"
+             "holt_repair_blast_radius/v1"
 
     assert {:ok, approve_execution} =
              Tasks.execute_action(
@@ -3303,20 +4320,24 @@ defmodule HoltTest do
                %{
                  "title" => "Dispatch assigned agents",
                  "assignees" => [
-                   %{"id" => "person_1", "kind" => "person", "display_name" => "Human Owner"},
                    %{
-                     "id" => "agent_alpha",
+                     "agent_id" => "person_1",
+                     "kind" => "person",
+                     "display_name" => "Human Owner"
+                   },
+                   %{
+                     "agent_id" => "agent_alpha",
                      "kind" => "agent",
                      "display_name" => "Alpha",
                      "agent_handle" => "@alpha"
                    },
                    %{
-                     "id" => "agent_beta",
+                     "agent_id" => "agent_beta",
                      "kind" => "agent",
                      "display_name" => "Beta",
                      "agent_ref" => "B-02"
                    },
-                   %{"id" => "agent_gamma", "kind" => "agent", "display_name" => "Gamma"}
+                   %{"agent_id" => "agent_gamma", "kind" => "agent", "display_name" => "Gamma"}
                  ]
                },
                workspace: workspace
@@ -3351,7 +4372,7 @@ defmodule HoltTest do
     assert Enum.all?(agent_runs, &(&1["dispatch_plan"]["selected_count"] == 2))
   end
 
-  test "stdio start_agent_work supports Inktrail-style task batch requests" do
+  test "stdio start_agent_work requires a canonical task ref" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -3361,37 +4382,27 @@ defmodule HoltTest do
              Tasks.create(
                %{
                  "title" => "Batch first",
-                 "assignees" => [%{"id" => "agent_one", "kind" => "agent"}]
+                 "assignees" => [%{"agent_id" => "agent_one", "kind" => "agent"}]
                },
                workspace: workspace
              )
 
-    assert {:ok, second} =
-             Tasks.create(
-               %{
-                 "title" => "Batch second",
-                 "assignees" => [%{"id" => "agent_two", "kind" => "agent"}]
-               },
-               workspace: workspace
-             )
-
-    assert %{"ok" => true, "result" => batch_result} =
+    assert %{"ok" => true, "result" => result} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "start_agent_work",
                  "params" => %{
-                   "task_ids" => [first["ref"], second["ref"]],
-                   "message" => "Run the batch."
+                   "ref" => first["ref"],
+                   "message" => "Run this task."
                  }
                },
                opts
              )
 
-    assert batch_result[:started_count] == 2
-    assert Enum.map(batch_result[:results], & &1[:task]["ref"]) == [first["ref"], second["ref"]]
+    assert result[:task]["ref"] == first["ref"]
 
     assert Tasks.agent_runs(workspace: workspace)
-           |> Enum.map(& &1["task_ref"]) == [first["ref"], second["ref"]]
+           |> Enum.map(& &1["task_ref"]) == [first["ref"]]
   end
 
   test "automatic continuation follows structured depth policy and records suppression" do
@@ -3410,6 +4421,7 @@ defmodule HoltTest do
                %{
                  "message" => "Run with automatic continuation.",
                  "auto_continue" => true,
+                 "continuation_allowed" => true,
                  "max_continuation_depth" => 2
                },
                home: home,
@@ -3460,6 +4472,7 @@ defmodule HoltTest do
                %{
                  "message" => "Approval should block this run.",
                  "auto_continue" => true,
+                 "continuation_allowed" => true,
                  "max_continuation_depth" => 2
                },
                home: home,
@@ -3488,7 +4501,7 @@ defmodule HoltTest do
              Tasks.create(
                %{
                  "title" => "Watchdog recovery task",
-                 "assignees" => [%{"id" => "agent_watch", "kind" => "agent"}]
+                 "assignees" => [%{"agent_id" => "agent_watch", "kind" => "agent"}]
                },
                workspace: workspace
              )
@@ -3525,7 +4538,7 @@ defmodule HoltTest do
     assert old_work["status"] == "recovery_queued"
 
     assert old_work["watchdog_recovery_packet"]["schema_version"] ==
-             "holtworks_agent_run_watchdog_recovery/v1"
+             "holt_agent_run_watchdog_recovery/v1"
 
     assert old_work["watchdog_recovery_packet"]["previous_agent_run_id"] == agent_run["id"]
     assert recovery_work["kind"] == "continuation"
@@ -3677,7 +4690,9 @@ defmodule HoltTest do
                task["ref"],
                %{
                  "summary" => "All event checks passed.",
-                 "checks" => [%{"name" => "tests", "status" => "passed"}],
+                 "checks" => [
+                   %{"name" => "tests", "check_type" => "regression_check", "status" => "passed"}
+                 ],
                  "changed_files" => ["lib/example.ex"],
                  "evidence" => ["mix test"]
                },
@@ -3751,30 +4766,175 @@ defmodule HoltTest do
       "run.created",
       "run.transitioned",
       "context.built",
-      "tool.requested",
-      "tool.completed",
-      "tool.failed"
+      "action.requested",
+      "action.completed",
+      "action.failed"
     ])
   end
 
-  test "tools enforce workspace path boundaries" do
+  test "actions enforce workspace path boundaries" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
     assert {:error, :path_outside_workspace} =
-             Tools.execute("read_file", %{"path" => "../outside.txt"}, workspace: workspace)
+             LocalActions.execute("read", %{"path" => "../outside.txt"}, workspace: workspace)
   end
 
-  test "tool visibility metadata summarizes inputs without content leakage" do
+  test "write actions return structured edit diff metadata" do
+    %{workspace: workspace} = tmp_env()
+    Workspace.init(workspace)
+    path = Path.join(workspace, "lib/app.ex")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "old\nsame\n")
+
+    assert {:ok, result} =
+             LocalActions.execute(
+               "write",
+               %{"path" => "lib/app.ex", "content" => "new\nsame\nextra\n"},
+               workspace: workspace,
+               approval: :always_approve
+             )
+
+    assert result["path"] == "lib/app.ex"
+    assert result["additions"] == 2
+    assert result["deletions"] == 1
+    assert result["unified_diff"] =~ "--- a/lib/app.ex"
+    assert result["unified_diff"] =~ "+++ b/lib/app.ex"
+    assert result["unified_diff"] =~ "@@ -1,2 +1,3 @@"
+    assert result["unified_diff"] =~ "-old"
+    assert result["unified_diff"] =~ "+new"
+
+    event = ActionVisibility.completed("write", %{}, result, "action_call_write", [])
+    assert event["output_summary"]["path"] == "lib/app.ex"
+    assert event["output_summary"]["additions"] == 2
+    assert event["output_summary"]["deletions"] == 1
+    assert event["output_summary"]["unified_diff"] == result["unified_diff"]
+  end
+
+  test "write action diffs use focused unified hunks for distant edits" do
+    %{workspace: workspace} = tmp_env()
+    Workspace.init(workspace)
+    path = Path.join(workspace, "lib/app.ex")
+    File.mkdir_p!(Path.dirname(path))
+
+    before =
+      1..11
+      |> Enum.map(&"line #{&1}")
+      |> Enum.join("\n")
+
+    after_content =
+      1..11
+      |> Enum.map(fn
+        1 -> "LINE 1"
+        11 -> "LINE 11"
+        index -> "line #{index}"
+      end)
+      |> Enum.join("\n")
+
+    File.write!(path, before <> "\n")
+
+    assert {:ok, result} =
+             LocalActions.execute(
+               "write",
+               %{"path" => "lib/app.ex", "content" => after_content <> "\n"},
+               workspace: workspace,
+               approval: :always_approve
+             )
+
+    diff = result["unified_diff"]
+    assert result["additions"] == 2
+    assert result["deletions"] == 2
+    assert diff =~ "@@ -1,4 +1,4 @@"
+    assert diff =~ "@@ -8,4 +8,4 @@"
+    assert diff =~ "-line 1"
+    assert diff =~ "+LINE 1"
+    assert diff =~ "-line 11"
+    assert diff =~ "+LINE 11"
+    refute diff =~ " line 6"
+  end
+
+  test "unchanged write actions do not render as edited zero-diff changes" do
+    %{workspace: workspace} = tmp_env()
+    Workspace.init(workspace)
+    path = Path.join(workspace, "lib/app.ex")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "same\n")
+
+    assert {:ok, result} =
+             LocalActions.execute(
+               "write",
+               %{"path" => "lib/app.ex", "content" => "same\n"},
+               workspace: workspace,
+               approval: :always_approve
+             )
+
+    assert result["path"] == "lib/app.ex"
+    assert result["status"] == "unchanged"
+    refute Map.has_key?(result, "additions")
+    refute Map.has_key?(result, "deletions")
+    refute Map.has_key?(result, "unified_diff")
+
+    event = ActionVisibility.completed("write", %{}, result, "action_call_write", [])
+    assert event["label"] == "Unchanged `lib/app.ex`"
+    assert event["output_summary"]["status"] == "unchanged"
+    refute Map.has_key?(event["output_summary"], "additions")
+
+    rendered = event |> Map.put("type", "action.completed") |> ActionVisibility.render()
+    refute rendered =~ "Edited lib/app.ex (+0 -0)"
+  end
+
+  test "write approvals include structured proposed diff preview" do
+    %{workspace: workspace} = tmp_env()
+    Workspace.init(workspace)
+    path = Path.join(workspace, "README.md")
+    File.write!(path, "old\n")
+
     event =
-      ToolVisibility.started(
-        "write_file",
+      ActionVisibility.approval_requested(
+        "write",
+        %{"path" => "README.md", "content" => "new\n"},
+        "action_call_write",
+        workspace: workspace
+      )
+
+    assert event["change_preview"]["path"] == "README.md"
+    assert event["change_preview"]["additions"] == 1
+    assert event["change_preview"]["deletions"] == 1
+    assert event["change_preview"]["unified_diff"] =~ "--- a/README.md"
+    assert event["change_preview"]["unified_diff"] =~ "-old"
+    assert event["change_preview"]["unified_diff"] =~ "+new"
+
+    unchanged =
+      ActionVisibility.approval_requested(
+        "write",
+        %{"path" => "README.md", "content" => "old\n"},
+        "action_call_unchanged",
+        workspace: workspace
+      )
+
+    assert unchanged["change_preview"] == %{"path" => "README.md", "status" => "unchanged"}
+
+    secret =
+      ActionVisibility.approval_requested(
+        "write",
+        %{"path" => ".env", "content" => "TOKEN=secret\n"},
+        "action_call_secret",
+        workspace: workspace
+      )
+
+    assert secret["change_preview"] == %{"path" => ".env", "diff_redacted" => true}
+  end
+
+  test "action visibility metadata summarizes inputs without content leakage" do
+    event =
+      ActionVisibility.started(
+        "write",
         %{"path" => "lib/app.ex", "content" => "secret body"},
-        "tool_call_test",
+        "action_call_test",
         []
       )
 
-    assert event["tool"] == "write_file"
+    assert event["action"] == "write"
     assert event["category"] == "workspace"
     assert event["risk"] == "write"
     assert event["approval_required"] == true
@@ -3782,7 +4942,19 @@ defmodule HoltTest do
     assert event["input_summary"]["content_bytes"] == 11
     refute inspect(event) =~ "secret body"
 
-    secret = ToolVisibility.started("read_file", %{"path" => ".env"}, "tool_call_secret", [])
+    approval =
+      ActionVisibility.approval_requested(
+        "write",
+        %{"path" => "lib/app.ex", "content" => "secret body"},
+        "action_call_test",
+        []
+      )
+
+    assert approval["label"] == "Writing file `lib/app.ex`"
+    assert approval["approval_subject"] == "Writing file `lib/app.ex`"
+    refute approval["label"] =~ "Waiting for approval"
+
+    secret = ActionVisibility.started("read", %{"path" => ".env"}, "action_call_secret", [])
     assert secret["risk"] == "secret"
     assert secret["approval_required"] == true
   end
@@ -3793,7 +4965,7 @@ defmodule HoltTest do
     File.write!(Path.join(workspace, "README.md"), "# Project")
 
     assert {:ok, %{"files" => files}} =
-             Tools.execute("list_files", %{"limit" => 20}, workspace: workspace)
+             LocalActions.execute("list", %{"limit" => 20}, workspace: workspace)
 
     assert "README.md" in files
     refute Enum.any?(files, &String.starts_with?(&1, ".holtworks/"))
@@ -3823,7 +4995,7 @@ defmodule HoltTest do
     assert [%{name: "repo-review", risk: "read"}] = skills
   end
 
-  test "agent skill tools save load update list and run scripts" do
+  test "agent skill actions save load update list and run scripts" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
@@ -3834,7 +5006,7 @@ defmodule HoltTest do
                  "name" => "Repo Review",
                  "slug" => "repo-review",
                  "description" => "Review a repository and summarize architecture.",
-                 "body" => "1. Run `list_files`.\n2. Summarize the architecture.",
+                 "body" => "1. Run `list`.\n2. Summarize the architecture.",
                  "triggers" => ["review repo", "architecture"],
                  "scripts" => %{"hello.sh" => "echo skill:$1\n"}
                },
@@ -3919,7 +5091,7 @@ defmodule HoltTest do
     assert found["text"] == "Use a local gateway"
   end
 
-  test "scoped user memory tools remember search list and forget" do
+  test "scoped user memory actions remember search list and forget" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
@@ -3935,7 +5107,7 @@ defmodule HoltTest do
              )
 
     assert remember_execution["status"] == "ok"
-    assert remember_execution["result"]["schema_version"] == "holtworks_user_memory/v1"
+    assert remember_execution["result"]["schema_version"] == "holt_user_memory/v1"
     assert remember_execution["result"]["scope"] == "user"
     assert remember_execution["result"]["user_id"] == "user_1"
 
@@ -3975,7 +5147,7 @@ defmodule HoltTest do
     assert empty_list["result"]["memories"] == []
   end
 
-  test "scoped project memory tools save recall and read plans and research" do
+  test "scoped project memory actions save recall and read plans and research" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
@@ -3984,7 +5156,7 @@ defmodule HoltTest do
                "remember_for_project",
                %{
                  "project_id" => "project_1",
-                 "summary" => "Use a local-first runtime boundary.",
+                 "summary" => "Use a managed runtime boundary.",
                  "category" => "structure"
                },
                workspace: workspace
@@ -3998,7 +5170,7 @@ defmodule HoltTest do
                %{
                  "project_id" => "project_1",
                  "title" => "Migration plan",
-                 "body" => "Move scoped memory tools before implementing delegation",
+                 "body" => "Move scoped memory actions before implementing delegation",
                  "category" => "general"
                },
                workspace: workspace
@@ -4013,7 +5185,7 @@ defmodule HoltTest do
                %{
                  "project_id" => "project_1",
                  "title" => "Memory research",
-                 "body" => "Inktrail separates user and project memory tools.",
+                 "body" => "Inktrail separates user and project memory actions.",
                  "category" => "structure",
                  "sources" => ["inktrail/actions/project_memory"]
                },
@@ -4140,12 +5312,13 @@ defmodule HoltTest do
                "finish_reason" => "tool_calls",
                "message" => %{
                  "content" => "# NEXT STEPS\n\nGenerated by OpenRouter.",
+                 "reasoning" => "Inspect the workspace before choosing an action.",
                  "tool_calls" => [
                    %{
-                     "id" => "call_read_file",
+                     "id" => "call_read",
                      "type" => "function",
                      "function" => %{
-                       "name" => "read_file",
+                       "name" => "read",
                        "arguments" => Jason.encode!(%{"path" => "README.md"})
                      }
                    }
@@ -4157,10 +5330,10 @@ defmodule HoltTest do
        }}
     end
 
-    read_file_tool = %{
+    read_action = %{
       type: "function",
       function: %{
-        name: "read_file",
+        name: "read",
         parameters: %{"type" => "object", "properties" => %{"path" => %{"type" => "string"}}}
       }
     }
@@ -4178,13 +5351,14 @@ defmodule HoltTest do
                },
                [%{"role" => "user", "content" => "plan this repo"}],
                post_json: post_json,
-               tools: [read_file_tool],
+               actions: [read_action],
                tool_choice: "auto"
              )
 
     assert response["provider"] == "openrouter"
     assert response["content"] =~ "Generated by OpenRouter"
-    assert [%{"function" => %{"name" => "read_file"}}] = response["tool_calls"]
+    assert response["reasoning"] == "Inspect the workspace before choosing an action."
+    assert [%{"function" => %{"name" => "read"}}] = response["tool_calls"]
     assert response["finish_reason"] == "tool_calls"
 
     assert_received {:openrouter_request, "https://openrouter.ai/api/v1/chat/completions",
@@ -4194,8 +5368,186 @@ defmodule HoltTest do
     assert {"X-Title", "Holt"} in headers
     assert body.model == "openai/gpt-4o-mini"
     assert [%{"role" => "user", "content" => "plan this repo"}] = body.messages
-    assert body.tools == [read_file_tool]
+    refute Map.has_key?(body, :actions)
+    assert body.tools == [read_action]
     assert body.tool_choice == "auto"
+    assert body.reasoning == %{"enabled" => true, "exclude" => false}
+  end
+
+  test "openrouter adapter translates action result messages at the provider boundary" do
+    previous = System.get_env("OPENROUTER_API_KEY")
+    System.put_env("OPENROUTER_API_KEY", "test-key")
+    on_exit(fn -> restore_env("OPENROUTER_API_KEY", previous) end)
+    test_pid = self()
+
+    post_json = fn _url, _headers, body, _api_key ->
+      send(test_pid, {:openrouter_followup_request, body})
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "choices" => [
+             %{
+               "finish_reason" => "stop",
+               "message" => %{"content" => "The selected option was Writing."}
+             }
+           ]
+         }
+       }}
+    end
+
+    action_result =
+      Holt.Actions.ProviderAdapter.result_message(
+        %{
+          "id" => "call_ask",
+          "function" => %{"name" => "ask", "arguments" => Jason.encode!(%{})}
+        },
+        %{"status" => "completed", "answer" => "Writing"}
+      )
+
+    assert {:ok, response} =
+             Models.chat(
+               %{
+                 "id" => "openrouter",
+                 "type" => "openrouter",
+                 "model" => "openai/gpt-4o-mini",
+                 "api_key_env" => "OPENROUTER_API_KEY",
+                 "base_url" => "https://openrouter.ai/api/v1"
+               },
+               [
+                 %{"role" => "user", "content" => "ask me a question with options"},
+                 %{
+                   "role" => "assistant",
+                   "content" => "",
+                   "tool_calls" => [
+                     %{
+                       "id" => "call_ask",
+                       "type" => "function",
+                       "function" => %{
+                         "name" => "ask",
+                         "arguments" =>
+                           Jason.encode!(%{
+                             "question" => "What type of task would you like to focus on?",
+                             "options" => ["Reading", "Writing", "Planning", "Executing"]
+                           })
+                       }
+                     }
+                   ]
+                 },
+                 action_result
+               ],
+               post_json: post_json,
+               tool_choice: "auto"
+             )
+
+    assert response["content"] == "The selected option was Writing."
+
+    assert_received {:openrouter_followup_request, body}
+    refute Enum.any?(body.messages, &(Map.get(&1, "role") == "action"))
+
+    assert %{
+             "role" => "tool",
+             "tool_call_id" => "call_ask",
+             "content" => content
+           } = Enum.at(body.messages, 2)
+
+    refute Map.has_key?(Enum.at(body.messages, 2), "name")
+    assert Jason.decode!(content)["answer"] == "Writing"
+  end
+
+  test "runtime sends ask continuation policy on hosted provider follow-up turns" do
+    %{home: home, workspace: workspace} = tmp_env()
+    Config.bootstrap(home: home)
+    Workspace.init(workspace)
+
+    previous = System.get_env("OPENROUTER_API_KEY")
+    System.put_env("OPENROUTER_API_KEY", "test-key")
+    on_exit(fn -> restore_env("OPENROUTER_API_KEY", previous) end)
+
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    test_pid = self()
+
+    post_json = fn _url, _headers, body, _api_key ->
+      call_number = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+      send(test_pid, {:runtime_openrouter_body, call_number, body})
+
+      case call_number do
+        1 ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "choices" => [
+                 %{
+                   "finish_reason" => "tool_calls",
+                   "message" => %{
+                     "content" => "",
+                     "tool_calls" => [
+                       %{
+                         "id" => "call_ask",
+                         "type" => "function",
+                         "function" => %{
+                           "name" => "ask",
+                           "arguments" =>
+                             Jason.encode!(%{
+                               "question" => "What would you like to do next?",
+                               "options" => [
+                                 %{"label" => "Read a file", "value" => "read_file"},
+                                 %{"label" => "Inspect the workspace", "value" => "inspect"}
+                               ]
+                             })
+                         }
+                       }
+                     ]
+                   }
+                 }
+               ]
+             }
+           }}
+
+        2 ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "choices" => [
+                 %{
+                   "finish_reason" => "stop",
+                   "message" => %{"content" => "I will ask for the file structurally next."}
+                 }
+               ]
+             }
+           }}
+      end
+    end
+
+    await_user_callback = fn question, metadata ->
+      send(test_pid, {:runtime_await_user, question, metadata})
+      {:ok, "read_file"}
+    end
+
+    assert {:ok, %{output: output}} =
+             Runtime.run("ask me a question with options",
+               home: home,
+               workspace: workspace,
+               provider: "openrouter",
+               mode: "chat",
+               approval: :always_approve,
+               post_json: post_json,
+               await_user_callback: await_user_callback
+             )
+
+    assert output == "I will ask for the file structurally next."
+    assert_received {:runtime_await_user, "What would you like to do next?", _metadata}
+    assert_received {:runtime_openrouter_body, 1, _first_body}
+    assert_received {:runtime_openrouter_body, 2, second_body}
+
+    assert %{"role" => "tool", "content" => content} = Enum.at(second_body.messages, 3)
+    decoded = Jason.decode!(content)
+    assert decoded["question"] == "What would you like to do next?"
+    assert decoded["continuation_policy"]["follow_up_user_input_action"] == "ask"
+    assert decoded["continuation_policy"]["requires_action_for_more_user_input"] == true
   end
 
   test "openrouter adapter returns provider failure details" do
@@ -4237,6 +5589,8 @@ defmodule HoltTest do
     providers = Config.default_providers() |> Map.put("default_provider", "openrouter")
     Config.save_providers(home, providers)
 
+    test_pid = self()
+
     post_json = fn _url, _headers, _body, _api_key ->
       {:ok,
        %{
@@ -4245,6 +5599,7 @@ defmodule HoltTest do
            "choices" => [
              %{
                "message" => %{
+                 "reasoning" => "Need produce a concise plan.",
                  "content" => "# NEXT STEPS\n\nLLM generated plan from OpenRouter."
                }
              }
@@ -4258,7 +5613,8 @@ defmodule HoltTest do
                home: home,
                workspace: workspace,
                approval: :always_approve,
-               post_json: post_json
+               post_json: post_json,
+               runtime_event_callback: fn event -> send(test_pid, {:runtime_event, event}) end
              )
 
     assert run["status"] == "completed"
@@ -4267,7 +5623,22 @@ defmodule HoltTest do
 
     events = Runs.events(run["run_dir"])
     assert Enum.any?(events, &(Map.get(&1, "type") == "model.requested"))
+
+    assert Enum.any?(
+             events,
+             &(&1["type"] == "model.thinking" and
+                 &1["block_type"] == "thinking" and
+                 &1["content"] == "Need produce a concise plan.")
+           )
+
     assert Enum.any?(events, &(Map.get(&1, "type") == "model.completed"))
+
+    assert_received {:runtime_event,
+                     %{
+                       "type" => "model.thinking",
+                       "block_type" => "thinking",
+                       "content" => "Need produce a concise plan."
+                     }}
   end
 
   test "state machine enforces structured transitions" do
@@ -4278,7 +5649,7 @@ defmodule HoltTest do
              StateMachine.transition("completed", "running")
   end
 
-  test "stdio bridge handles status and tools list" do
+  test "stdio bridge handles status and actions list" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -4291,13 +5662,13 @@ defmodule HoltTest do
 
     assert status["workspace"] == workspace
 
-    assert %{"ok" => true, "result" => tools} =
-             Bridge.Stdio.handle_request(%{"method" => "tools/list"},
+    assert %{"ok" => true, "result" => actions} =
+             Bridge.Stdio.handle_request(%{"method" => "actions/list"},
                home: home,
                workspace: workspace
              )
 
-    assert Enum.any?(tools, &(&1["name"] == "write_file"))
+    assert Enum.any?(actions, &(&1["name"] == "write"))
   end
 
   test "stdio bridge exposes task action parity methods" do
@@ -4439,7 +5810,7 @@ defmodule HoltTest do
     assert read_memory["content"] =~ "Bridge callers load runtime before work."
   end
 
-  test "stdio bridge accepts Inktrail MCP-style task method aliases" do
+  test "stdio bridge task methods require canonical parameter names" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -4453,7 +5824,7 @@ defmodule HoltTest do
 
     assert %{"ok" => true, "result" => fetched} =
              Bridge.Stdio.handle_request(
-               %{"method" => "get_task", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "get_task", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
@@ -4463,7 +5834,7 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "update_task",
-                 "params" => %{"task_id" => task["ref"], "priority" => "urgent"}
+                 "params" => %{"ref" => task["ref"], "priority" => "urgent"}
                },
                opts
              )
@@ -4475,7 +5846,7 @@ defmodule HoltTest do
                %{
                  "method" => "save_task_spec",
                  "params" => %{
-                   "task_id" => task["ref"],
+                   "ref" => task["ref"],
                    "kind" => "decision",
                    "title" => "Alias decision",
                    "content" => "Alias spec content."
@@ -4486,7 +5857,7 @@ defmodule HoltTest do
 
     assert %{"ok" => true, "result" => [listed_spec]} =
              Bridge.Stdio.handle_request(
-               %{"method" => "list_task_specs", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "list_task_specs", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
@@ -4496,7 +5867,7 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "start_agent_work",
-                 "params" => %{"task_id" => task["ref"], "message" => "Alias run."}
+                 "params" => %{"ref" => task["ref"], "message" => "Alias run."}
                },
                opts
              )
@@ -4508,9 +5879,15 @@ defmodule HoltTest do
                %{
                  "method" => "route_verification_review",
                  "params" => %{
-                   "task_id" => task["ref"],
+                   "ref" => task["ref"],
                    "summary" => "Alias verification passed.",
-                   "checks" => [%{"name" => "tests", "status" => "passed"}]
+                   "checks" => [
+                     %{
+                       "name" => "tests",
+                       "check_type" => "regression_check",
+                       "status" => "passed"
+                     }
+                   ]
                  }
                },
                opts
@@ -4520,7 +5897,7 @@ defmodule HoltTest do
 
     assert %{"ok" => true, "result" => graph} =
              Bridge.Stdio.handle_request(
-               %{"method" => "create_task_graph", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "create_task_graph", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
@@ -4530,8 +5907,8 @@ defmodule HoltTest do
                  "method" => "complete_task_graph_node",
                  "params" => %{
                    "graph_id" => graph["id"],
-                   "node_key" => "plan",
-                   "summary" => "Plan node complete."
+                   "node_ref" => "plan",
+                   "output" => "Plan node complete."
                  }
                },
                opts
@@ -4541,7 +5918,7 @@ defmodule HoltTest do
 
     assert %{"ok" => true, "result" => [listed_graph]} =
              Bridge.Stdio.handle_request(
-               %{"method" => "list_task_graphs", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "list_task_graphs", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
@@ -4549,72 +5926,72 @@ defmodule HoltTest do
 
     assert %{"ok" => true, "result" => evidence_contract} =
              Bridge.Stdio.handle_request(
-               %{"method" => "get_evidence_contract", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "get_evidence_contract", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
-    assert evidence_contract["schema_version"] == "holtworks_evidence_contract/v1"
+    assert evidence_contract["schema_version"] == "holt_evidence_contract/v1"
 
     assert %{"ok" => true, "result" => verifier_route} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "plan_verifier_route",
-                 "params" => %{"task_id" => task["ref"], "graph_id" => graph["id"]}
+                 "params" => %{"ref" => task["ref"], "graph_id" => graph["id"]}
                },
                opts
              )
 
-    assert verifier_route[:route]["child_agent_contract"]["job_contract"]["gate_tool"] ==
+    assert verifier_route[:route]["child_agent_contract"]["job_contract"]["gate_action"] ==
              "route_verification_review"
 
-    assert %{"ok" => true, "result" => tool_session} =
+    assert %{"ok" => true, "result" => action_session} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "task_tool_session",
-                 "params" => %{"task_id" => task["ref"], "disabled_tools" => ["write_file"]}
+                 "method" => "action_session",
+                 "params" => %{"ref" => task["ref"], "disabled_actions" => ["write"]}
                },
                opts
              )
 
-    refute "write_file" in tool_session["direct_tools"]
+    refute "write" in action_session["direct_actions"]
 
-    assert %{"ok" => true, "result" => tool_route} =
+    assert %{"ok" => true, "result" => action_route} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "route_task_tool",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "method" => "route_action",
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
 
-    assert tool_route["status"] == "accepted"
-    assert tool_route["action_contract"]["effect_scope"] == "read_only"
+    assert action_route["status"] == "accepted"
+    assert action_route["action_contract"]["effect_scope"] == "read_only"
 
     assert %{"ok" => true, "result" => action_contract} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "action_contract",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
 
-    assert action_contract["schema_version"] == "holtworks_action_contract/v1"
+    assert action_contract["schema_version"] == "holt_action_contract/v1"
     assert action_contract["effect_scope"] == "read_only"
 
     assert %{"ok" => true, "result" => plan_contract} =
              Bridge.Stdio.handle_request(
-               %{"method" => "plan_contract", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "plan_contract", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
-    assert plan_contract["schema_version"] == "holtworks_plan_contract/v1"
+    assert plan_contract["schema_version"] == "holt_plan_contract/v1"
 
     assert %{"ok" => true, "result" => plan_gate} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "plan_gate",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
@@ -4625,7 +6002,7 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "action_preflight",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
@@ -4636,7 +6013,7 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "consequence_gate",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
@@ -4647,7 +6024,7 @@ defmodule HoltTest do
              Bridge.Stdio.handle_request(
                %{
                  "method" => "action_runtime_envelope",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
@@ -4673,8 +6050,8 @@ defmodule HoltTest do
                %{
                  "method" => "action_approval_request",
                  "params" => %{
-                   "task_id" => task["ref"],
-                   "tool_name" => "run_command",
+                   "ref" => task["ref"],
+                   "action" => "run",
                    "allow_workspace_durable" => true
                  }
                },
@@ -4703,8 +6080,8 @@ defmodule HoltTest do
                %{
                  "method" => "action_evidence_ledger",
                  "params" => %{
-                   "task_id" => task["ref"],
-                   "tool_name" => "get_task",
+                   "ref" => task["ref"],
+                   "action" => "get_task",
                    "result_status" => "ok",
                    "result_preview" => "stdio ledger"
                  }
@@ -4712,7 +6089,7 @@ defmodule HoltTest do
                opts
              )
 
-    assert evidence_ledger["schema_version"] == "holtworks_evidence_ledger/v1"
+    assert evidence_ledger["schema_version"] == "holt_evidence_ledger/v1"
     assert evidence_ledger["coverage"]["has_observation"] == true
 
     assert %{"ok" => true, "result" => memory_artifact} =
@@ -4720,7 +6097,7 @@ defmodule HoltTest do
                %{
                  "method" => "record_task_memory_artifact",
                  "params" => %{
-                   "task_id" => task["ref"],
+                   "ref" => task["ref"],
                    "kind" => "handoff",
                    "title" => "Alias memory",
                    "content" => "Alias exact memory content."
@@ -4729,82 +6106,82 @@ defmodule HoltTest do
                opts
              )
 
-    assert memory_artifact["schema_version"] == "holtworks_task_memory_artifact/v1"
+    assert memory_artifact["schema_version"] == "holt_task_memory_artifact/v1"
 
     assert %{"ok" => true, "result" => memory_context} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "task_memory_context",
-                 "params" => %{"task_id" => task["ref"], "estimated_input_tokens" => 1000}
+                 "params" => %{"ref" => task["ref"], "estimated_input_tokens" => 1000}
                },
                opts
              )
 
-    assert memory_context["schema_version"] == "holtworks_task_memory_context_packet/v1"
+    assert memory_context["schema_version"] == "holt_task_memory_context_packet/v1"
     assert memory_artifact["artifact_ref"] in memory_context["artifact_refs"]
 
     assert %{"ok" => true, "result" => context_budget} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "context_budget",
-                 "params" => %{"task_id" => task["ref"], "estimated_input_tokens" => 1000}
+                 "params" => %{"ref" => task["ref"], "estimated_input_tokens" => 1000}
                },
                opts
              )
 
-    assert context_budget["schema_version"] == "holtworks_context_budget_governor/v1"
+    assert context_budget["schema_version"] == "holt_context_budget_governor/v1"
     assert context_budget["action"] == "send"
 
     assert %{"ok" => true, "result" => continuation_packet} =
              Bridge.Stdio.handle_request(
-               %{"method" => "continuation_packet", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "continuation_packet", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
-    assert continuation_packet["schema_version"] == "holtworks_continuation_packet/v1"
+    assert continuation_packet["schema_version"] == "holt_continuation_packet/v1"
     assert continuation_packet["previous_runtime_run_id"] == run_result[:run]["id"]
 
     assert %{"ok" => true, "result" => capability_entry} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "capability_registry",
-                 "params" => %{"tool_name" => "get_task"}
+                 "params" => %{"action" => "get_task"}
                },
                opts
              )
 
-    assert capability_entry["schema_version"] == "holtworks_capability_registry_entry/v1"
+    assert capability_entry["schema_version"] == "holt_capability_registry_entry/v1"
 
     assert %{"ok" => true, "result" => capability_contract} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "capability_contract",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
 
-    assert capability_contract["schema_version"] == "holtworks_capability_contract/v1"
+    assert capability_contract["schema_version"] == "holt_capability_contract/v1"
 
     assert %{"ok" => true, "result" => capability_route} =
              Bridge.Stdio.handle_request(
                %{
                  "method" => "capability_route",
-                 "params" => %{"task_id" => task["ref"], "tool_name" => "get_task"}
+                 "params" => %{"ref" => task["ref"], "action" => "get_task"}
                },
                opts
              )
 
-    assert capability_route["schema_version"] == "holtworks_capability_route/v1"
+    assert capability_route["schema_version"] == "holt_capability_route/v1"
     assert capability_route["execution_mode"] in ["persisted_agent", "ephemeral_sub_agent"]
 
     assert %{"ok" => true, "result" => generic_plan} =
              Bridge.Stdio.handle_request(
-               %{"method" => "generic_plan", "params" => %{"task_id" => task["ref"]}},
+               %{"method" => "generic_plan", "params" => %{"ref" => task["ref"]}},
                opts
              )
 
-    assert generic_plan["schema_version"] == "holtworks_generic_work_graph/v1"
+    assert generic_plan["schema_version"] == "holt_generic_work_graph/v1"
 
     assert Enum.map(generic_plan["nodes"], & &1["phase"]) ==
              ~w(research propose act verify repair)
@@ -4857,12 +6234,40 @@ defmodule HoltTest do
                workspace: workspace
              )
 
-    assert comment_execution["schema_version"] == "holtworks_action_execution/v1"
+    assert comment_execution["schema_version"] == "holt_action_execution/v1"
     assert comment_execution["status"] == "ok"
     assert get_in(comment_execution, ["route", "status"]) == "accepted"
 
     assert [%{"body" => "created through executable action"}] =
              get_in(comment_execution, ["result", "comments"])
+
+    comment_id =
+      comment_execution
+      |> get_in(["result", "comments"])
+      |> List.first()
+      |> Map.fetch!("id")
+
+    assert {:error, legacy_comment_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "add_comment",
+               %{"content" => "legacy comment alias"},
+               workspace: workspace
+             )
+
+    assert legacy_comment_execution["reason"] == "missing_required_arguments"
+    assert legacy_comment_execution["missing_arguments"] == ["body"]
+
+    assert {:error, legacy_delete_comment_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "delete_comment",
+               %{"id" => comment_id},
+               workspace: workspace
+             )
+
+    assert legacy_delete_comment_execution["reason"] == "missing_required_arguments"
+    assert legacy_delete_comment_execution["missing_arguments"] == ["comment_id"]
 
     assert {:ok, update_execution} =
              Tasks.execute_task_action(
@@ -4894,19 +6299,78 @@ defmodule HoltTest do
 
     assert estimate_execution["result"]["estimate"] == 5
 
+    assert {:error, legacy_label_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "add_label",
+               %{"label" => "legacy-label"},
+               workspace: workspace
+             )
+
+    assert legacy_label_execution["reason"] == "missing_required_arguments"
+    assert legacy_label_execution["missing_arguments"] == ["name"]
+
+    assert {:ok, target} =
+             Tasks.create(%{"title" => "Executable action target"}, workspace: workspace)
+
+    assert {:error, legacy_link_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "add_link",
+               %{"target" => target["ref"]},
+               workspace: workspace
+             )
+
+    assert legacy_link_execution["reason"] == "missing_required_arguments"
+    assert legacy_link_execution["missing_arguments"] == ["target_ref"]
+
+    assert {:ok, graph} = Tasks.create_task_graph(task["ref"], %{}, workspace: workspace)
+
+    assert {:error, legacy_graph_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "get_task_graph",
+               %{"id" => graph["id"]},
+               workspace: workspace
+             )
+
+    assert legacy_graph_execution["reason"] == "missing_required_arguments"
+    assert legacy_graph_execution["missing_arguments"] == ["graph_id"]
+
+    assert {:error, legacy_task_graph_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "get_task_graph",
+               %{"task_graph_id" => graph["id"]},
+               workspace: workspace
+             )
+
+    assert legacy_task_graph_execution["reason"] == "unsupported_argument:task_graph_id"
+
+    assert {:error, legacy_node_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "complete_task_graph_node",
+               %{"graph_id" => graph["id"], "node_key" => "plan"},
+               workspace: workspace
+             )
+
+    assert legacy_node_execution["reason"] == "missing_required_arguments"
+    assert legacy_node_execution["missing_arguments"] == ["node_ref"]
+
     assert {:error, rejected} =
              Tasks.execute_task_action(
                task["ref"],
                "update_task",
-               %{"status" => "done", "disabled_tools" => ["update_task"]},
+               %{"status" => "done", "disabled_actions" => ["update_task"]},
                workspace: workspace
              )
 
     assert rejected["status"] == "rejected"
-    assert rejected["reason"] == "tool_disabled_for_session"
+    assert rejected["reason"] == "action_disabled_for_session"
   end
 
-  test "meta actions expose schemas and execute only safe nested task tools" do
+  test "meta actions expose schemas and execute only safe nested task actions" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
 
@@ -4916,7 +6380,7 @@ defmodule HoltTest do
     assert {:ok, search_execution} =
              Tasks.execute_task_action(
                task["ref"],
-               "search_tools",
+               "search_actions",
                %{"effect_scopes" => ["task_durable"]},
                workspace: workspace
              )
@@ -4929,8 +6393,8 @@ defmodule HoltTest do
     assert {:ok, schema_execution} =
              Tasks.execute_task_action(
                task["ref"],
-               "get_tool_schema",
-               %{"tool_name" => "add_comment"},
+               "get_action_schema",
+               %{"action" => "add_comment"},
                workspace: workspace
              )
 
@@ -4940,12 +6404,24 @@ defmodule HoltTest do
              "body"
            ]
 
+    assert {:error, legacy_schema_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "get_action_schema",
+               %{"action_name" => "add_comment"},
+               workspace: workspace
+             )
+
+    assert legacy_schema_execution["status"] == "error"
+    assert legacy_schema_execution["reason"] == "missing_required_arguments"
+    assert legacy_schema_execution["missing_arguments"] == ["action"]
+
     assert {:error, unsafe_nested_execution} =
              Tasks.execute_task_action(
                task["ref"],
-               "execute_tool",
+               "execute_action",
                %{
-                 "tool_name" => "add_label",
+                 "action" => "add_label",
                  "arguments" => %{"name" => "nested", "color" => "#0f766e"}
                },
                workspace: workspace
@@ -4957,9 +6433,9 @@ defmodule HoltTest do
     assert {:ok, todo_execution} =
              Tasks.execute_task_action(
                task["ref"],
-               "execute_tool",
+               "execute_action",
                %{
-                 "tool_name" => "todo_write",
+                 "action" => "todo_write",
                  "arguments" => %{
                    "todos" => [
                      %{"content" => "Check action safety", "status" => "in_progress"}
@@ -4981,12 +6457,84 @@ defmodule HoltTest do
              }
            ] = get_in(todo_execution, ["result", "result", "todos"])
 
+    assert {:error, legacy_nested_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "execute_action",
+               %{
+                 "action_name" => "todo_write",
+                 "arguments" => %{
+                   "todos" => [
+                     %{"content" => "Rejected legacy action field", "status" => "pending"}
+                   ]
+                 }
+               },
+               workspace: workspace
+             )
+
+    assert legacy_nested_execution["status"] == "error"
+    assert legacy_nested_execution["reason"] == "missing_required_arguments"
+    assert legacy_nested_execution["missing_arguments"] == ["action"]
+
+    assert {:ok, batch_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "multi_execute_action",
+               %{
+                 "calls" => [
+                   %{
+                     "action" => "todo_read",
+                     "arguments" => %{
+                       "action_session" => %{
+                         "todos" => [%{"content" => "Batch visible", "status" => "pending"}]
+                       }
+                     }
+                   }
+                 ]
+               },
+               workspace: workspace
+             )
+
+    assert [%{"action" => "todo_read", "status" => "ok"}] =
+             get_in(batch_execution, ["result", "executions"])
+
+    assert {:error, legacy_batch_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "multi_execute_action",
+               %{
+                 "calls" => [
+                   %{
+                     "action_name" => "todo_read",
+                     "arguments" => %{
+                       "action_session" => %{
+                         "todos" => [
+                           %{"content" => "Rejected batch alias", "status" => "pending"}
+                         ]
+                       }
+                     }
+                   }
+                 ]
+               },
+               workspace: workspace
+             )
+
+    assert legacy_batch_execution["status"] == "error"
+    assert legacy_batch_execution["reason"] == "batch_stopped"
+
+    assert [
+             %{
+               "reason" => "missing_required_arguments",
+               "missing_arguments" => ["action"]
+             }
+           ] = legacy_batch_execution["executions"]
+
     assert {:ok, read_todo_execution} =
              Tasks.execute_task_action(
                task["ref"],
                "todo_read",
                %{
-                 "task_tool_session" => %{
+                 "action_session" => %{
                    "todos" => [
                      %{"content" => "Stored in session", "status" => "pending"}
                    ]
@@ -5013,10 +6561,11 @@ defmodule HoltTest do
              Tasks.execute_task_action(task["ref"], "todo_write", %{}, workspace: workspace)
 
     assert missing_todos_execution["status"] == "error"
-    assert missing_todos_execution["reason"] == "todos is required."
+    assert missing_todos_execution["reason"] == "missing_required_arguments"
+    assert missing_todos_execution["missing_arguments"] == ["todos"]
   end
 
-  test "task session meta tools report connections and route workbench reads" do
+  test "task session meta actions report connections and route workbench reads" do
     %{workspace: workspace} = tmp_env()
     Workspace.init(workspace)
     File.write!(Path.join(workspace, "WORKBENCH.md"), "Workbench context")
@@ -5066,16 +6615,16 @@ defmodule HoltTest do
                task["ref"],
                "use_workbench",
                Map.merge(session_attrs, %{
-                 "tool_name" => "read_file",
+                 "action" => "read",
                  "arguments" => %{"path" => "WORKBENCH.md"}
                }),
                workspace: workspace
              )
 
     assert get_in(read_execution, ["result", "status"]) == "executed"
-    assert get_in(read_execution, ["result", "tool_execution", "tool_name"]) == "read_file"
+    assert get_in(read_execution, ["result", "action_execution", "action"]) == "read"
 
-    assert get_in(read_execution, ["result", "tool_execution", "result", "content"]) ==
+    assert get_in(read_execution, ["result", "action_execution", "result", "content"]) ==
              "Workbench context"
 
     assert {:error, unsafe_workbench_execution} =
@@ -5083,7 +6632,7 @@ defmodule HoltTest do
                task["ref"],
                "use_workbench",
                Map.merge(session_attrs, %{
-                 "tool_name" => "write_file",
+                 "action" => "write",
                  "arguments" => %{"path" => "blocked.txt", "content" => "blocked"}
                }),
                workspace: workspace
@@ -5091,9 +6640,40 @@ defmodule HoltTest do
 
     assert unsafe_workbench_execution["status"] == "error"
     assert unsafe_workbench_execution["reason"] == "unsafe_nested_effect_scope:workspace_durable"
+
+    assert {:error, legacy_workbench_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "use_workbench",
+               Map.merge(session_attrs, %{
+                 "action_name" => "read",
+                 "arguments" => %{"path" => "WORKBENCH.md"}
+               }),
+               workspace: workspace
+             )
+
+    assert legacy_workbench_execution["status"] == "error"
+    assert legacy_workbench_execution["reason"] == "unsupported_argument:action_name"
+
+    assert {:error, legacy_session_execution} =
+             Tasks.execute_task_action(
+               task["ref"],
+               "todo_read",
+               %{
+                 "session" => %{
+                   "todos" => [
+                     %{"content" => "Rejected session alias", "status" => "pending"}
+                   ]
+                 }
+               },
+               workspace: workspace
+             )
+
+    assert legacy_session_execution["status"] == "error"
+    assert legacy_session_execution["reason"] == "unsupported_argument:session"
   end
 
-  test "stdio executes task tools through the action layer" do
+  test "stdio executes task actions through the action layer" do
     %{home: home, workspace: workspace} = tmp_env()
     Config.bootstrap(home: home)
     Workspace.init(workspace)
@@ -5105,10 +6685,10 @@ defmodule HoltTest do
     assert %{"ok" => true, "result" => bridge_execution} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "tasks/execute_tool",
+                 "method" => "tasks/execute_action",
                  "params" => %{
                    "ref" => task["ref"],
-                   "tool_name" => "add_label",
+                   "action" => "add_label",
                    "arguments" => %{"name" => "bridge-action"}
                  }
                },
@@ -5128,10 +6708,10 @@ defmodule HoltTest do
     assert %{"ok" => true, "result" => comment_execution} =
              Bridge.Stdio.handle_request(
                %{
-                 "method" => "tasks/execute_tool",
+                 "method" => "tasks/execute_action",
                  "params" => %{
                    "ref" => task["ref"],
-                   "tool_name" => "add_comment",
+                   "action" => "add_comment",
                    "arguments" => %{"body" => "via bridge action"}
                  }
                },
@@ -5153,6 +6733,59 @@ defmodule HoltTest do
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{home: home, workspace: workspace}
+  end
+
+  defp mob_colleague_attrs do
+    %{
+      "groundwork_agent_id" => "agent_worker",
+      "colleague_agent" => %{
+        "agent_id" => "agent_mob_ui",
+        "display_name" => "Mob UI Reviewer",
+        "description" => "Observes implementation work and leaves course-correction comments.",
+        "agent_handle" => "mob-ui",
+        "work_roles" => ["observer", "reviewer", "verifier"],
+        "default_work_role" => "reviewer",
+        "instructions" =>
+          "Observe the current task like a mob programming colleague. Inspect task context, check documentation, and write concise task comments that help the worker adjust course before they finish.",
+        "skills" => [
+          %{
+            "id" => "live_ui_review",
+            "name" => "Live UI review",
+            "description" => "Reviews implementation direction while work is underway.",
+            "action_names" => ["get_task", "load_teammate_runtime", "add_comment"]
+          }
+        ],
+        "capabilities" => ["documentation_review", "course_correction", "post_work_review"]
+      },
+      "setup_task" => %{
+        "title" => "Set up Mob UI Reviewer",
+        "description" => "Create the specialist profile and attach it to this task flow."
+      },
+      "observation_task" => %{
+        "title" => "Observe current implementation",
+        "description" =>
+          "Watch the parent task while groundwork is running, inspect task context and docs, and write feedback comments to the parent task."
+      },
+      "observation_message" =>
+        "Observe the parent task on the fly. Check documentation and task runtime, then comment early when the worker should adjust course.",
+      "review_task" => %{
+        "title" => "Review completed groundwork",
+        "description" =>
+          "Review the parent task output after the groundwork agent completes and identify quality gaps."
+      },
+      "review_message" =>
+        "Review the completed groundwork for the parent task. Compare against the live comments and documentation, then report concrete quality gaps.",
+      "documentation_sources" => ["docs/ui-review.md", "AGENTS.md"],
+      "collaboration_comments" => [
+        %{
+          "phase" => "groundwork",
+          "priority" => "high",
+          "topic" => "density",
+          "body" =>
+            "Keep the dashboard dense and operational. Prefer small reviewable changes over broad visual rewrites."
+        }
+      ]
+    }
   end
 
   defp assert_event_types(actual_events, expected_events) do
@@ -5191,12 +6824,18 @@ defmodule HoltTest do
   defp flatten_agent_event_tree(nil), do: []
 
   defp flatten_agent_event_tree(node) when is_map(node) do
-    [node | Enum.flat_map(node["children"] || [], &flatten_agent_event_tree/1)]
+    [node | Enum.flat_map(agent_event_children(node), &flatten_agent_event_tree/1)]
   end
 
   defp graph_node(graph, node_key) do
-    Enum.find(graph["nodes"] || [], &(&1["node_key"] == node_key))
+    Enum.find(graph_nodes(graph), &(&1["node_key"] == node_key))
   end
+
+  defp agent_event_children(%{"children" => children}) when is_list(children), do: children
+  defp agent_event_children(_node), do: []
+
+  defp graph_nodes(%{"nodes" => nodes}) when is_list(nodes), do: nodes
+  defp graph_nodes(_graph), do: []
 
   defp blocker_codes(graph) do
     graph

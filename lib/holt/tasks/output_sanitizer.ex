@@ -108,8 +108,11 @@ defmodule Holt.Tasks.OutputSanitizer do
   defp internal_payload?(_value, depth) when depth > 4, do: false
 
   defp internal_payload?(map, depth) when is_map(map) do
-    has_any_key?(map, @internal_payload_keys) or
-      Enum.any?(Map.values(map), &internal_payload?(&1, depth + 1))
+    cond do
+      has_any_key?(map, @internal_payload_keys) -> true
+      Enum.any?(Map.values(map), &internal_payload?(&1, depth + 1)) -> true
+      true -> false
+    end
   end
 
   defp internal_payload?(list, depth) when is_list(list) do

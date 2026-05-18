@@ -7,14 +7,17 @@ defmodule Holt.Models do
 
   def default_provider(home) do
     providers = Config.load_providers(home)
-    provider_id = providers["default_provider"] || "local"
+    provider_id = provider_config_value(providers, "default_provider", "local")
     provider(home, provider_id)
   end
 
   def provider(home, provider_id) do
     providers = Config.load_providers(home)
-    provider = get_in(providers, ["providers", provider_id]) || %{"type" => "local"}
-    Map.put(provider, "id", provider_id)
+
+    case get_in(providers, ["providers", provider_id]) do
+      provider when is_map(provider) -> Map.put(provider, "id", provider_id)
+      _missing -> %{"id" => provider_id, "type" => "unknown"}
+    end
   end
 
   def validate(%{"type" => "local"}), do: :ok
@@ -47,12 +50,12 @@ defmodule Holt.Models do
 
   def list_models(%{"type" => "local"}), do: {:ok, ["local-planner"]}
 
-  def list_models(%{"type" => "openai", "model" => model}) do
-    {:ok, [model || "gpt-5.2"]}
+  def list_models(%{"type" => "openai"} = provider) do
+    {:ok, [provider_model(provider, "gpt-5.2")]}
   end
 
-  def list_models(%{"type" => "openrouter", "model" => model}) do
-    {:ok, [model || "openai/gpt-4o-mini"]}
+  def list_models(%{"type" => "openrouter"} = provider) do
+    {:ok, [provider_model(provider, "moonshotai/kimi-k2.6")]}
   end
 
   def list_models(%{"type" => "ollama", "base_url" => url}) do
@@ -103,8 +106,8 @@ defmodule Holt.Models do
 
     {:ok,
      %{
-       "provider" => provider["id"] || "local",
-       "model" => provider["model"] || "local-planner",
+       "provider" => provider_id(provider, "local"),
+       "model" => provider_model(provider, "local-planner"),
        "content" => "Local planner received: #{latest_user}"
      }}
   end
@@ -112,7 +115,7 @@ defmodule Holt.Models do
   defp do_chat(%{"type" => "openai", "api_key_env" => env} = provider, messages, opts) do
     case System.get_env(env) do
       api_key when is_binary(api_key) and api_key != "" ->
-        body = chat_body(provider["model"] || "gpt-5.2", messages, opts)
+        body = chat_body(provider_model(provider, "gpt-5.2"), messages, opts)
 
         "https://api.openai.com/v1/chat/completions"
         |> Req.post(auth: {:bearer, api_key}, json: body, receive_timeout: 60_000)
@@ -143,7 +146,7 @@ defmodule Holt.Models do
     url
     |> url_with_path("api/chat")
     |> Req.post(
-      json: chat_body(provider["model"] || "llama3.1", messages, opts),
+      json: chat_body(provider_model(provider, "llama3.1"), messages, opts),
       receive_timeout: 60_000
     )
     |> normalize_provider_response(provider, "ollama")
@@ -152,34 +155,62 @@ defmodule Holt.Models do
   defp do_chat(provider, _messages, _opts), do: {:error, {:unknown_provider, provider["type"]}}
 
   defp openrouter_body(provider, messages, opts) do
-    model = provider["model"] || "openai/gpt-4o-mini"
+    model = provider_model(provider, "moonshotai/kimi-k2.6")
 
     model
     |> chat_body(messages, opts)
-    |> Map.put(:max_tokens, provider["max_tokens"] || 1_200)
-    |> Map.put(:temperature, provider["temperature"] || 0.2)
+    |> Map.put(:max_tokens, provider_number(provider, "max_tokens", 1_200))
+    |> Map.put(:temperature, provider_number(provider, "temperature", 0.2))
+    |> maybe_put(:reasoning, openrouter_reasoning(provider))
   end
+
+  defp openrouter_reasoning(%{"reasoning" => false}), do: nil
+  defp openrouter_reasoning(%{"reasoning" => %{} = reasoning}), do: reasoning
+  defp openrouter_reasoning(_provider), do: %{"enabled" => true, "exclude" => false}
 
   defp chat_body(model, messages, opts) do
     %{
       model: model,
-      messages: messages,
+      messages: provider_messages(messages),
       stream: false
     }
-    |> maybe_put(:tools, opts[:tools])
+    |> maybe_put(:tools, opts[:actions])
     |> maybe_put(:tool_choice, opts[:tool_choice])
   end
 
+  defp provider_messages(messages) when is_list(messages) do
+    Enum.map(messages, &provider_message/1)
+  end
+
+  defp provider_message(%{"role" => "action"} = message) do
+    message
+    |> Map.put("role", "tool")
+    |> Map.take(["role", "tool_call_id", "content"])
+  end
+
+  defp provider_message(message), do: message
+
   defp normalize_chat_message(provider, provider_type, message, body) do
     %{
-      "provider" => provider["id"] || provider_type,
-      "model" => provider["model"],
-      "content" => message["content"] || "",
-      "tool_calls" => normalize_tool_calls(message["tool_calls"] || []),
+      "provider" => provider_id(provider, provider_type),
+      "model" => provider_model(provider, provider_default_model(provider_type)),
+      "content" => message_content(message),
+      "tool_calls" => normalize_tool_calls(Map.get(message, "tool_calls", [])),
       "finish_reason" => get_in(body, ["choices", Access.at(0), "finish_reason"])
     }
+    |> maybe_put("reasoning", reasoning_text(message))
+    |> maybe_put("reasoning_details", normalize_reasoning_details(message["reasoning_details"]))
     |> reject_empty()
   end
+
+  defp reasoning_text(%{"reasoning" => reasoning}) when is_binary(reasoning), do: reasoning
+  defp reasoning_text(_message), do: nil
+
+  defp normalize_reasoning_details(details) when is_list(details) do
+    Enum.filter(details, &is_map/1)
+  end
+
+  defp normalize_reasoning_details(_details), do: []
 
   defp normalize_provider_response({:error, reason}, _provider, _provider_type),
     do: {:error, reason}
@@ -223,10 +254,10 @@ defmodule Holt.Models do
       %{"function" => %{} = function} = call ->
         %{
           "id" => call["id"],
-          "type" => call["type"] || "function",
+          "type" => tool_call_type(call),
           "function" => %{
             "name" => function["name"],
-            "arguments" => function["arguments"] || "{}"
+            "arguments" => tool_call_arguments(function)
           }
         }
         |> reject_empty()
@@ -243,8 +274,8 @@ defmodule Holt.Models do
 
   defp openrouter_headers(provider) do
     [
-      {"HTTP-Referer", provider["http_referer"] || "https://holtworks.ai"},
-      {"X-Title", provider["app_title"] || "Holt"}
+      {"HTTP-Referer", provider_config_value(provider, "http_referer", "https://holtworks.ai")},
+      {"X-Title", provider_config_value(provider, "app_title", "Holt")}
     ]
   end
 
@@ -284,6 +315,45 @@ defmodule Holt.Models do
           receive_timeout: 60_000
         )
     end
+  end
+
+  defp provider_id(provider, default) do
+    provider_config_value(provider, "id", default)
+  end
+
+  defp provider_model(provider, default) do
+    provider_config_value(provider, "model", default)
+  end
+
+  defp provider_default_model("openai"), do: "gpt-5.2"
+  defp provider_default_model("openrouter"), do: "moonshotai/kimi-k2.6"
+  defp provider_default_model("ollama"), do: "llama3.1"
+  defp provider_default_model(_provider_type), do: "local-planner"
+
+  defp provider_config_value(provider, key, default) do
+    case Map.get(provider, key) do
+      value when value in [nil, ""] -> default
+      value -> value
+    end
+  end
+
+  defp provider_number(provider, key, default) do
+    case Map.get(provider, key) do
+      value when is_number(value) -> value
+      _missing -> default
+    end
+  end
+
+  defp message_content(message) do
+    provider_config_value(message, "content", "")
+  end
+
+  defp tool_call_type(call) do
+    provider_config_value(call, "type", "function")
+  end
+
+  defp tool_call_arguments(function) do
+    provider_config_value(function, "arguments", "{}")
   end
 
   defp maybe_put(map, _key, value) when value in [nil, "", []], do: map

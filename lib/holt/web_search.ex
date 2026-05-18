@@ -6,28 +6,23 @@ defmodule Holt.WebSearch do
   access. The default provider uses Tavily when `TAVILY_API_KEY` is available.
   """
 
-  alias Holt.Tasks.RuntimeContracts
-
   @max_result_bytes 8_000
 
   def search_web(args, opts \\ [])
 
   def search_web(args, opts) when is_map(args) do
-    args = RuntimeContracts.string_keys(args)
-    query = string_value(args, "query")
+    with :ok <- canonical_args(args),
+         {:ok, query} <- required_text(args, "query") do
+      cond do
+        is_function(opts[:web_search], 2) ->
+          opts[:web_search].(args, opts) |> normalize_result(query)
 
-    cond do
-      query in [nil, ""] ->
-        {:error, :query_required}
+        is_function(opts[:web_search], 1) ->
+          opts[:web_search].(args) |> normalize_result(query)
 
-      is_function(opts[:web_search], 2) ->
-        opts[:web_search].(args, opts) |> normalize_result(query)
-
-      is_function(opts[:web_search], 1) ->
-        opts[:web_search].(args) |> normalize_result(query)
-
-      true ->
-        tavily_search(query, args, opts)
+        true ->
+          tavily_search(query, args, opts)
+      end
     end
   end
 
@@ -77,11 +72,10 @@ defmodule Holt.WebSearch do
   end
 
   defp normalize_search_payload(query, payload) when is_map(payload) do
-    payload = RuntimeContracts.string_keys(payload)
     answer = string_value(payload, "answer")
-    results = normalize_results(payload["results"] || payload["items"] || [])
+    results = normalize_results(Map.get(payload, "results", []))
     source_urls = source_urls(results, payload)
-    text = string_value(payload, "text") || format_results(query, answer, results)
+    text = result_text(payload, query, answer, results)
 
     %{
       "query" => query,
@@ -90,7 +84,7 @@ defmodule Holt.WebSearch do
       "source_urls" => source_urls,
       "text" => truncate(text)
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp normalize_search_payload(query, _payload) do
@@ -106,15 +100,13 @@ defmodule Holt.WebSearch do
   defp normalize_results(_results), do: []
 
   defp normalize_result_row(result) when is_map(result) do
-    result = RuntimeContracts.string_keys(result)
-
     %{
       "title" => string_value(result, "title"),
       "url" => string_value(result, "url"),
-      "content" => string_value(result, "content") || string_value(result, "snippet"),
+      "content" => string_value(result, "content"),
       "score" => result["score"]
     }
-    |> RuntimeContracts.reject_empty()
+    |> reject_empty()
   end
 
   defp normalize_result_row(_result), do: %{}
@@ -150,9 +142,9 @@ defmodule Holt.WebSearch do
       |> Enum.with_index(1)
       |> Enum.map_join("\n", fn {result, index} ->
         [
-          "### #{index}. #{result["title"] || "Untitled result"}",
-          result["content"] || "",
-          "Source: #{result["url"] || "unknown"}"
+          "### #{index}. #{result_title(result)}",
+          result_content(result),
+          "Source: #{result_url(result)}"
         ]
         |> Enum.join("\n")
       end)
@@ -170,11 +162,54 @@ defmodule Holt.WebSearch do
   end
 
   defp max_results(args) do
-    case RuntimeContracts.integer(args["max_results"]) do
+    case args["max_results"] do
       value when value in 1..10 -> value
       _value -> 5
     end
   end
+
+  defp result_text(payload, query, answer, results) do
+    case string_value(payload, "text") do
+      nil -> format_results(query, answer, results)
+      text -> text
+    end
+  end
+
+  defp result_title(%{"title" => title}) when is_binary(title) and title != "",
+    do: title
+
+  defp result_title(_result), do: "Untitled result"
+
+  defp result_content(%{"content" => content}) when is_binary(content), do: content
+  defp result_content(_result), do: ""
+
+  defp result_url(%{"url" => url}) when is_binary(url) and url != "", do: url
+  defp result_url(_result), do: "unknown"
+
+  defp required_text(map, key) do
+    case string_value(map, key) do
+      nil -> {:error, :query_required}
+      value -> {:ok, value}
+    end
+  end
+
+  defp canonical_args(args) do
+    if canonical_value?(args) do
+      :ok
+    else
+      {:error, :invalid_search_arguments}
+    end
+  end
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      {_key, _nested} -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
 
   defp string_value(map, key) do
     case map[key] do
@@ -185,5 +220,11 @@ defmodule Holt.WebSearch do
       _value ->
         nil
     end
+  end
+
+  defp reject_empty(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
   end
 end

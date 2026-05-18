@@ -4,7 +4,6 @@ defmodule Holt.Memory do
   """
 
   alias Holt.{Clock, JSON, Paths, TextMatch}
-  alias Holt.Tasks.RuntimeContracts
 
   @user_categories ~w(preference fact context goal)
   @project_categories ~w(design content structure general)
@@ -20,7 +19,7 @@ defmodule Holt.Memory do
 
     entry =
       %{
-        "schema_version" => "holtworks_memory/v1",
+        "schema_version" => "holt_memory/v1",
         "id" => Clock.id("mem"),
         "kind" => to_string(kind),
         "text" => to_string(text),
@@ -40,7 +39,7 @@ defmodule Holt.Memory do
     |> facts_path()
     |> JSON.read_jsonl()
     |> Enum.filter(fn entry ->
-      TextMatch.matches?(Map.get(entry, "text", ""), query)
+      TextMatch.matches?(entry_text(entry, "text"), query)
     end)
   end
 
@@ -54,16 +53,16 @@ defmodule Holt.Memory do
   def remember_user(attrs, opts \\ [])
 
   def remember_user(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, summary} <- required_text(attrs, "summary"),
-         {:ok, category} <- enum_value(attrs, "category", @user_categories, "fact") do
+    with :ok <- canonical_attrs(attrs),
+         {:ok, summary} <- required_text(attrs, "summary"),
+         {:ok, category} <- required_enum(attrs, "category", @user_categories),
+         {:ok, user_id} <- optional_text(attrs, "user_id") do
       entry =
         %{
-          "schema_version" => "holtworks_user_memory/v1",
+          "schema_version" => "holt_user_memory/v1",
           "id" => Clock.id("user_mem"),
           "scope" => "user",
-          "user_id" => scoped_id(attrs, opts, "user_id", :user_id, "local_user"),
+          "user_id" => scoped_id(user_id, "local_user"),
           "category" => category,
           "summary" => summary,
           "created_at" => Clock.iso_now()
@@ -82,39 +81,46 @@ defmodule Holt.Memory do
   def remember_user(_attrs, _opts), do: {:error, :invalid_user_memory}
 
   def list_user(attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    user_id = scoped_id(attrs, opts, "user_id", :user_id, "local_user")
-    category = optional_enum(attrs, "category", @user_categories)
+    with :ok <- canonical_attrs(attrs),
+         {:ok, category} <- optional_enum(attrs, "category", @user_categories),
+         {:ok, user_id} <- optional_text(attrs, "user_id") do
+      scoped_user_id = scoped_id(user_id, "local_user")
 
-    opts
-    |> Paths.workspace_root()
-    |> user_memory_path()
-    |> JSON.read_jsonl()
-    |> Enum.filter(&(&1["user_id"] == user_id))
-    |> filter_exact("category", category)
+      opts
+      |> Paths.workspace_root()
+      |> user_memory_path()
+      |> JSON.read_jsonl()
+      |> Enum.filter(&(&1["user_id"] == scoped_user_id))
+      |> filter_exact("category", category)
+    end
   end
 
   def search_user(attrs, opts \\ []) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    query = text(attrs, "query")
+    with :ok <- canonical_attrs(attrs),
+         {:ok, query} <- required_text(attrs, "query") do
+      case list_user(attrs, opts) do
+        memories when is_list(memories) ->
+          Enum.filter(memories, &TextMatch.matches?(entry_text(&1, "summary"), query))
 
-    attrs
-    |> list_user(opts)
-    |> Enum.filter(&TextMatch.matches?(&1["summary"] || "", query || ""))
+        {:error, _reason} = error ->
+          error
+      end
+    end
   end
 
   def forget_user(attrs, opts \\ []) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, substring} <- required_text(attrs, "substring") do
+    with :ok <- canonical_attrs(attrs),
+         {:ok, substring} <- required_text(attrs, "substring"),
+         {:ok, user_id} <- optional_text(attrs, "user_id") do
       root = Paths.workspace_root(opts)
       path = user_memory_path(root)
-      user_id = scoped_id(attrs, opts, "user_id", :user_id, "local_user")
+      scoped_user_id = scoped_id(user_id, "local_user")
       memories = JSON.read_jsonl(path)
 
       {forgotten, kept} =
         Enum.split_with(memories, fn entry ->
-          entry["user_id"] == user_id and TextMatch.matches?(entry["summary"] || "", substring)
+          entry["user_id"] == scoped_user_id and
+            TextMatch.matches?(entry_text(entry, "summary"), substring)
         end)
 
       rewrite_jsonl(path, kept)
@@ -125,10 +131,9 @@ defmodule Holt.Memory do
   def remember_project(attrs, opts \\ [])
 
   def remember_project(attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, summary} <- required_text(attrs, "summary"),
-         {:ok, category} <- enum_value(attrs, "category", @project_categories, "general") do
+    with :ok <- canonical_attrs(attrs),
+         {:ok, summary} <- required_text(attrs, "summary"),
+         {:ok, category} <- required_enum(attrs, "category", @project_categories) do
       save_project_entry(
         %{
           "kind" => "note",
@@ -151,34 +156,36 @@ defmodule Holt.Memory do
     do: save_project_long_form("research", attrs, opts)
 
   def recall_project(attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    project_id = scoped_id(attrs, opts, "project_id", :project_id, "local_project")
-    query = text(attrs, "query")
-    kind = optional_enum(attrs, "kind", @project_kinds)
-    limit = clamp_limit(attrs["limit"], 10, 30)
-
-    opts
-    |> Paths.workspace_root()
-    |> project_memory_path()
-    |> JSON.read_jsonl()
-    |> Enum.filter(&(&1["project_id"] == project_id))
-    |> filter_exact("kind", kind)
-    |> filter_query(query)
-    |> Enum.take(limit)
-    |> Enum.map(&project_memory_summary/1)
-  end
-
-  def read_project(attrs, opts \\ []) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, id} <- required_text(attrs, "id") do
-      project_id = scoped_id(attrs, opts, "project_id", :project_id, "local_project")
+    with :ok <- canonical_attrs(attrs),
+         {:ok, kind} <- optional_enum(attrs, "kind", @project_kinds),
+         {:ok, limit} <- optional_limit(attrs, "limit", 10, 30),
+         {:ok, project_id} <- optional_text(attrs, "project_id"),
+         {:ok, query} <- optional_text(attrs, "query") do
+      scoped_project_id = scoped_id(project_id, "local_project")
 
       opts
       |> Paths.workspace_root()
       |> project_memory_path()
       |> JSON.read_jsonl()
-      |> Enum.find(&(&1["id"] == id and &1["project_id"] == project_id))
+      |> Enum.filter(&(&1["project_id"] == scoped_project_id))
+      |> filter_exact("kind", kind)
+      |> filter_query(query)
+      |> Enum.take(limit)
+      |> Enum.map(&project_memory_summary/1)
+    end
+  end
+
+  def read_project(attrs, opts \\ []) when is_map(attrs) do
+    with :ok <- canonical_attrs(attrs),
+         {:ok, id} <- required_text(attrs, "id"),
+         {:ok, project_id} <- optional_text(attrs, "project_id") do
+      scoped_project_id = scoped_id(project_id, "local_project")
+
+      opts
+      |> Paths.workspace_root()
+      |> project_memory_path()
+      |> JSON.read_jsonl()
+      |> Enum.find(&(&1["id"] == id and &1["project_id"] == scoped_project_id))
       |> case do
         nil -> {:error, :project_memory_not_found}
         entry -> {:ok, entry}
@@ -205,11 +212,11 @@ defmodule Holt.Memory do
   end
 
   defp save_project_long_form(kind, attrs, opts) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-
-    with {:ok, title} <- required_text(attrs, "title"),
+    with :ok <- canonical_attrs(attrs),
+         {:ok, title} <- required_text(attrs, "title"),
          {:ok, body} <- required_text(attrs, "body"),
-         {:ok, category} <- enum_value(attrs, "category", @project_categories, "general") do
+         {:ok, category} <- required_enum(attrs, "category", @project_categories),
+         {:ok, sources} <- optional_string_list(attrs, "sources") do
       save_project_entry(
         %{
           "kind" => kind,
@@ -217,7 +224,7 @@ defmodule Holt.Memory do
           "title" => title,
           "summary" => String.slice(body, 0, 240),
           "body" => body,
-          "sources" => string_list(attrs, "sources")
+          "sources" => sources
         },
         attrs,
         opts
@@ -228,23 +235,25 @@ defmodule Holt.Memory do
   defp save_project_long_form(_kind, _attrs, _opts), do: {:error, :invalid_project_memory}
 
   defp save_project_entry(entry_attrs, attrs, opts) do
-    entry =
-      entry_attrs
-      |> Map.merge(%{
-        "schema_version" => "holtworks_project_memory/v1",
-        "id" => Clock.id("project_mem"),
-        "scope" => "project",
-        "project_id" => scoped_id(attrs, opts, "project_id", :project_id, "local_project"),
-        "created_at" => Clock.iso_now()
-      })
-      |> reject_empty()
+    with {:ok, project_id} <- optional_text(attrs, "project_id") do
+      entry =
+        entry_attrs
+        |> Map.merge(%{
+          "schema_version" => "holt_project_memory/v1",
+          "id" => Clock.id("project_mem"),
+          "scope" => "project",
+          "project_id" => scoped_id(project_id, "local_project"),
+          "created_at" => Clock.iso_now()
+        })
+        |> reject_empty()
 
-    opts
-    |> Paths.workspace_root()
-    |> project_memory_path()
-    |> JSON.append_jsonl(entry)
+      opts
+      |> Paths.workspace_root()
+      |> project_memory_path()
+      |> JSON.append_jsonl(entry)
 
-    {:ok, entry}
+      {:ok, entry}
+    end
   end
 
   defp project_memory_summary(entry) do
@@ -259,7 +268,7 @@ defmodule Holt.Memory do
       "sources",
       "created_at"
     ])
-    |> Map.put("snippet", String.slice(entry["body"] || entry["summary"] || "", 0, 300))
+    |> Map.put("snippet", String.slice(entry_text(entry, "body"), 0, 300))
     |> reject_empty()
   end
 
@@ -267,9 +276,9 @@ defmodule Holt.Memory do
 
   defp filter_query(entries, query) do
     Enum.filter(entries, fn entry ->
-      TextMatch.matches?(entry["title"] || "", query) or
-        TextMatch.matches?(entry["summary"] || "", query) or
-        TextMatch.matches?(entry["body"] || "", query)
+      Enum.any?(["title", "summary", "body"], fn field ->
+        TextMatch.matches?(entry_text(entry, field), query)
+      end)
     end)
   end
 
@@ -288,20 +297,36 @@ defmodule Holt.Memory do
     :ok
   end
 
-  defp scoped_id(attrs, opts, string_key, atom_key, default) do
-    text(attrs, string_key) || opts[atom_key] || default
-  end
-
-  defp required_text(attrs, key) do
-    case text(attrs, key) do
-      nil -> {:error, "#{key}_required"}
-      value -> {:ok, value}
+  defp scoped_id(value, default) do
+    case value do
+      nil -> default
+      scoped_value -> scoped_value
     end
   end
 
-  defp enum_value(attrs, key, allowed, default) do
-    value = text(attrs, key) || default
+  defp required_text(attrs, key) do
+    case optional_text(attrs, key) do
+      {:ok, nil} -> {:error, "#{key}_required"}
+      {:ok, value} -> {:ok, value}
+      {:error, _reason} = error -> error
+    end
+  end
 
+  defp required_enum(attrs, key, allowed) do
+    with {:ok, value} <- required_text(attrs, key) do
+      validate_enum(value, key, allowed)
+    end
+  end
+
+  defp optional_enum(attrs, key, allowed) do
+    case optional_text(attrs, key) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, value} -> validate_enum(value, key, allowed)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_enum(value, key, allowed) do
     if value in allowed do
       {:ok, value}
     else
@@ -309,46 +334,85 @@ defmodule Holt.Memory do
     end
   end
 
-  defp optional_enum(attrs, key, allowed) do
-    case text(attrs, key) do
-      nil -> nil
-      value -> if(value in allowed, do: value)
+  defp optional_text(attrs, key) do
+    case Map.fetch(attrs, key) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, value} when is_binary(value) ->
+        value = String.trim(value)
+
+        case value do
+          "" -> {:ok, nil}
+          trimmed -> {:ok, trimmed}
+        end
+
+      {:ok, _value} ->
+        {:error, "#{key}_invalid"}
     end
   end
 
-  defp text(attrs, key) do
-    case attrs[key] do
+  defp entry_text(entry, key) do
+    case entry[key] do
       value when is_binary(value) ->
-        value = String.trim(value)
-        if value == "", do: nil, else: value
+        value
 
       _value ->
-        nil
+        ""
     end
   end
 
-  defp string_list(attrs, key) do
-    attrs
-    |> Map.get(key, [])
-    |> List.wrap()
-    |> Enum.filter(&is_binary/1)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.uniq()
+  defp optional_string_list(attrs, key) do
+    case Map.fetch(attrs, key) do
+      :error ->
+        {:ok, []}
+
+      {:ok, values} when is_list(values) ->
+        strings =
+          values
+          |> Enum.filter(&is_binary/1)
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.uniq()
+
+        if length(strings) == length(values) do
+          {:ok, strings}
+        else
+          {:error, "#{key}_invalid"}
+        end
+
+      {:ok, _value} ->
+        {:error, "#{key}_invalid"}
+    end
   end
 
   defp title_from_summary(summary), do: String.slice(summary, 0, 80)
 
-  defp clamp_limit(value, _default, max) when is_integer(value), do: value |> max(1) |> min(max)
-
-  defp clamp_limit(value, default, max) when is_binary(value) do
-    case Integer.parse(value) do
-      {integer, ""} -> clamp_limit(integer, default, max)
-      _other -> default
+  defp optional_limit(attrs, key, default, max) do
+    case Map.fetch(attrs, key) do
+      :error -> {:ok, default}
+      {:ok, value} when is_integer(value) -> {:ok, value |> max(1) |> min(max)}
+      {:ok, _value} -> {:error, "#{key}_invalid"}
     end
   end
 
-  defp clamp_limit(_value, default, _max), do: default
+  defp canonical_attrs(attrs) do
+    if canonical_map?(attrs) do
+      :ok
+    else
+      {:error, :invalid_memory_attrs}
+    end
+  end
+
+  defp canonical_map?(attrs) do
+    Enum.all?(attrs, fn {key, value} ->
+      is_binary(key) and canonical_value?(value)
+    end)
+  end
+
+  defp canonical_value?(value) when is_map(value), do: canonical_map?(value)
+  defp canonical_value?(values) when is_list(values), do: Enum.all?(values, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
 
   defp reject_empty(map) do
     map

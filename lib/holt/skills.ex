@@ -4,7 +4,6 @@ defmodule Holt.Skills do
   """
 
   alias Holt.{Clock, Paths, TextMatch}
-  alias Holt.Tasks.RuntimeContracts
 
   def list(opts \\ []) do
     home = Paths.home(opts)
@@ -28,46 +27,43 @@ defmodule Holt.Skills do
   end
 
   def search(params \\ %{}, opts \\ []) do
-    query =
-      params
-      |> RuntimeContracts.string_keys()
-      |> Map.get("query", "")
-      |> to_string()
-      |> String.downcase()
+    with {:ok, params} <- canonical_params(params) do
+      query =
+        params
+        |> Map.get("query", "")
+        |> to_string()
+        |> String.downcase()
 
-    opts
-    |> list()
-    |> Enum.filter(fn skill ->
-      query == "" or
-        String.contains?(String.downcase(skill.name), query) or
-        String.contains?(String.downcase(skill.description), query) or
-        String.contains?(String.downcase(Enum.join(skill.triggers, " ")), query)
-    end)
-    |> Enum.map(&skill_summary/1)
+      opts
+      |> list()
+      |> Enum.filter(&skill_matches_query?(&1, query))
+      |> Enum.map(&skill_summary/1)
+    else
+      {:error, _reason} -> []
+    end
   end
 
   def load(params, opts \\ []) when is_map(params) do
-    params = RuntimeContracts.string_keys(params)
-    slug = text(params, "slug") || text(params, "name")
-
-    opts
-    |> list()
-    |> Enum.find(&(skill_slug(&1.name) == skill_slug(slug) or &1.name == slug))
-    |> case do
-      nil -> {:error, :skill_not_found}
-      skill -> {:ok, skill_payload(skill)}
+    with {:ok, params} <- canonical_params(params),
+         {:ok, slug} <- required_text(params, "slug") do
+      opts
+      |> list()
+      |> Enum.find(&(skill_slug(&1.name) == skill_slug(slug)))
+      |> case do
+        nil -> {:error, :skill_not_found}
+        skill -> {:ok, skill_payload(skill)}
+      end
     end
   end
 
   def save(params, opts \\ [])
 
   def save(params, opts) when is_map(params) do
-    params = RuntimeContracts.string_keys(params)
-
-    with {:ok, name} <- required_text(params, "name"),
+    with {:ok, params} <- canonical_params(params),
+         {:ok, name} <- required_text(params, "name"),
          {:ok, description} <- required_text(params, "description"),
          {:ok, body} <- required_text(params, "body") do
-      slug = skill_slug(text(params, "slug") || name)
+      slug = skill_slug(text_default(text(params, "slug"), name))
       target = skill_path(slug, opts)
 
       if File.exists?(target) do
@@ -85,13 +81,12 @@ defmodule Holt.Skills do
   def update(params, opts \\ [])
 
   def update(params, opts) when is_map(params) do
-    params = RuntimeContracts.string_keys(params)
-
-    with {:ok, slug} <- required_text(params, "slug"),
+    with {:ok, params} <- canonical_params(params),
+         {:ok, slug} <- required_text(params, "slug"),
          {:ok, current} <- load(%{"slug" => slug}, opts) do
-      name = text(params, "name") || current["name"]
-      description = text(params, "description") || current["description"]
-      body = text(params, "body") || current["content"]
+      name = text_default(text(params, "name"), current["name"])
+      description = text_default(text(params, "description"), current["description"])
+      body = text_default(text(params, "body"), current["content"])
       target = skill_path(skill_slug(slug), opts)
       write_skill_file(target, name, description, body, params, current)
       write_scripts(skill_slug(slug), params["scripts"], opts)
@@ -104,29 +99,43 @@ defmodule Holt.Skills do
   def run_script(params, opts \\ [])
 
   def run_script(params, opts) when is_map(params) do
-    params = RuntimeContracts.string_keys(params)
-
-    with {:ok, slug} <- required_any_text(params, ["skill_slug", "slug", "name"]),
-         {:ok, script_name} <- required_any_text(params, ["script_name", "script", "path"]),
+    with {:ok, params} <- canonical_params(params),
+         {:ok, slug} <- required_text(params, "skill_slug"),
+         {:ok, script_name} <- required_text(params, "script_name"),
          {:ok, script_path} <- script_path(slug, script_name, opts) do
-      run_script_file(script_path, params["args"] || [], opts)
+      run_script_file(script_path, script_args(params), opts)
     end
   end
 
   def run_script(_params, _opts), do: {:error, :invalid_skill_script}
 
+  defp skill_matches_query?(_skill, ""), do: true
+
+  defp skill_matches_query?(skill, query) do
+    cond do
+      String.contains?(String.downcase(skill.name), query) -> true
+      String.contains?(String.downcase(skill.description), query) -> true
+      String.contains?(String.downcase(Enum.join(skill.triggers, " ")), query) -> true
+      true -> false
+    end
+  end
+
+  defp script_args(%{"args" => args}) when is_list(args), do: args
+  defp script_args(_params), do: []
+
   def parse_file(path) do
     with {:ok, body} <- File.read(path) do
       {meta, content} = parse_frontmatter(body)
+      meta = string_keyed_map(meta)
 
       %{
         path: path,
-        name: Map.get(meta, "name") || Path.basename(path, ".md"),
-        description: Map.get(meta, "description") || "",
-        triggers: Map.get(meta, "triggers") || [],
-        risk: Map.get(meta, "risk") || "read",
-        version: Map.get(meta, "version") || "1",
-        scope: Map.get(meta, "scope") || "workspace",
+        name: text_value(meta, "name", Path.basename(path, ".md")),
+        description: text_value(meta, "description", ""),
+        triggers: normalize_string_list(Map.get(meta, "triggers")),
+        risk: text_value(meta, "risk", "read"),
+        version: text_value(meta, "version", "1"),
+        scope: text_value(meta, "scope", "workspace"),
         scripts: skill_scripts(path),
         content: String.trim(content)
       }
@@ -192,12 +201,11 @@ defmodule Holt.Skills do
       |> increment_version()
 
     triggers =
-      params
-      |> Map.get("triggers", Map.get(current, "triggers", []))
+      Map.get(params, "triggers", Map.get(current, "triggers", []))
       |> normalize_string_list()
 
-    risk = text(params, "risk") || Map.get(current, "risk", "read")
-    scope = text(params, "scope") || Map.get(current, "scope", "workspace")
+    risk = text_default(text(params, "risk"), Map.get(current, "risk", "read"))
+    scope = text_default(text(params, "scope"), Map.get(current, "scope", "workspace"))
 
     frontmatter =
       [
@@ -334,15 +342,6 @@ defmodule Holt.Skills do
     end
   end
 
-  defp required_any_text(params, keys) do
-    keys
-    |> Enum.find_value(&text(params, &1))
-    |> case do
-      nil -> {:error, :required_skill_argument_missing}
-      value -> {:ok, value}
-    end
-  end
-
   defp text(params, key) do
     case params[key] do
       value when is_binary(value) ->
@@ -354,6 +353,16 @@ defmodule Holt.Skills do
     end
   end
 
+  defp text_default(nil, default), do: default
+  defp text_default(value, _default), do: value
+
+  defp text_value(params, key, default) do
+    case text(params, key) do
+      nil -> default
+      value -> value
+    end
+  end
+
   defp normalize_string_list(value) do
     value
     |> List.wrap()
@@ -362,6 +371,31 @@ defmodule Holt.Skills do
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
+
+  defp canonical_params(params) when is_map(params) do
+    case canonical_value?(params) do
+      true -> {:ok, params}
+      false -> {:error, :invalid_skill}
+    end
+  end
+
+  defp canonical_params(_params), do: {:error, :invalid_skill}
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      _entry -> false
+    end)
+  end
+
+  defp canonical_value?(values) when is_list(values), do: Enum.all?(values, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp string_keyed_map(map) when is_map(map) do
+    if Enum.all?(Map.keys(map), &is_binary/1), do: map, else: %{}
+  end
+
+  defp string_keyed_map(_map), do: %{}
 
   defp increment_version(value) do
     case Integer.parse(to_string(value)) do

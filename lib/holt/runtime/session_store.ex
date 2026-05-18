@@ -9,7 +9,7 @@ defmodule Holt.Runtime.SessionStore do
 
   alias Holt.{Clock, JSON, Paths}
 
-  @schema_version "holtworks_agent_session/v1"
+  @schema_version "holt_agent_session/v1"
   @resumable_statuses ~w(created queued running awaiting_user)
 
   def upsert(session_id, checkpoint, opts \\ [])
@@ -25,7 +25,7 @@ defmodule Holt.Runtime.SessionStore do
       |> stringify_keys()
       |> Map.put("schema_version", @schema_version)
       |> Map.put("session_id", session_id)
-      |> Map.put_new("inserted_at", existing["inserted_at"] || now)
+      |> Map.put_new("inserted_at", inserted_at(existing, now))
       |> Map.put("updated_at", now)
       |> reject_empty()
 
@@ -60,11 +60,11 @@ defmodule Holt.Runtime.SessionStore do
     |> Enum.map(&JSON.read/1)
     |> Enum.reject(&(&1 == %{}))
     |> filter_status(status)
-    |> Enum.sort_by(&(&1["updated_at"] || ""), :desc)
+    |> Enum.sort_by(&updated_at_sort_key/1, :desc)
   end
 
   def resumable(opts \\ []) do
-    statuses = opts[:statuses] || @resumable_statuses
+    statuses = resumable_statuses(opts)
     list(Keyword.put(opts, :status, statuses))
   end
 
@@ -117,6 +117,27 @@ defmodule Holt.Runtime.SessionStore do
       |> Base.url_encode64(padding: false)
 
     "session-#{digest}"
+  end
+
+  defp inserted_at(existing, now) do
+    case existing["inserted_at"] do
+      value when value in [nil, ""] -> now
+      value -> value
+    end
+  end
+
+  defp updated_at_sort_key(session) do
+    case session["updated_at"] do
+      value when value in [nil, ""] -> ""
+      value -> value
+    end
+  end
+
+  defp resumable_statuses(opts) do
+    case opts[:statuses] do
+      value when value in [nil, []] -> @resumable_statuses
+      value -> value
+    end
   end
 
   defp stringify_keys(map) do

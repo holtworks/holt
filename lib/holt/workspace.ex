@@ -4,6 +4,7 @@ defmodule Holt.Workspace do
   """
 
   alias Holt.Paths
+  @agent_instruction_file "AGENTS.md"
 
   def init(root, opts \\ []) do
     Paths.ensure_workspace(root)
@@ -12,7 +13,7 @@ defmodule Holt.Workspace do
       []
       |> maybe_write(root, "HOLT.md", default_holt(), opts)
       |> maybe_write(root, "AGENTS.md", default_agents(), opts)
-      |> maybe_write(root, "TOOLS.md", default_tools(), opts)
+      |> maybe_write(root, "ACTIONS.md", default_actions(), opts)
 
     %{
       root: root,
@@ -32,6 +33,12 @@ defmodule Holt.Workspace do
       {:ok, body} -> String.trim(body)
       _ -> ""
     end
+  end
+
+  def agent_instruction_file, do: @agent_instruction_file
+
+  def read_agent_instructions(root) do
+    read_instruction(root, @agent_instruction_file)
   end
 
   def default_holt do
@@ -55,16 +62,16 @@ defmodule Holt.Workspace do
     """
   end
 
-  def default_tools do
+  def default_actions do
     """
-    # Tools
+    # LocalActions
 
     Allowed without approval:
-    - list_files
-    - read_file
-    - search_files
-    - search_memory
-    - ask_user_question
+    - list
+    - read
+    - search
+    - recall
+    - ask
     - list_skills
     - load_skill
     - list_agents
@@ -74,10 +81,10 @@ defmodule Holt.Workspace do
     - get_repair_run
 
     Requires approval:
-    - write_file
-    - append_file
-    - run_command
-    - fetch_url
+    - write
+    - append
+    - run
+    - fetch
     - delegate_to_agent
     - set_page_title
     - create_page
@@ -111,12 +118,19 @@ defmodule Holt.Workspace do
   defp maybe_write(created, root, filename, content, opts) do
     path = Paths.workspace_file(root, filename)
 
-    if opts[:force] || not File.exists?(path) do
+    if should_write_workspace_file?(opts, path) do
       File.mkdir_p!(Path.dirname(path))
       File.write!(path, content)
       [filename | created]
     else
       created
+    end
+  end
+
+  defp should_write_workspace_file?(opts, path) do
+    case Keyword.get(opts, :force) do
+      true -> true
+      _default -> not File.exists?(path)
     end
   end
 end

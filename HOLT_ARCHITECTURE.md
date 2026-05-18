@@ -1,42 +1,66 @@
 # Holt Architecture
 
-Holt is migrating to a Rust-first agent runtime. The Rust binary owns the
-customer-facing command surface. Elixir remains as a structured backend for
-runtime services that have not moved behind typed Rust crates yet.
+Holt has two explicit boundaries:
 
-## Crate Boundaries
+- The customer-facing binary owns terminal interaction, commands, and streamed
+  presentation.
+- The Elixir backend owns supervised runs, action execution, durable event
+  logs, approvals, task state, memory, and provider adapters.
 
-- `holt-cli`: command dispatch, native `holt` binary, and structured backend
-  adapter calls.
-- `holt-tui`: terminal presentation over typed protocol events.
-- `holt-core`: agent turn orchestration and final-output contract.
-- `holt-protocol`: `TurnRequest`, `AgentEvent`, tool calls, approvals, and
-  response envelopes shared across all surfaces.
-- `holt-workspace`: repository scanning and generic context packing.
-- `holt-tools`: built-in tool registry and local tool execution.
-- `holt-policy`: approval and side-effect decisions.
-- `holt-sessions`: conversation state and recent chat context.
-- `holt-models`: model provider boundary.
-- `holt-telemetry`: trace and usage event sinks.
+The product surface should stay customer-first: users run `holt`, see progress,
+approve risky work, and get an answer. Internal runtime terms are not exposed in
+normal CLI copy.
 
-## Data Flow
+## Runtime Flow
 
 ```text
-holt-cli / holt-tui
-  -> holt-protocol::TurnRequest
-  -> holt-core::AgentEngine
-  -> holt-workspace::WorkspaceScanner
-  -> holt-tools::LocalToolExecutor
-  -> holt-policy::PolicyDecision
-  -> holt-models::ModelProvider
-  -> holt-protocol::AgentEvent stream
-  -> holt-tui renderer
+holt
+  -> native bridge request
+  -> Holt.Runtime / Holt.Runtime.RunServer
+  -> Holt.Actions.Registry
+  -> Holt.Actions.ProviderAdapter, only when a model provider needs function calls
+  -> Holt.Actions.Executor
+  -> Holt.ActionVisibility
+  -> action.* event stream
+  -> terminal renderer
 ```
 
-## Migration Rule
+## Elixir Boundaries
 
-New runtime behavior belongs in Rust crates first. The Elixir `Holt.*`
-modules are compatibility surfaces until their behavior has a typed Rust owner.
-The removed Elixir terminal modules should not be reintroduced; Rust should
-call Elixir through explicit bridge requests until the remaining behavior has a
-native Rust owner.
+- `Holt.Runtime.RunServer`: supervised process wrapper for one run.
+- `Holt.Runtime.Session`: supervised live session with streaming and user
+  response checkpoints.
+- `Holt.Runtime.RunStore`: repository for run state, event JSONL, and
+  transcripts.
+- `Holt.Runtime.AgentEventStore`: repository for agent session event JSONL.
+- `Holt.Actions.Registry`: action discovery and catalog lookup.
+- `Holt.Actions.Executor`: runtime-facing action execution API.
+- `Holt.Actions.ProviderAdapter`: provider protocol conversion. OpenAI-style
+  `tool_calls` and action result messages are contained here.
+- `Holt.ActionVisibility`: product-facing labels, summaries, risk display, and
+  approval display for action events.
+- `Holt.Bridge.NativeCommand`: request decoding and service dispatch.
+- `Holt.Bridge.NativePresenter`: CLI/log/event output rendering.
+
+## Event Contract
+
+Runtime activity uses action events:
+
+- `action.started`
+- `action.approval_requested`
+- `action.approval_resolved`
+- `action.completed`
+- `action.failed`
+
+Agent session events use `action_invocation` and `action_result`. Provider
+protocol names such as `tool_calls`, `tool_choice`, and provider result messages
+remain isolated to model-provider boundaries.
+
+## Verification
+
+The expected local gates are:
+
+```sh
+mix precommit
+cargo test --manifest-path rust/Cargo.toml
+```

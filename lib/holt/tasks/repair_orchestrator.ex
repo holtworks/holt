@@ -4,27 +4,41 @@ defmodule Holt.Tasks.RepairOrchestrator do
   """
 
   alias Holt.Clock
-  alias Holt.Tasks.RuntimeContracts
 
-  @schema_version "holtworks_repair_orchestration/v1"
+  @schema_version "holt_repair_orchestration/v1"
 
   def orchestrate(attrs \\ %{})
 
   def orchestrate(attrs) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
+    case input(attrs) do
+      {:ok, input} -> orchestrate_canonical(input)
+      {:error, reason} -> rejected_orchestration(attrs, reason)
+    end
+  end
 
-    envelope =
-      RuntimeContracts.normalize_map(
-        RuntimeContracts.value(attrs, "action_runtime_envelope") ||
-          RuntimeContracts.value(attrs, "envelope")
-      )
+  def orchestrate(_attrs), do: rejected_orchestration(%{}, "invalid_attrs")
 
-    directive =
-      RuntimeContracts.text(attrs, "repair_directive", envelope["repair_directive"] || "continue")
+  defp input(attrs) do
+    with :ok <- canonical_attrs(attrs),
+         :ok <- unsupported_arguments(attrs),
+         {:ok, envelope} <- runtime_envelope(attrs),
+         {:ok, repair_attempt} <- optional_nonnegative_integer(attrs, "repair_attempt"),
+         {:ok, max_repair_attempts} <- optional_positive_integer(attrs, "max_repair_attempts") do
+      {:ok,
+       %{
+         envelope: envelope,
+         repair_attempt: repair_attempt,
+         max_repair_attempts: max_repair_attempts
+       }}
+    end
+  end
 
-    contract = RuntimeContracts.normalize_map(envelope["action_contract"])
+  defp orchestrate_canonical(input) do
+    envelope = input.envelope
+    directive = envelope["repair_directive"]
+    contract = envelope["action_contract"]
     mode = repair_mode(directive)
-    budget = retry_budget(attrs, envelope, contract, mode)
+    budget = retry_budget(input, contract, mode)
     repair_plan = repair_plan(envelope, contract, mode, directive, budget)
     resume_gate = resume_gate(mode, budget, repair_plan)
     status = orchestration_status(mode, budget, resume_gate)
@@ -32,15 +46,15 @@ defmodule Holt.Tasks.RepairOrchestrator do
     %{
       "schema_version" => @schema_version,
       "repair_id" =>
-        RuntimeContracts.stable_id("repair", [
+        stable_id("repair", [
           envelope["envelope_id"],
           directive,
           mode,
           budget["attempts_used"]
         ]),
       "source_envelope_id" => envelope["envelope_id"],
-      "source_tool_name" => envelope["tool_name"],
-      "source_tool_call_id" => envelope["tool_call_id"],
+      "source_action" => envelope["action"],
+      "source_action_call_id" => envelope["action_call_id"],
       "directive" => directive,
       "mode" => mode,
       "status" => status,
@@ -51,10 +65,79 @@ defmodule Holt.Tasks.RepairOrchestrator do
       "memory_feedback" => memory_feedback(mode, status, envelope, repair_plan),
       "created_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
-  def orchestrate(_attrs), do: orchestrate(%{})
+  defp rejected_orchestration(attrs, reason) do
+    %{
+      "schema_version" => @schema_version,
+      "repair_id" =>
+        output_text(
+          attrs,
+          "repair_id",
+          stable_id("repair", [reason, attrs])
+        ),
+      "status" => "rejected",
+      "reason" => reason,
+      "created_at" => Clock.iso_now()
+    }
+  end
+
+  defp runtime_envelope(attrs) do
+    case Map.fetch(attrs, "action_runtime_envelope") do
+      {:ok, envelope} when is_map(envelope) ->
+        with :ok <- validate_runtime_envelope(envelope) do
+          {:ok, envelope}
+        end
+
+      {:ok, _envelope} ->
+        {:error, "invalid_action_runtime_envelope"}
+
+      :error ->
+        {:error, "invalid_action_runtime_envelope"}
+    end
+  end
+
+  defp validate_runtime_envelope(envelope) do
+    with {:ok, _envelope_id} <-
+           required_text(envelope, "envelope_id", "invalid_action_runtime_envelope"),
+         {:ok, directive} <-
+           required_text(envelope, "repair_directive", "invalid_action_runtime_envelope"),
+         :ok <- repair_directive(directive),
+         :ok <- optional_text_field(envelope, "action", "invalid_action_runtime_envelope"),
+         :ok <- optional_text_field(envelope, "action_call_id", "invalid_action_runtime_envelope"),
+         :ok <- required_map(envelope, "action_contract", "invalid_action_runtime_envelope"),
+         :ok <-
+           optional_map_field(envelope, "prediction_error", "invalid_action_runtime_envelope"),
+         :ok <-
+           optional_map_field(envelope, "state_reconciliation", "invalid_action_runtime_envelope"),
+         :ok <- validate_action_contract(envelope["action_contract"]) do
+      :ok
+    end
+  end
+
+  defp validate_action_contract(contract) do
+    with {:ok, _contract_id} <-
+           required_text(contract, "contract_id", "invalid_action_runtime_envelope"),
+         {:ok, _action} <- required_text(contract, "action", "invalid_action_runtime_envelope"),
+         {:ok, _effect_scope} <-
+           required_text(contract, "effect_scope", "invalid_action_runtime_envelope"),
+         :ok <- optional_text_field(contract, "target_domain", "invalid_action_runtime_envelope"),
+         :ok <- optional_text_field(contract, "risk_level", "invalid_action_runtime_envelope") do
+      :ok
+    end
+  end
+
+  defp repair_directive("continue"), do: :ok
+  defp repair_directive("execute_then_reconcile"), do: :ok
+  defp repair_directive("await_human_approval"), do: :ok
+  defp repair_directive("wait_for_async_state_observation"), do: :ok
+  defp repair_directive("enter_repair_phase_with_observed_error"), do: :ok
+  defp repair_directive("enter_repair_phase_with_missing_state_delta"), do: :ok
+  defp repair_directive("verify_unexpected_state_delta_before_continuing"), do: :ok
+  defp repair_directive("enter_repair_phase_with_new_prediction"), do: :ok
+  defp repair_directive("do_not_execute_replan"), do: :ok
+  defp repair_directive(_directive), do: {:error, "invalid_repair_directive"}
 
   defp repair_mode("continue"), do: "none"
   defp repair_mode("execute_then_reconcile"), do: "none"
@@ -70,15 +153,10 @@ defmodule Holt.Tasks.RepairOrchestrator do
 
   defp repair_mode("enter_repair_phase_with_new_prediction"), do: "replan_with_new_prediction"
   defp repair_mode("do_not_execute_replan"), do: "replan_before_execution"
-  defp repair_mode(_directive), do: "generic_repair"
 
-  defp retry_budget(attrs, envelope, contract, mode) do
-    attempts_used =
-      RuntimeContracts.integer(
-        RuntimeContracts.value(attrs, "repair_attempt") || envelope["repair_attempt"] || 0
-      )
-
-    max_attempts = max_attempts(attrs, contract, mode)
+  defp retry_budget(input, contract, mode) do
+    attempts_used = integer_default(input.repair_attempt, 0)
+    max_attempts = max_attempts(input.max_repair_attempts, contract, mode)
     remaining = max(max_attempts - attempts_used, 0)
 
     %{
@@ -90,18 +168,13 @@ defmodule Holt.Tasks.RepairOrchestrator do
     }
   end
 
-  defp max_attempts(_attrs, _contract, mode) when mode in ["none", "async_wait", "approval_wait"],
-    do: 0
+  defp max_attempts(_explicit, _contract, mode)
+       when mode in ["none", "async_wait", "approval_wait"],
+       do: 0
 
-  defp max_attempts(attrs, contract, _mode) do
-    explicit = RuntimeContracts.integer(RuntimeContracts.value(attrs, "max_repair_attempts"))
-
-    cond do
-      explicit > 0 -> explicit
-      contract["risk_level"] == "high" -> 1
-      true -> 2
-    end
-  end
+  defp max_attempts(explicit, _contract, _mode) when is_integer(explicit), do: explicit
+  defp max_attempts(_explicit, %{"risk_level" => "high"}, _mode), do: 1
+  defp max_attempts(_explicit, _contract, _mode), do: 2
 
   defp escalation("none", _remaining), do: "none"
   defp escalation("async_wait", _remaining), do: "wait_for_observation"
@@ -114,17 +187,17 @@ defmodule Holt.Tasks.RepairOrchestrator do
   defp repair_plan(_envelope, _contract, "approval_wait", _directive, _budget), do: nil
 
   defp repair_plan(envelope, contract, mode, directive, budget) do
-    error = RuntimeContracts.normalize_map(envelope["prediction_error"])
-    reconciliation = RuntimeContracts.normalize_map(envelope["state_reconciliation"])
+    error = optional_map_value(envelope, "prediction_error")
+    reconciliation = optional_map_value(envelope, "state_reconciliation")
 
     plan =
       %{
-        "schema_version" => "holtworks_repair_plan/v1",
+        "schema_version" => "holt_repair_plan/v1",
         "mode" => mode,
         "directive" => directive,
         "source_envelope_id" => envelope["envelope_id"],
         "source_contract_id" => contract["contract_id"],
-        "source_tool_name" => contract["tool_name"],
+        "source_action" => contract["action"],
         "effect_scope" => contract["effect_scope"],
         "target_domain" => contract["target_domain"],
         "root_cause" => %{
@@ -134,15 +207,15 @@ defmodule Holt.Tasks.RepairOrchestrator do
           "state_matched" => reconciliation["matched"],
           "state_delta_accuracy" => reconciliation["state_delta_accuracy"]
         },
-        "missing_changes" => reconciliation["missing_changes"] || [],
-        "unexpected_changes" => reconciliation["unexpected_changes"] || [],
+        "missing_changes" => list_field(reconciliation, "missing_changes"),
+        "unexpected_changes" => list_field(reconciliation, "unexpected_changes"),
         "retry_budget" => budget,
         "steps" => repair_steps(mode),
         "required_evidence" => required_evidence(mode)
       }
-      |> RuntimeContracts.reject_empty()
+      |> compact()
 
-    Map.put(plan, "repair_plan_id", RuntimeContracts.stable_id("repair_plan", [plan]))
+    Map.put(plan, "repair_plan_id", stable_id("repair_plan", [plan]))
   end
 
   defp repair_steps("repair_observed_error"),
@@ -210,7 +283,7 @@ defmodule Holt.Tasks.RepairOrchestrator do
       "status" => "open",
       "can_resume" => false,
       "reason" => "repair_must_complete_before_resume",
-      "required_evidence" => RuntimeContracts.value(plan || %{}, "required_evidence") || []
+      "required_evidence" => plan_required_evidence(plan)
     }
   end
 
@@ -225,12 +298,12 @@ defmodule Holt.Tasks.RepairOrchestrator do
     %{
       "feedback_kind" => "repair_effectiveness_seed",
       "source_envelope_id" => envelope["envelope_id"],
-      "repair_plan_id" => RuntimeContracts.value(plan || %{}, "repair_plan_id"),
+      "repair_plan_id" => repair_plan_id(plan),
       "mode" => mode,
       "status" => status,
       "effectiveness_status" => effectiveness_status(mode, status)
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp effectiveness_status("none", _status), do: "not_required"
@@ -238,4 +311,154 @@ defmodule Holt.Tasks.RepairOrchestrator do
   defp effectiveness_status(_mode, "waiting"), do: "pending_external_input"
   defp effectiveness_status(_mode, "escalation_required"), do: "escalated"
   defp effectiveness_status(_mode, _status), do: "pending"
+
+  defp plan_required_evidence(%{"required_evidence" => evidence}) when is_list(evidence),
+    do: evidence
+
+  defp plan_required_evidence(_plan), do: []
+
+  defp repair_plan_id(%{"repair_plan_id" => repair_plan_id}) when is_binary(repair_plan_id),
+    do: repair_plan_id
+
+  defp repair_plan_id(_plan), do: nil
+
+  defp list_field(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_list(value) -> value
+      _value -> []
+    end
+  end
+
+  defp canonical_attrs(attrs) do
+    case canonical_value?(attrs) do
+      true -> :ok
+      false -> {:error, "invalid_attrs"}
+    end
+  end
+
+  defp canonical_value?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      _entry -> false
+    end)
+  end
+
+  defp canonical_value?(values) when is_list(values), do: Enum.all?(values, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp unsupported_arguments(attrs) do
+    cond do
+      Map.has_key?(attrs, "envelope") -> {:error, "unsupported_argument:envelope"}
+      Map.has_key?(attrs, "repair_directive") -> {:error, "unsupported_argument:repair_directive"}
+      true -> :ok
+    end
+  end
+
+  defp required_map(map, key, reason) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_map(value) -> :ok
+      {:ok, _value} -> {:error, reason}
+      :error -> {:error, reason}
+    end
+  end
+
+  defp optional_map_value(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_map(value) -> value
+      _missing -> %{}
+    end
+  end
+
+  defp optional_map_field(map, key, reason) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_map(value) -> :ok
+      {:ok, _value} -> {:error, reason}
+      :error -> :ok
+    end
+  end
+
+  defp optional_nonnegative_integer(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
+      {:ok, _value} -> {:error, "invalid_" <> key}
+      :error -> {:ok, nil}
+    end
+  end
+
+  defp optional_positive_integer(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_integer(value) and value > 0 -> {:ok, value}
+      {:ok, _value} -> {:error, "invalid_" <> key}
+      :error -> {:ok, nil}
+    end
+  end
+
+  defp integer_default(nil, default), do: default
+  defp integer_default(value, _default), do: value
+
+  defp required_text(map, key, reason) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_binary(value) ->
+        case String.trim(value) do
+          "" -> {:error, reason}
+          text -> {:ok, text}
+        end
+
+      {:ok, _value} ->
+        {:error, reason}
+
+      :error ->
+        {:error, reason}
+    end
+  end
+
+  defp optional_text_field(map, key, reason) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_binary(value) ->
+        case String.trim(value) do
+          "" -> {:error, reason}
+          _text -> :ok
+        end
+
+      {:ok, _value} ->
+        {:error, reason}
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp output_text(map, key, default) when is_map(map) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_binary(value) -> text_default(trim_empty(value), default)
+      _missing -> default
+    end
+  end
+
+  defp output_text(_map, _key, default), do: default
+
+  defp text_default(nil, default), do: default
+  defp text_default(value, _default), do: value
+
+  defp trim_empty(value) do
+    case String.trim(value) do
+      "" -> nil
+      text -> text
+    end
+  end
+
+  defp compact(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
+  end
+
+  defp stable_id(prefix, parts) do
+    digest =
+      :crypto.hash(:sha256, :erlang.term_to_binary(parts))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    "#{prefix}_#{digest}"
+  end
 end

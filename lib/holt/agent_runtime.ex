@@ -43,10 +43,10 @@ defmodule Holt.AgentRuntime do
     StateInvariantCheck,
     StateReconciliation,
     StateTransitionPrediction,
-    TaskToolRouter,
-    TaskToolSession,
+    ActionRouter,
+    ActionSession,
     TeamOrchestration,
-    ToolRegistry,
+    ActionAvailability,
     VerificationContract,
     VerificationGateway,
     VerifierAssignment,
@@ -59,10 +59,10 @@ defmodule Holt.AgentRuntime do
     WorldStateSnapshot
   }
 
-  def tool_availability(attrs \\ %{}), do: ToolRegistry.snapshot(attrs)
+  def action_availability(attrs \\ %{}), do: ActionAvailability.snapshot(attrs)
 
-  def capability_registry_entry(tool_name, attrs \\ %{}),
-    do: CapabilityRegistry.lookup(tool_name, attrs)
+  def capability_registry_entry(action_name, attrs \\ %{}),
+    do: CapabilityRegistry.lookup(action_name, attrs)
 
   def capability_registry, do: CapabilityRegistry.all()
 
@@ -147,29 +147,29 @@ defmodule Holt.AgentRuntime do
   def compact_context_messages(messages, plan),
     do: ContextBudgetGovernor.compact_messages(messages, plan)
 
-  def task_tool_session(attrs \\ %{}), do: TaskToolSession.build(attrs)
-  def task_tool_session_prompt(session), do: TaskToolSession.prompt_section(session)
-  def task_tool_route(attrs \\ %{}), do: TaskToolRouter.route(attrs)
+  def action_session(attrs \\ %{}), do: ActionSession.build(attrs)
+  def action_session_prompt(session), do: ActionSession.prompt_section(session)
+  def action_route(attrs \\ %{}), do: ActionRouter.route(attrs)
 
-  def task_tool_route(tool_name, arguments, session),
-    do: TaskToolRouter.route(tool_name, arguments, session)
+  def action_route(action_name, arguments, session),
+    do: ActionRouter.route(action_name, arguments, session)
 
-  def task_tool_allowed?(tool_name, session), do: TaskToolRouter.allowed?(tool_name, session)
+  def action_allowed?(action_name, session), do: ActionRouter.allowed?(action_name, session)
   def verification_satisfied?(gate), do: VerificationGateway.satisfied?(gate)
   def verification_submitted?(%{"status" => "submitted"}), do: true
   def verification_submitted?(_gate), do: false
 
   def doctor(attrs \\ %{}) when is_map(attrs) do
-    tools = tool_availability(attrs)
-    status = if Enum.all?(tools, & &1["available"]), do: "ready", else: "degraded"
+    actions = action_availability(attrs)
+    status = if Enum.all?(actions, & &1["available"]), do: "ready", else: "degraded"
 
     %{
-      "schema_version" => "holtworks_agent_runtime_doctor/v1",
+      "schema_version" => "holt_agent_runtime_doctor/v1",
       "status" => status,
-      "tools" => tools
+      "actions" => actions
     }
   end
 
-  def task_tool_session_for_task(ref_or_id, attrs \\ %{}, opts \\ []),
-    do: Tasks.task_tool_session(ref_or_id, attrs, opts)
+  def action_session_for_task(ref_or_id, attrs \\ %{}, opts \\ []),
+    do: Tasks.action_session(ref_or_id, attrs, opts)
 end

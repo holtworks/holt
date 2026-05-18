@@ -2,10 +2,9 @@ defmodule Holt.Runtime.Session do
   @moduledoc """
   Supervised live session wrapper around `Holt.Runtime.run/2`.
 
-  Sessions provide the Inktrail-style runtime surface Holt needs without
-  changing the local-first execution model: subscribers receive stream events,
-  `ask_user` tool calls pause in `awaiting_user`, and status is checkpointed to
-  disk through `SessionStore`.
+  Sessions provide the Inktrail-style runtime surface Holt needs: subscribers
+  receive stream events, `ask` actions pause in `awaiting_user`, and status is
+  checkpointed to disk through `SessionStore`.
   """
 
   use GenServer, restart: :temporary
@@ -25,7 +24,7 @@ defmodule Holt.Runtime.Session do
   end
 
   def start(objective, opts) when is_binary(objective) do
-    session_id = opts[:session_id] || Clock.id("session")
+    session_id = session_id(opts)
 
     opts =
       opts
@@ -83,6 +82,13 @@ defmodule Holt.Runtime.Session do
 
   def via(session_id), do: {:via, Registry, {Holt.Runtime.SessionRegistry, session_id}}
 
+  defp session_id(opts) do
+    case opts[:session_id] do
+      value when value in [nil, ""] -> Clock.id("session")
+      value -> value
+    end
+  end
+
   @impl true
   def init(opts) do
     objective = Keyword.fetch!(opts, :objective)
@@ -133,7 +139,8 @@ defmodule Holt.Runtime.Session do
 
   def handle_call({:respond, answer}, _from, state) do
     awaiting = state.awaiting
-    send(awaiting.waiter, {:holt_user_response, awaiting.ref, to_string(answer || "")})
+    answer = event_text(answer)
+    send(awaiting.waiter, {:holt_user_response, awaiting.ref, answer})
 
     state =
       state
@@ -143,8 +150,8 @@ defmodule Holt.Runtime.Session do
 
     broadcast(state, %{
       "type" => "user_response",
-      "answer" => to_string(answer || ""),
-      "tool_call_id" => awaiting.tool_call_id
+      "answer" => answer,
+      "action_call_id" => awaiting.action_call_id
     })
 
     {:reply, {:ok, checkpoint(state)}, state}
@@ -185,7 +192,7 @@ defmodule Holt.Runtime.Session do
     state =
       case event["type"] do
         "stream_chunk" ->
-          content = to_string(event["content"] || "")
+          content = event_text(event["content"])
           Map.update!(state, :accumulated_content, &(&1 <> content))
 
         _other ->
@@ -201,8 +208,10 @@ defmodule Holt.Runtime.Session do
     awaiting = %{
       ref: ref,
       waiter: waiter,
-      question: to_string(question || ""),
-      tool_call_id: metadata["tool_call_id"],
+      question: event_text(question),
+      description: metadata["description"],
+      options: question_options(metadata),
+      action_call_id: metadata["action_call_id"],
       turn: metadata["turn"],
       started_at: Clock.iso_now()
     }
@@ -216,7 +225,9 @@ defmodule Holt.Runtime.Session do
     broadcast(state, %{
       "type" => "awaiting_user",
       "question" => awaiting.question,
-      "tool_call_id" => awaiting.tool_call_id,
+      "description" => awaiting.description,
+      "options" => awaiting.options,
+      "action_call_id" => awaiting.action_call_id,
       "turn" => awaiting.turn
     })
 
@@ -241,7 +252,7 @@ defmodule Holt.Runtime.Session do
     if status == "completed" do
       broadcast(state, %{"type" => "stream_done", "content" => state.accumulated_content})
     else
-      broadcast(state, %{"type" => "stream_error", "reason" => error || status})
+      broadcast(state, %{"type" => "stream_error", "reason" => stream_error_reason(error, status)})
     end
 
     {:noreply, state}
@@ -281,7 +292,7 @@ defmodule Holt.Runtime.Session do
 
   defp await_user(owner, question, metadata) do
     ref = make_ref()
-    send(owner, {:await_user, self(), ref, question, stringify_keys(metadata || %{})})
+    send(owner, {:await_user, self(), ref, question, metadata_map(metadata)})
 
     receive do
       {:holt_user_response, ^ref, answer} -> {:ok, answer}
@@ -306,6 +317,26 @@ defmodule Holt.Runtime.Session do
   end
 
   defp normalize_timeout(_value, default), do: default
+
+  defp event_text(nil), do: ""
+  defp event_text(value), do: to_string(value)
+
+  defp question_options(metadata) do
+    case metadata["options"] do
+      options when is_list(options) -> options
+      _missing -> []
+    end
+  end
+
+  defp stream_error_reason(error, status) do
+    case error do
+      value when value in [nil, ""] -> status
+      value -> value
+    end
+  end
+
+  defp metadata_map(metadata) when is_map(metadata), do: stringify_keys(metadata)
+  defp metadata_map(_metadata), do: %{}
 
   defp put_subscriber(nil, state), do: state
   defp put_subscriber(pid, state) when not is_pid(pid), do: state
@@ -333,9 +364,9 @@ defmodule Holt.Runtime.Session do
       "objective" => state.objective,
       "workspace" => workspace(state),
       "home" => state.opts[:home],
-      "agent_id" => state.opts[:agent_id] || state.opts[:agent] || "default",
-      "run_id" => get_in(state.run || %{}, ["id"]),
-      "run_dir" => get_in(state.run || %{}, ["run_dir"]),
+      "agent_id" => checkpoint_agent_id(state.opts),
+      "run_id" => get_in(run_map(state), ["id"]),
+      "run_dir" => get_in(run_map(state), ["run_dir"]),
       "started_at" => state.started_at,
       "completed_at" => state.completed_at,
       "awaiting_user" => awaiting_checkpoint(state.awaiting),
@@ -348,12 +379,24 @@ defmodule Holt.Runtime.Session do
 
   defp workspace(state), do: Paths.workspace_root(state.opts)
 
+  defp checkpoint_agent_id(opts) do
+    case opts[:agent_id] do
+      value when value in [nil, ""] -> "default"
+      value -> value
+    end
+  end
+
+  defp run_map(%{run: run}) when is_map(run), do: run
+  defp run_map(_state), do: %{}
+
   defp awaiting_checkpoint(nil), do: nil
 
   defp awaiting_checkpoint(awaiting) do
     %{
       "question" => awaiting.question,
-      "tool_call_id" => awaiting.tool_call_id,
+      "description" => awaiting.description,
+      "options" => awaiting.options,
+      "action_call_id" => awaiting.action_call_id,
       "turn" => awaiting.turn,
       "started_at" => awaiting.started_at
     }
@@ -392,15 +435,29 @@ defmodule Holt.Runtime.Session do
   defp send_raw_event(_pid, _event), do: :ok
 
   defp result_status({:ok, %{run: %{} = run}} = _result) do
-    {run["status"] || "completed", run, nil}
+    {completed_run_status(run), run, nil}
   end
 
   defp result_status({:error, %{run: %{} = run, reason: reason}}) do
-    {run["status"] || "failed", run, inspect(reason)}
+    {failed_run_status(run), run, inspect(reason)}
   end
 
   defp result_status({:error, reason}), do: {"failed", nil, inspect(reason)}
   defp result_status(_result), do: {"completed", nil, nil}
+
+  defp completed_run_status(run) do
+    case run["status"] do
+      value when value in [nil, ""] -> "completed"
+      value -> value
+    end
+  end
+
+  defp failed_run_status(run) do
+    case run["status"] do
+      value when value in [nil, ""] -> "failed"
+      value -> value
+    end
+  end
 
   defp result_summary({:ok, %{run: %{} = run, output: output, artifact: artifact}}) do
     %{

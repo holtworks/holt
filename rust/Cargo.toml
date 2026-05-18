@@ -7,7 +7,7 @@ members = [
     "crates/holt-protocol",
     "crates/holt-sessions",
     "crates/holt-telemetry",
-    "crates/holt-tools",
+    "crates/holt-actions",
     "crates/holt-tui",
     "crates/holt-workspace",
 ]
@@ -22,8 +22,12 @@ license = "MIT"
 anyhow = "1"
 base64 = "0.22"
 crossterm = "0.28"
+mermaid-text = "0.56"
+pulldown-cmark = "0.13"
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+syntect = "5"
 
 holt-core = { path = "crates/holt-core" }
 holt-models = { path = "crates/holt-models" }
@@ -31,6 +35,6 @@ holt-policy = { path = "crates/holt-policy" }
 holt-protocol = { path = "crates/holt-protocol" }
 holt-sessions = { path = "crates/holt-sessions" }
 holt-telemetry = { path = "crates/holt-telemetry" }
-holt-tools = { path = "crates/holt-tools" }
+holt-actions = { path = "crates/holt-actions" }
 holt-tui = { path = "crates/holt-tui" }
 holt-workspace = { path = "crates/holt-workspace" }

@@ -3,46 +3,44 @@ defmodule Holt.Tasks do
   Workspace-local task flow with durable artifacts and run linkage.
   """
 
-  alias Holt.{Actions, Agents, Clock, JSON, Paths, ResearchClaims, Runtime}
+  alias Holt.{Agents, Clock, JSON, Paths, Runtime}
 
   alias Holt.Tasks.{
     ActionContract,
+    ActionApi,
     ActionPreflight,
     ActionRuntimeEnvelope,
     AgentDispatch,
-    AgentLoop,
+    AgentProfiles,
+    AgentRunLog,
     AgentRunDecision,
     AgentRunFailureClassifier,
     AgentRunPolicy,
     AgentRuns,
-    AgentRunStateMachine,
-    AgentWorkLiveness,
     CapabilityContract,
     CapabilityRegistry,
     CapabilityRouter,
     ChildAgentContract,
     ConsequenceGate,
-    ContextBudget,
     ContextBudgetGovernor,
     ContinuationPacket,
     EvidenceLedger,
     EvidenceContract,
     GenericPlanner,
+    GraphApi,
     HumanApprovalInbox,
-    MetaLearningLoop,
+    MobColleagueFlow,
     PlanContract,
     PlanGate,
-    ProviderRegistry,
     ProcessWakeScheduler,
-    RecoveryContract,
-    RunDebugger,
-    SafetyPolicy,
+    Repository,
+    Store,
     TaskMemory,
     TaskGraphs,
-    TaskToolRouter,
-    TaskToolSession,
+    ActionRouter,
+    ActionSession,
+    Attributes,
     TeamOrchestration,
-    ToolRegistry,
     VerificationContract,
     VerificationGateway,
     VerifierAssignment,
@@ -73,8 +71,6 @@ defmodule Holt.Tasks do
     research concept critique decision
   )
   @memory_kinds ~w(behavior_profile preference_signal workflow_pattern)
-  @memory_scopes ~w(user team org)
-  @portability_values ~w(exportable org_confidential private)
   @spec_kinds ~w(
     research concept critique decision outcome_contract workflow_contract
     validation_contract verification_report walkthrough_video handoff decision_log
@@ -92,558 +88,170 @@ defmodule Holt.Tasks do
   def runtime_spec_kinds, do: @runtime_spec_kinds
   def memory_kinds, do: @memory_kinds
 
-  def agents(opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.list_for_root()
-  end
+  def agents(opts \\ []), do: AgentProfiles.list(opts)
 
-  def create_agent(attrs, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.create(attrs)
-  end
+  def create_agent(attrs, opts \\ []) when is_map(attrs), do: AgentProfiles.create(attrs, opts)
 
-  def update_agent(agent_id, attrs, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.update(agent_id, attrs)
-  end
+  def update_agent(agent_id, attrs, opts \\ []) when is_map(attrs),
+    do: AgentProfiles.update(agent_id, attrs, opts)
 
-  def get_agent(agent_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.get(agent_id)
-  end
+  def get_agent(agent_id, opts \\ []), do: AgentProfiles.get(agent_id, opts)
 
-  def suspend_agent(agent_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.suspend(agent_id, attrs)
-  end
+  def suspend_agent(agent_id, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: AgentProfiles.suspend(agent_id, attrs, opts)
 
-  def resume_agent(agent_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.resume(agent_id, attrs)
-  end
+  def resume_agent(agent_id, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: AgentProfiles.resume(agent_id, attrs, opts)
 
-  def archive_agent(agent_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.archive(agent_id, attrs)
-  end
+  def archive_agent(agent_id, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: AgentProfiles.archive(agent_id, attrs, opts)
 
-  def agent_cards(opts \\ []) do
-    root = Paths.workspace_root(opts)
-    Agents.list_cards(root, opts)
-  end
+  def agent_cards(opts \\ []), do: AgentProfiles.cards(opts)
 
-  def agent_card(agent_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.card(agent_id)
-  end
+  def agent_card(agent_id, opts \\ []), do: AgentProfiles.card(agent_id, opts)
 
-  def agent_skills(agent_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> Agents.list_skills(agent_id)
-  end
+  def agent_skills(agent_id, opts \\ []), do: AgentProfiles.skills(agent_id, opts)
 
-  def action_definitions(opts \\ []), do: Actions.definitions(opts)
+  def action_definitions(opts \\ []), do: ActionApi.definitions(opts)
 
-  def action_catalog(context \\ %{}, opts \\ []), do: Actions.agent_tool_catalog(context, opts)
+  def action_catalog(context \\ %{}, opts \\ []), do: ActionApi.catalog(context, opts)
 
-  def agent_tool_definitions(context \\ %{}, opts \\ []),
-    do: Actions.agent_tool_definitions(context, opts)
+  def agent_action_definitions(context \\ %{}, opts \\ []),
+    do: ActionApi.agent_definitions(context, opts)
 
   def action_provider_metadata(context \\ %{}, opts \\ []),
-    do: Actions.tool_provider_metadata(context, opts)
+    do: ActionApi.provider_metadata(context, opts)
 
   def action_provider_prompt_sections(context \\ %{}, opts \\ []),
-    do: Actions.action_provider_prompt_sections(context, opts)
+    do: ActionApi.provider_prompt_sections(context, opts)
 
   def search_actions(filters \\ %{}, opts \\ []) when is_map(filters),
-    do: Actions.search(filters, opts)
+    do: ActionApi.search(filters, opts)
 
-  def get_action(name, opts \\ []), do: Actions.get(name, opts)
+  def get_action(name, opts \\ []), do: ActionApi.get(name, opts)
 
   def execute_action(name, args \\ %{}, opts \\ []) when is_map(args),
-    do: Actions.execute(name, args, opts)
+    do: ActionApi.execute(name, args, opts)
 
-  def dispatch_agent_tool(name, args \\ %{}, context \\ %{}, opts \\ []) when is_map(args),
-    do: Actions.dispatch_agent_tool(name, args, context, opts)
+  def dispatch_agent_action(name, args \\ %{}, context \\ %{}, opts \\ []) when is_map(args),
+    do: ActionApi.dispatch(name, args, context, opts)
 
-  def execute_task_action(ref_or_id, tool_name, args \\ %{}, opts \\ []) when is_map(args),
-    do: Actions.execute_task_tool(ref_or_id, tool_name, args, opts)
+  def execute_task_action(ref_or_id, action_name, args \\ %{}, opts \\ []) when is_map(args),
+    do: ActionApi.execute_task(ref_or_id, action_name, args, opts)
 
   def execute_task_actions(ref_or_id, calls, opts \\ []) when is_list(calls),
-    do: Actions.execute_many(ref_or_id, calls, opts)
+    do: ActionApi.execute_many(ref_or_id, calls, opts)
 
-  def tool_availability(attrs \\ %{}) when is_map(attrs), do: ToolRegistry.snapshot(attrs)
+  def action_availability(attrs \\ %{}) when is_map(attrs), do: ActionApi.availability(attrs)
 
   def provider_profile(model_id, attrs \\ %{}) when is_map(attrs),
-    do: ProviderRegistry.profile(model_id, attrs)
+    do: ActionApi.provider_profile(model_id, attrs)
 
-  def research_claims(opts \\ []), do: ResearchClaims.list(opts)
+  def research_claims(opts \\ []), do: ActionApi.research_claims(opts)
 
-  def safety_policy(attrs \\ %{}) when is_map(attrs), do: SafetyPolicy.build(attrs)
+  def safety_policy(attrs \\ %{}) when is_map(attrs), do: ActionApi.safety_policy(attrs)
 
-  def runtime_context_budget(attrs \\ %{}) when is_map(attrs), do: ContextBudget.build(attrs)
+  def runtime_context_budget(attrs \\ %{}) when is_map(attrs), do: ActionApi.context_budget(attrs)
 
-  def recovery_contract(attrs \\ %{}) when is_map(attrs), do: RecoveryContract.build(attrs)
+  def recovery_contract(attrs \\ %{}) when is_map(attrs), do: ActionApi.recovery_contract(attrs)
 
-  def run_debugger(attrs \\ %{}) when is_map(attrs), do: RunDebugger.build(attrs)
+  def run_debugger(attrs \\ %{}) when is_map(attrs), do: ActionApi.run_debugger(attrs)
 
-  def meta_learning_snapshot(attrs \\ %{}) when is_map(attrs), do: MetaLearningLoop.build(attrs)
+  def meta_learning_snapshot(attrs \\ %{}) when is_map(attrs),
+    do: ActionApi.meta_learning_snapshot(attrs)
 
-  def agent_run_lifecycle_states, do: AgentRunStateMachine.states()
+  def agent_run_lifecycle_states, do: ActionApi.lifecycle_states()
 
   def agent_run_lifecycle_transition(current_state, next_state),
-    do: AgentRunStateMachine.transition(current_state, next_state)
+    do: ActionApi.lifecycle_transition(current_state, next_state)
 
   def agent_run_lifecycle_complete(attrs \\ %{}) when is_map(attrs),
-    do: AgentRunStateMachine.complete(attrs)
+    do: ActionApi.lifecycle_complete(attrs)
 
-  def agent_loop_contract(attrs \\ %{}) when is_map(attrs), do: AgentLoop.contract(attrs)
+  def agent_loop_contract(attrs \\ %{}) when is_map(attrs),
+    do: ActionApi.agent_loop_contract(attrs)
 
   def record_process_started(payload, context \\ %{}, opts \\ [])
 
   def record_process_started(payload, context, opts) when is_map(payload) and is_map(context),
-    do: ProcessWakeScheduler.record_started(string_keys(payload), string_keys(context), opts)
+    do: ProcessWakeScheduler.record_started(payload, context, opts)
 
   def record_process_started(_payload, _context, _opts), do: {:error, :invalid_process_event}
 
   def notify_process_terminal(payload, context \\ %{}, opts \\ [])
 
   def notify_process_terminal(payload, context, opts) when is_map(payload) and is_map(context),
-    do: ProcessWakeScheduler.notify_terminal(string_keys(payload), string_keys(context), opts)
+    do: ProcessWakeScheduler.notify_terminal(payload, context, opts)
 
   def notify_process_terminal(_payload, _context, _opts), do: {:error, :invalid_process_event}
 
-  def runtime_doctor(attrs \\ %{}) when is_map(attrs) do
-    tools = tool_availability(attrs)
-    status = if Enum.all?(tools, & &1["available"]), do: "ready", else: "degraded"
+  def runtime_doctor(attrs \\ %{}) when is_map(attrs), do: ActionApi.doctor(attrs)
 
-    %{
-      "schema_version" => "holtworks_agent_runtime_doctor/v1",
-      "status" => status,
-      "tools" => tools
-    }
-  end
+  def create(attrs, opts \\ []) when is_map(attrs), do: Repository.create(attrs, opts)
 
-  def create(attrs, opts \\ []) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
-    ensure_store(root)
+  def list(opts \\ []), do: Repository.list(opts)
 
-    with {:ok, title} <- required_text(attrs, "title"),
-         {:ok, kind} <- enum_value(attrs, "kind", @kinds, "task"),
-         {:ok, status} <- enum_value(attrs, "status", @statuses, "todo"),
-         {:ok, priority} <- enum_value(attrs, "priority", @priorities, "medium"),
-         {:ok, estimate} <- estimate_value(Map.get(attrs, "estimate", nil)),
-         {:ok, number} <- next_number(root) do
-      now = Clock.iso_now()
+  def get(ref_or_id, opts \\ []), do: Repository.get(ref_or_id, opts)
 
-      task =
-        %{
-          "schema_version" => "holtworks_task/v1",
-          "id" => Clock.id("task"),
-          "number" => number,
-          "ref" => task_ref(number),
-          "title" => title,
-          "description" => optional_text(attrs, "description", ""),
-          "kind" => kind,
-          "status" => status,
-          "priority" => priority,
-          "estimate" => estimate,
-          "due_date" => optional_text(attrs, "due_date"),
-          "scheduled_start_at" => optional_text(attrs, "scheduled_start_at"),
-          "recurrence" => normalize_recurrence(Map.get(attrs, "recurrence")),
-          "labels" => normalize_labels(Map.get(attrs, "labels", [])),
-          "links" => dependency_links(attrs) ++ normalize_links(Map.get(attrs, "links", [])),
-          "origin" => optional_text(attrs, "origin", "local_cli"),
-          "assignees" => normalize_assignees(Map.get(attrs, "assignees", [])),
-          "agent_policy" => normalize_agent_policy(Map.get(attrs, "agent_policy", %{})),
-          "parent_id" => optional_text(attrs, "parent_id"),
-          "comments" => [],
-          "attachments" => [],
-          "agent_work" => [],
-          "activity" => [
-            activity("task.created", %{
-              "status" => status,
-              "priority" => priority,
-              "kind" => kind
-            })
-          ],
-          "created_at" => now,
-          "updated_at" => now
-        }
-        |> reject_empty()
+  def update(ref_or_id, attrs, opts \\ []) when is_map(attrs),
+    do: Repository.update(ref_or_id, attrs, opts)
 
-      root
-      |> load_tasks()
-      |> Kernel.++([task])
-      |> store_tasks(root)
+  def add_comment(ref_or_id, body, opts \\ []),
+    do: Repository.add_comment(ref_or_id, body, opts)
 
-      {:ok, task}
-    end
-  end
+  def delete_comment(ref_or_id, comment_id, opts \\ []),
+    do: Repository.delete_comment(ref_or_id, comment_id, opts)
 
-  def list(opts \\ []) do
-    root = Paths.workspace_root(opts)
-    status = option(opts, :status)
+  def add_label(ref_or_id, attrs, opts \\ []) when is_map(attrs),
+    do: Repository.add_label(ref_or_id, attrs, opts)
 
-    root
-    |> load_tasks()
-    |> filter_status(status)
-    |> Enum.sort_by(&Map.get(&1, "number", 0))
-    |> Enum.map(&enrich_task(root, &1))
-  end
+  def remove_label(ref_or_id, name, opts \\ []),
+    do: Repository.remove_label(ref_or_id, name, opts)
 
-  def get(ref_or_id, opts \\ []) do
-    root = Paths.workspace_root(opts)
+  def add_link(ref_or_id, target_ref_or_id, type, opts \\ []),
+    do: Repository.add_link(ref_or_id, target_ref_or_id, type, opts)
 
-    case Enum.find(load_tasks(root), &task_ref_matches?(&1, ref_or_id)) do
-      nil -> {:error, :task_not_found}
-      task -> {:ok, enrich_task(root, task)}
-    end
-  end
+  def remove_link(ref_or_id, link_id, opts \\ []),
+    do: Repository.remove_link(ref_or_id, link_id, opts)
 
-  def update(ref_or_id, attrs, opts \\ []) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
+  def set_estimate(ref_or_id, estimate, opts \\ []),
+    do: Repository.set_estimate(ref_or_id, estimate, opts)
 
-    with {:ok, patch} <- update_patch(attrs),
-         {:ok, task} <-
-           update_task(root, ref_or_id, fn task ->
-             fields = Map.keys(patch)
+  def set_priority(ref_or_id, priority, opts \\ []),
+    do: Repository.set_priority(ref_or_id, priority, opts)
 
-             task
-             |> Map.merge(patch)
-             |> touch()
-             |> append_activity("task.updated", %{"fields" => fields})
-           end) do
-      {:ok, task}
-    end
-  end
+  def save_spec(ref_or_id, attrs, opts \\ []) when is_map(attrs),
+    do: Repository.save_spec(ref_or_id, attrs, opts)
 
-  def add_comment(ref_or_id, body, opts \\ []) do
-    root = Paths.workspace_root(opts)
+  def list_specs(ref_or_id, opts \\ []), do: Repository.list_specs(ref_or_id, opts)
 
-    with {:ok, text} <- required_text(%{"body" => body}, "body"),
-         {:ok, task} <-
-           update_task(root, ref_or_id, fn task ->
-             comment = %{
-               "id" => Clock.id("comment"),
-               "body" => text,
-               "author" => opts[:author] || "user",
-               "created_at" => Clock.iso_now()
-             }
+  def get_spec(spec_id, opts \\ []), do: Repository.get_spec(spec_id, opts)
 
-             task
-             |> Map.update("comments", [comment], &(&1 ++ [comment]))
-             |> touch()
-             |> append_activity("task.comment_added", %{"comment_id" => comment["id"]})
-           end) do
-      {:ok, task}
-    end
-  end
+  def save_teammate_memory(ref_or_id, attrs, opts \\ []) when is_map(attrs),
+    do: Repository.save_teammate_memory(ref_or_id, attrs, opts)
 
-  def delete_comment(ref_or_id, comment_id, opts \\ []) do
-    root = Paths.workspace_root(opts)
-    comment_id = to_string(comment_id)
+  def load_teammate_runtime(ref_or_id, opts \\ []),
+    do: Repository.load_teammate_runtime(ref_or_id, opts)
 
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, _comment} <- find_comment(task, comment_id) do
-      update_task(root, task["id"], fn current ->
-        next_comments = Enum.reject(current["comments"] || [], &(&1["id"] == comment_id))
+  def read_memory_artifact(artifact_ref, opts \\ []),
+    do: Repository.read_memory_artifact(artifact_ref, opts)
 
-        current
-        |> Map.put("comments", next_comments)
-        |> touch()
-        |> append_activity("task.comment_deleted", %{"comment_id" => comment_id})
-      end)
-    end
-  end
-
-  def add_label(ref_or_id, attrs, opts \\ []) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
-
-    with {:ok, name} <- required_text(attrs, "name") do
-      color = optional_text(attrs, "color", "#2563eb")
-      label = %{"name" => name, "color" => color}
-
-      update_task(root, ref_or_id, fn task ->
-        labels = normalize_labels(task["labels"] || [])
-
-        if label_exists?(labels, name) do
-          task
-        else
-          task
-          |> Map.put("labels", labels ++ [label])
-          |> touch()
-          |> append_activity("task.label_added", %{"name" => name, "color" => color})
-        end
-      end)
-    end
-  end
-
-  def remove_label(ref_or_id, name, opts \\ []) do
-    root = Paths.workspace_root(opts)
-    normalized = normalize_label_name(name)
-
-    update_task(root, ref_or_id, fn task ->
-      labels = normalize_labels(task["labels"] || [])
-      next_labels = Enum.reject(labels, &(normalize_label_name(&1["name"]) == normalized))
-
-      if length(next_labels) == length(labels) do
-        task
-      else
-        task
-        |> Map.put("labels", next_labels)
-        |> touch()
-        |> append_activity("task.label_removed", %{"name" => to_string(name)})
-      end
-    end)
-  end
-
-  def add_link(ref_or_id, target_ref_or_id, type, opts \\ []) do
-    root = Paths.workspace_root(opts)
-
-    with {:ok, link_type} <- enum_value(%{"type" => type}, "type", @link_types, "relates_to"),
-         {:ok, source} <- get(ref_or_id, opts),
-         {:ok, target} <- get(target_ref_or_id, opts),
-         :ok <- ensure_not_self_link(source, target),
-         :ok <- ensure_new_link(source, target) do
-      link = %{
-        "id" => Clock.id("link"),
-        "target_id" => target["id"],
-        "target_ref" => target["ref"],
-        "type" => link_type
-      }
-
-      update_task(root, source["id"], fn task ->
-        task
-        |> Map.update("links", [link], &(&1 ++ [link]))
-        |> touch()
-        |> append_activity("task.link_added", %{
-          "link_id" => link["id"],
-          "target_id" => target["id"],
-          "target_ref" => target["ref"],
-          "type" => link_type
-        })
-      end)
-    end
-  end
-
-  def remove_link(ref_or_id, link_id, opts \\ []) do
-    root = Paths.workspace_root(opts)
-    link_id = to_string(link_id)
-
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, link} <- find_link(task, link_id) do
-      update_task(root, task["id"], fn current ->
-        next_links = Enum.reject(current["links"] || [], &(&1["id"] == link_id))
-
-        current
-        |> Map.put("links", next_links)
-        |> touch()
-        |> append_activity("task.link_removed", %{
-          "link_id" => link_id,
-          "target_id" => link["target_id"],
-          "target_ref" => link["target_ref"],
-          "type" => link["type"]
-        })
-      end)
-    end
-  end
-
-  def set_estimate(ref_or_id, estimate, opts \\ []) do
-    with {:ok, value} <- estimate_value(estimate) do
-      update(ref_or_id, %{"estimate" => value}, opts)
-    end
-  end
-
-  def set_priority(ref_or_id, priority, opts \\ []) do
-    update(ref_or_id, %{"priority" => priority}, opts)
-  end
-
-  def save_spec(ref_or_id, attrs, opts \\ []) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
-    ensure_store(root)
-
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, kind} <- enum_value(attrs, "kind", @spec_kinds, nil),
-         {:ok, content} <- required_text(attrs, "content") do
-      spec_id = Clock.id("spec")
-      title = optional_text(attrs, "title", default_spec_title(kind, task))
-      relative_path = Path.join([".holtworks", "tasks", "specs", task["id"], spec_id <> ".md"])
-      absolute_path = Path.join(root, relative_path)
-      now = Clock.iso_now()
-
-      spec =
-        %{
-          "schema_version" => "holtworks_task_spec/v1",
-          "id" => spec_id,
-          "task_id" => task["id"],
-          "task_ref" => task["ref"],
-          "kind" => kind,
-          "title" => title,
-          "path" => relative_path,
-          "created_at" => now,
-          "created_by" => opts[:author] || "user",
-          "metadata" => normalize_metadata(Map.get(attrs, "metadata", %{}))
-        }
-
-      File.mkdir_p!(Path.dirname(absolute_path))
-      File.write!(absolute_path, content)
-
-      root
-      |> load_specs()
-      |> Kernel.++([spec])
-      |> store_specs(root)
-
-      attachment =
-        %{
-          "id" => spec_id,
-          "kind" => "spec",
-          "artifact_kind" => kind,
-          "spec_kind" => kind,
-          "title" => title,
-          "path" => relative_path
-        }
-
-      {:ok, updated_task} =
-        update_task(root, task["id"], fn current ->
-          current
-          |> Map.update("attachments", [attachment], &(&1 ++ [attachment]))
-          |> touch(now)
-          |> append_activity("task.spec_saved", %{
-            "spec_id" => spec_id,
-            "spec_kind" => kind
-          })
-        end)
-
-      {:ok, Map.put(spec, "task", updated_task)}
-    end
-  end
-
-  def list_specs(ref_or_id, opts \\ []) do
-    root = Paths.workspace_root(opts)
-
-    with {:ok, task} <- get(ref_or_id, opts) do
-      kind = option(opts, :kind) || "all"
-      include_content? = option(opts, :include_content) != false
-      content_limit = option(opts, :content_limit) || 12_000
-
-      specs =
-        root
-        |> load_specs()
-        |> Enum.filter(&(&1["task_id"] == task["id"]))
-        |> filter_spec_kind(kind)
-        |> Enum.map(&maybe_include_spec_content(&1, root, include_content?, content_limit))
-
-      {:ok, specs}
-    end
-  end
-
-  def get_spec(spec_id, opts \\ []) do
-    root = Paths.workspace_root(opts)
-    task_ref = option(opts, :task_ref) || option(opts, :task_id)
-
-    case Enum.find(load_specs(root), &(&1["id"] == spec_id)) do
-      nil ->
-        {:error, :spec_not_found}
-
-      spec ->
-        with :ok <- ensure_spec_task_scope(spec, task_ref, opts) do
-          {:ok,
-           maybe_include_spec_content(spec, root, true, option(opts, :content_limit) || 50_000)}
-        end
-    end
-  end
-
-  def save_teammate_memory(ref_or_id, attrs, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, memory_attrs} <- teammate_memory_attrs(attrs) do
-      save_spec(ref_or_id, memory_attrs, opts)
-    end
-  end
-
-  def load_teammate_runtime(ref_or_id, opts \\ []) do
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, specs} <-
-           list_specs(
-             ref_or_id,
-             Keyword.merge(opts,
-               kind: "all",
-               include_content: true,
-               content_limit: option(opts, :content_limit) || 1_600
-             )
-           ) do
-      runtime_specs = Enum.filter(specs, &(&1["kind"] in @runtime_spec_kinds))
-      {:ok, teammate_runtime_markdown(task, runtime_specs, opts)}
-    end
-  end
-
-  def read_memory_artifact(artifact_ref, opts \\ []) do
-    root = Paths.workspace_root(opts)
-
-    case TaskMemory.dereference_artifact(root, artifact_ref) do
-      {:ok, artifact} -> {:ok, artifact}
-      {:error, :artifact_not_found} -> get_spec(artifact_ref, opts)
-      {:error, :invalid_ref} -> get_spec(artifact_ref, opts)
-      {:error, _reason} = error -> error
-    end
-  end
-
-  def record_task_memory_artifact(ref_or_id, attrs, opts \\ []) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
-
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, artifact} <- TaskMemory.record_artifact(root, task, attrs),
-         {:ok, updated_task} <-
-           update_task(root, task["id"], fn current ->
-             attachment = %{
-               "id" => artifact["artifact_ref"],
-               "kind" => "task_memory_artifact",
-               "artifact_kind" => artifact["kind"],
-               "title" => artifact["title"],
-               "artifact_ref" => artifact["artifact_ref"]
-             }
-
-             current
-             |> Map.update("attachments", [attachment], &(&1 ++ [attachment]))
-             |> touch()
-             |> append_activity("task.memory_artifact_recorded", %{
-               "artifact_ref" => artifact["artifact_ref"],
-               "artifact_kind" => artifact["kind"]
-             })
-           end) do
-      {:ok, Map.put(artifact, "task", enrich_task(root, updated_task))}
-    end
-  end
+  def record_task_memory_artifact(ref_or_id, attrs, opts \\ []) when is_map(attrs),
+    do: Repository.record_task_memory_artifact(ref_or_id, attrs, opts)
 
   def task_memory_context(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts) do
       TaskMemory.context_packet(root, task, task_memory_context_attrs(root, task, attrs, opts))
     end
   end
 
   def context_budget(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, _task} <- get(ref_or_id, opts) do
-      if Map.has_key?(attrs, "messages") or Map.has_key?(attrs, "estimated_input_tokens") do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, _task} <- get(ref_or_id, opts) do
+      if context_budget_attrs?(attrs) do
         {:ok, ContextBudgetGovernor.plan(attrs)}
       else
         with {:ok, packet} <- task_memory_context(ref_or_id, attrs, opts) do
@@ -655,9 +263,9 @@ defmodule Holt.Tasks do
 
   def continuation_packet(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, previous_work} <- agent_work_to_continue(task, attrs) do
       previous_run = agent_run_for_work(root, task["id"], previous_work)
       context_packet = task_memory_context_packet(root, task, attrs, opts)
@@ -667,187 +275,96 @@ defmodule Holt.Tasks do
     end
   end
 
-  def agent_runs(opts \\ []) do
-    AgentRuns.list(opts)
-  end
-
-  def agent_run_events(opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.event_log()
-  end
-
-  def agent_run_event_log(run_or_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.list_events(run_or_id)
-  end
-
-  def agent_runs_by_agent(agent_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.list_by_agent(agent_id, opts)
-  end
-
-  def agent_run_events_by_agent(agent_id, filters \\ %{}, opts \\ []) when is_map(filters) do
-    root = Paths.workspace_root(opts)
-    AgentRuns.search_events_by_agent(root, agent_id, string_keys(filters))
-  end
-
-  def agent_run_replay(agent_id, run_or_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.replay_by_agent(agent_id, run_or_id)
-  end
-
-  def agent_run_task_inspector(task_ref_or_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.task_inspector(task_ref_or_id, opts)
-  end
-
-  def record_agent_run_event(run_or_id, attrs, opts \\ [])
-
-  def record_agent_run_event(run_or_id, attrs, opts) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
-    metadata = Map.get(attrs, "metadata", Map.drop(attrs, ["kind", "type", "message"]))
-
-    AgentRuns.record_event_once(
-      root,
-      run_or_id,
-      attrs["kind"] || attrs["type"] || "agent_run.event",
-      attrs["message"] || "Agent run event recorded.",
-      metadata
+  defp context_budget_attrs?(attrs) do
+    Enum.any?(
+      [Map.has_key?(attrs, "messages"), Map.has_key?(attrs, "estimated_input_tokens")],
+      & &1
     )
   end
 
-  def record_agent_run_event(_run_or_id, _attrs, _opts),
-    do: {:error, :invalid_agent_run_event}
+  def agent_runs(opts \\ []), do: AgentRunLog.list(opts)
+
+  def agent_run_events(opts \\ []), do: AgentRunLog.events(opts)
+
+  def agent_run_event_log(run_or_id, opts \\ []), do: AgentRunLog.event_log(run_or_id, opts)
+
+  def agent_runs_by_agent(agent_id, opts \\ []), do: AgentRunLog.by_agent(agent_id, opts)
+
+  def agent_run_events_by_agent(agent_id, filters \\ %{}, opts \\ []) when is_map(filters) do
+    AgentRunLog.events_by_agent(agent_id, filters, opts)
+  end
+
+  def agent_run_replay(agent_id, run_or_id, opts \\ []),
+    do: AgentRunLog.replay(agent_id, run_or_id, opts)
+
+  def agent_run_task_inspector(task_ref_or_id, opts \\ []),
+    do: AgentRunLog.task_inspector(task_ref_or_id, opts)
+
+  def record_agent_run_event(run_or_id, attrs, opts \\ [])
+
+  def record_agent_run_event(run_or_id, attrs, opts),
+    do: AgentRunLog.record_event(run_or_id, attrs, opts)
 
   def record_agent_run_continuation_packet(run_or_id, attrs, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_continuation_packet(run_or_id, attrs)
+    AgentRunLog.record_continuation_packet(run_or_id, attrs, opts)
   end
 
   def record_agent_run_narration(run_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_agent_narration(run_or_id, attrs)
+    AgentRunLog.record_narration(run_or_id, attrs, opts)
   end
 
   def record_agent_run_plan_contract(run_or_id, attrs, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_plan_contract(run_or_id, attrs)
+    AgentRunLog.record_plan_contract(run_or_id, attrs, opts)
   end
 
   def record_agent_run_child_contract(run_or_id, attrs, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_child_agent_contract(run_or_id, attrs)
+    AgentRunLog.record_child_contract(run_or_id, attrs, opts)
   end
 
   def record_agent_run_child_completion(run_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_child_agent_completion(run_or_id, attrs)
+    AgentRunLog.record_child_completion(run_or_id, attrs, opts)
   end
 
-  def record_agent_run_tool_event(run_or_id, attrs, opts \\ [])
+  def record_agent_run_action_event(run_or_id, attrs, opts \\ [])
 
-  def record_agent_run_tool_event(run_or_id, attrs, opts) when is_map(attrs) do
-    attrs = string_keys(attrs)
-    tool_name = attrs["tool_name"] || attrs["tool"]
-    tool_call_id = attrs["tool_call_id"] || attrs["call_id"] || Clock.id("tool_call")
-
-    result =
-      attrs["result"] ||
-        %{
-          "status" => attrs["result_status"] || attrs["status"],
-          "preview" => attrs["result_preview"]
-        }
-        |> reject_empty()
-
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_tool_event(run_or_id, tool_name, tool_call_id, result, attrs)
-  end
-
-  def record_agent_run_tool_event(_run_or_id, _attrs, _opts), do: {:error, :invalid_tool_event}
+  def record_agent_run_action_event(run_or_id, attrs, opts),
+    do: AgentRunLog.record_action_event(run_or_id, attrs, opts)
 
   def record_agent_run_objective_evaluation(run_or_id, attrs, opts \\ [])
 
-  def record_agent_run_objective_evaluation(run_or_id, attrs, opts) when is_map(attrs) do
-    attrs = string_keys(attrs)
+  def record_agent_run_objective_evaluation(run_or_id, attrs, opts),
+    do: AgentRunLog.record_objective_evaluation(run_or_id, attrs, opts)
 
-    route =
-      attrs["route"] || attrs["evaluation"] ||
-        Map.take(attrs, ["can_finish", "decision", "status"])
+  def task_graphs(ref_or_id, opts \\ []), do: GraphApi.list(ref_or_id, opts)
 
-    opts
-    |> Paths.workspace_root()
-    |> AgentRuns.record_objective_evaluation(run_or_id, route, attrs)
-  end
+  def get_task_graph(graph_id, opts \\ []), do: GraphApi.get(graph_id, opts)
 
-  def record_agent_run_objective_evaluation(_run_or_id, _attrs, _opts),
-    do: {:error, :invalid_objective_evaluation}
+  def create_task_graph(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: GraphApi.create(ref_or_id, attrs, opts)
 
-  def task_graphs(ref_or_id, opts \\ []) do
-    root = Paths.workspace_root(opts)
+  def advance_task_graph(graph_id, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: GraphApi.advance(graph_id, attrs, opts)
 
-    with {:ok, task} <- get(ref_or_id, opts) do
-      {:ok, TaskGraphs.list_for_task(root, task["id"])}
-    end
-  end
+  def complete_task_graph_node(graph_id, node_ref, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: GraphApi.complete_node(graph_id, node_ref, attrs, opts)
 
-  def get_task_graph(graph_id, opts \\ []) do
-    opts
-    |> Paths.workspace_root()
-    |> TaskGraphs.get(graph_id)
-  end
-
-  def create_task_graph(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    root = Paths.workspace_root(opts)
-
-    with {:ok, task} <- get(ref_or_id, opts) do
-      TaskGraphs.create(root, task, attrs)
-    end
-  end
-
-  def advance_task_graph(graph_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> TaskGraphs.advance(graph_id, attrs)
-  end
-
-  def complete_task_graph_node(graph_id, node_ref, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> TaskGraphs.complete_node(graph_id, node_ref, attrs)
-  end
-
-  def block_task_graph_node(graph_id, node_ref, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    opts
-    |> Paths.workspace_root()
-    |> TaskGraphs.block_node(graph_id, node_ref, attrs)
-  end
+  def block_task_graph_node(graph_id, node_ref, attrs \\ %{}, opts \\ []) when is_map(attrs),
+    do: GraphApi.block_node(graph_id, node_ref, attrs, opts)
 
   def evidence_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts) do
       {:ok, evidence_contract_for_task(root, task, attrs)}
     end
   end
 
   def verification_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts) do
       {:ok,
        VerificationContract.build(
          attrs
@@ -859,9 +376,9 @@ defmodule Holt.Tasks do
 
   def plan_verifier_route(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, graph} <- verifier_route_graph(root, task, attrs) do
       contract = evidence_contract_for_task(root, task, attrs)
 
@@ -894,9 +411,9 @@ defmodule Holt.Tasks do
 
   def verifier_assignment(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, graph} <- work_graph(ref_or_id, attrs, opts) do
       evidence_contract = evidence_contract_for_task(root, task, attrs)
       {:ok, verification_contract} = verification_contract(ref_or_id, attrs, opts)
@@ -917,9 +434,9 @@ defmodule Holt.Tasks do
 
   def verifier_dispatch(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, graph} <- work_graph(ref_or_id, attrs, opts),
          {:ok, assignment} <- verifier_assignment(ref_or_id, attrs, opts),
          {:ok, contract} <- verification_contract(ref_or_id, attrs, opts) do
@@ -940,9 +457,9 @@ defmodule Holt.Tasks do
 
   def verifier_calibration(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, _task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, _task} <- get(ref_or_id, opts),
          {:ok, assignment} <- calibration_assignment(ref_or_id, attrs, opts),
          {:ok, graph} <- work_graph(ref_or_id, attrs, opts) do
       calibration =
@@ -962,85 +479,78 @@ defmodule Holt.Tasks do
     |> load_verifier_calibrations()
   end
 
-  def task_tool_session(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+  def action_session(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts) do
       {:ok,
-       TaskToolSession.build(
+       ActionSession.build(
          attrs
+         |> Map.take(
+           ~w(session_id agent_id agent_ref agent_handle agent_name run_id agent_run_id graph_id source policy_profile enabled_action_groups disabled_action_groups disabled_actions direct_actions connected_accounts todos workbench preload_actions)
+         )
          |> Map.put("task", task)
          |> Map.put("workspace", root)
        )}
     end
   end
 
-  def task_tool_session_prompt(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    with {:ok, session} <- task_tool_session(ref_or_id, attrs, opts) do
-      {:ok, TaskToolSession.prompt_section(session)}
+  def action_session_prompt(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+    with {:ok, session} <- action_session(ref_or_id, attrs, opts) do
+      {:ok, ActionSession.prompt_section(session)}
     end
   end
 
   def action_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, session} <- route_task_tool_session(ref_or_id, attrs, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, session} <- route_action_session(ref_or_id, attrs, opts) do
       {:ok,
        ActionContract.build(
          attrs
-         |> Map.put("task_tool_session", session)
-         |> Map.put_new("tool_name", attrs["name"])
+         |> Map.put("action_session", session)
        )}
     end
   end
 
-  def route_task_tool(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, session} <- route_task_tool_session(ref_or_id, attrs, opts) do
+  def route_action(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, session} <- route_action_session(ref_or_id, attrs, opts) do
       {:ok,
-       TaskToolRouter.route(
+       ActionRouter.route(
          attrs
-         |> Map.put("task_tool_session", session)
-         |> Map.put_new("tool_name", attrs["name"])
+         |> Map.put("action_session", session)
        )}
     end
   end
 
   def plan_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, session} <- route_task_tool_session(ref_or_id, attrs, opts),
-         {:ok, graph} <- maybe_plan_graph(root, task, attrs) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
+         {:ok, session} <- route_action_session(ref_or_id, attrs, opts),
+         {:ok, _graph} <- maybe_plan_graph(root, task, attrs) do
       contract_attrs =
         attrs
+        |> Map.take(
+          ~w(plan_id status allowed_effect_scopes allow_workspace_durable allowed_actions plan_steps created_at)
+        )
         |> Map.put("task", task)
-        |> Map.put("workspace", root)
-        |> Map.put("task_tool_session", session)
+        |> Map.put("action_session", session)
         |> Map.put("evidence_contract", evidence_contract_for_task(root, task, attrs))
-
-      contract_attrs =
-        if graph do
-          Map.put(contract_attrs, "task_graph", graph)
-        else
-          contract_attrs
-        end
 
       {:ok, PlanContract.build(contract_attrs)}
     end
   end
 
   def plan_gate(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, route} <- route_task_tool(ref_or_id, attrs, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, route} <- route_action(ref_or_id, attrs, opts),
          {:ok, plan} <- plan_contract(ref_or_id, attrs, opts) do
       {:ok,
        PlanGate.evaluate(%{
-         "task_tool_route" => route,
+         "action_route" => route,
          "action_contract" => route["action_contract"],
          "plan_contract" => plan
        })}
@@ -1048,13 +558,12 @@ defmodule Holt.Tasks do
   end
 
   def action_preflight(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, route} <- route_task_tool(ref_or_id, attrs, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, route} <- route_action(ref_or_id, attrs, opts),
          {:ok, plan} <- plan_contract(ref_or_id, attrs, opts) do
       gate =
         PlanGate.evaluate(%{
-          "task_tool_route" => route,
+          "action_route" => route,
           "action_contract" => route["action_contract"],
           "plan_contract" => plan
         })
@@ -1062,7 +571,7 @@ defmodule Holt.Tasks do
       {:ok,
        ActionPreflight.evaluate(
          attrs
-         |> Map.put("task_tool_route", route)
+         |> Map.put("action_route", route)
          |> Map.put("action_contract", route["action_contract"])
          |> Map.put("plan_contract", plan)
          |> Map.put("plan_gate", gate)
@@ -1071,23 +580,21 @@ defmodule Holt.Tasks do
   end
 
   def consequence_gate(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, runtime_attrs} <- action_runtime_attrs(ref_or_id, attrs, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, runtime_attrs} <- action_runtime_attrs(ref_or_id, attrs, opts) do
       {:ok, ConsequenceGate.evaluate(runtime_attrs)}
     end
   end
 
   def action_runtime_envelope(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, runtime_attrs} <- action_runtime_attrs(ref_or_id, attrs, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, runtime_attrs} <- action_runtime_attrs(ref_or_id, attrs, opts) do
       {:ok, ActionRuntimeEnvelope.propose(runtime_attrs)}
     end
   end
 
-  def capability_registry(tool_name, attrs \\ %{}) when is_map(attrs) do
-    {:ok, CapabilityRegistry.lookup(tool_name, attrs)}
+  def capability_registry(action_name, attrs \\ %{}) when is_map(attrs) do
+    {:ok, CapabilityRegistry.lookup(action_name, attrs)}
   end
 
   def capability_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
@@ -1097,11 +604,11 @@ defmodule Holt.Tasks do
   end
 
   def capability_route(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, contract} <- capability_contract(ref_or_id, attrs, opts) do
       route_attrs =
         attrs
-        |> string_keys()
         |> Map.put("capability_contract", contract)
         |> Map.put("available_agents", available_capability_agents(task, attrs))
 
@@ -1117,9 +624,9 @@ defmodule Holt.Tasks do
 
   def work_graph(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, task_graph} <- maybe_plan_graph(root, task, attrs) do
       agent_runs = AgentRuns.list_for_task(task["id"], workspace: root)
 
@@ -1129,7 +636,7 @@ defmodule Holt.Tasks do
          "task_graph" => task_graph,
          "agent_runs" => agent_runs,
          "events" => agent_run_events_for_task(root, task),
-         "verification_gate" => graph_gate(task_graph) || latest_verification_gate(agent_runs),
+         "verification_gate" => graph_gate(task_graph),
          "child_agent_contracts" => attrs["child_agent_contracts"],
          "prediction_errors" => attrs["prediction_errors"]
        })}
@@ -1137,9 +644,8 @@ defmodule Holt.Tasks do
   end
 
   def work_graph_gate(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, graph} <- work_graph(ref_or_id, attrs, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, graph} <- work_graph(ref_or_id, attrs, opts) do
       {:ok,
        WorkGraph.completion_gate(%{
          "work_graph" => graph,
@@ -1150,28 +656,26 @@ defmodule Holt.Tasks do
 
   def work_graph_budget(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, targets} <- resolve_agent_work_targets(root, task, attrs) do
       {:ok,
        WorkGraphBudget.build(
          attrs
          |> Map.put("task", task)
-         |> Map.put("task_id", task["id"])
-         |> Map.put("task_ref", task["ref"])
          |> Map.put("candidate_agents", targets)
        )}
     end
   end
 
   def work_graph_schedule(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, graph} <- work_graph(ref_or_id, attrs, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, graph} <- work_graph(ref_or_id, attrs, opts) do
       {:ok,
        WorkGraphScheduler.schedule(
          attrs
+         |> Map.take(~w(policy_decision repair_orchestration completed_node_ids node_statuses))
          |> Map.put("work_graph", graph)
          |> Map.put("verification_gate", graph["completion_gate"])
        )}
@@ -1180,18 +684,17 @@ defmodule Holt.Tasks do
 
   def agent_dispatch_plan(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, targets} <- resolve_agent_work_targets(root, task, attrs) do
       {:ok, agent_work_dispatch_plan(task, targets, attrs, opts)}
     end
   end
 
   def team_orchestration(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
-
-    with {:ok, task} <- get(ref_or_id, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts) do
       {:ok,
        TeamOrchestration.plan(
          attrs
@@ -1201,10 +704,18 @@ defmodule Holt.Tasks do
     end
   end
 
-  def child_agent_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
+  def schedule_mob_colleague_flow(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+    root = Paths.workspace_root(opts)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, scheduled} <- MobColleagueFlow.schedule(root, ref_or_id, attrs, opts) do
+      maybe_start_mob_colleague_observation(root, scheduled, opts)
+    end
+  end
+
+  def child_agent_contract(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, plan} <- plan_contract(ref_or_id, attrs, opts) do
       action =
         case action_contract_for_child(ref_or_id, attrs, opts) do
@@ -1212,18 +723,97 @@ defmodule Holt.Tasks do
           {:error, _reason} -> %{}
         end
 
-      {:ok,
-       ChildAgentContract.build(
-         attrs
-         |> Map.put("task", task)
-         |> Map.put("plan_contract", plan)
-         |> Map.put("action_contract", action)
-         |> Map.put(
-           "evidence_contract",
-           evidence_contract_for_task(Paths.workspace_root(opts), task, attrs)
-         )
-         |> Map.put("context", child_agent_context(task, attrs))
-       )}
+      attrs
+      |> Map.put("task", task)
+      |> Map.put("plan_contract", plan)
+      |> Map.put("action_contract", action)
+      |> Map.put(
+        "evidence_contract",
+        evidence_contract_for_task(Paths.workspace_root(opts), task, attrs)
+      )
+      |> Map.put("context", child_agent_context(task, attrs))
+      |> ChildAgentContract.build()
+      |> child_agent_contract_result()
+    end
+  end
+
+  def delegate_to_agent(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+    root = Paths.workspace_root(opts)
+
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, role} <- required_text(attrs, "role"),
+         {:ok, system_prompt} <- required_text(attrs, "system_prompt"),
+         {:ok, instructions} <- required_text(attrs, "instructions") do
+      attrs =
+        attrs
+        |> Map.put("role", role)
+        |> Map.put("work_role", optional_text(attrs, "work_role"))
+        |> Map.put("system_prompt", system_prompt)
+        |> Map.put("instructions", instructions)
+
+      with {:ok, contract} <-
+             delegation_child_contract(ref_or_id, "delegate_to_agent", attrs, opts),
+           {:ok, child_task} <- create_delegated_task(ref_or_id, "delegate_to_agent", attrs, opts) do
+        delegation_id = Clock.id("agent_delegation")
+        maybe_record_parent_child_contract(root, opts, contract)
+
+        attrs
+        |> delegated_agent_work_attrs("delegate_to_agent", contract, delegation_id, child_task)
+        |> start_delegated_agent_work(child_task["ref"], "delegate_to_agent", opts)
+        |> delegated_agent_result(
+          "holt_task_agent_delegation/v1",
+          "delegation_id",
+          delegation_id,
+          attrs,
+          contract,
+          child_task,
+          root,
+          opts
+        )
+      end
+    end
+  end
+
+  def invoke_agent(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
+    root = Paths.workspace_root(opts)
+
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, agent_id} <- required_text(attrs, "agent_id"),
+         {:ok, profile} <- Agents.get(root, agent_id),
+         :ok <- ensure_task_agent_invokable(profile),
+         {:ok, instructions} <- required_text(attrs, "instructions"),
+         {:ok, target_skill} <- required_text(attrs, "target_skill"),
+         {:ok, validation_contract} <- required_text(attrs, "validation_contract") do
+      attrs =
+        attrs
+        |> Map.put("agent_id", profile["id"])
+        |> Map.put("target_agent_id", profile["id"])
+        |> Map.put("target_skill", target_skill)
+        |> Map.put("instructions", instructions)
+        |> Map.put("validation_contract", validation_contract)
+        |> Map.put("agent_card", Agents.profile_card(profile))
+        |> Map.put("system_prompt", profile["instructions"])
+        |> reject_empty()
+
+      with {:ok, contract} <- delegation_child_contract(ref_or_id, "invoke_agent", attrs, opts),
+           {:ok, child_task} <- create_delegated_task(ref_or_id, "invoke_agent", attrs, opts) do
+        invocation_id = Clock.id("agent_invocation")
+        maybe_record_parent_child_contract(root, opts, contract)
+
+        attrs
+        |> delegated_agent_work_attrs("invoke_agent", contract, invocation_id, child_task)
+        |> start_delegated_agent_work(child_task["ref"], "invoke_agent", opts)
+        |> delegated_agent_result(
+          "holt_task_agent_invocation/v1",
+          "invocation_id",
+          invocation_id,
+          attrs,
+          contract,
+          child_task,
+          root,
+          opts
+        )
+      end
     end
   end
 
@@ -1237,9 +827,9 @@ defmodule Holt.Tasks do
 
   def action_approval_request(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, envelope} <- action_runtime_envelope(ref_or_id, attrs, opts) do
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, envelope} <- action_runtime_envelope(ref_or_id, attrs, opts) do
       request =
         attrs
         |> Map.put("action_runtime_envelope", envelope)
@@ -1267,22 +857,27 @@ defmodule Holt.Tasks do
   def resolve_action_approval_request(request, attrs, opts)
       when is_map(request) and is_map(attrs) do
     root = Paths.workspace_root(opts)
-    request = string_keys(request)
-    resolution = HumanApprovalInbox.resolve(request, attrs)
-    {:ok, persist_action_approval_resolution(root, request, resolution)}
+
+    with {:ok, request} <- canonical_attrs(request),
+         {:ok, attrs} <- canonical_attrs(attrs) do
+      resolution = HumanApprovalInbox.resolve(request, attrs)
+      {:ok, persist_action_approval_resolution(root, request, resolution)}
+    end
   end
 
   def resolve_action_approval_request(request_id, attrs, opts)
       when is_binary(request_id) and is_map(attrs) do
     root = Paths.workspace_root(opts)
 
-    case find_action_approval_request(root, request_id) do
-      nil ->
-        {:error, :approval_request_not_found}
+    with {:ok, attrs} <- canonical_attrs(attrs) do
+      case find_action_approval_request(root, request_id) do
+        nil ->
+          {:error, :approval_request_not_found}
 
-      request ->
-        resolution = HumanApprovalInbox.resolve(request, attrs)
-        {:ok, persist_action_approval_resolution(root, request, resolution)}
+        request ->
+          resolution = HumanApprovalInbox.resolve(request, attrs)
+          {:ok, persist_action_approval_resolution(root, request, resolution)}
+      end
     end
   end
 
@@ -1291,9 +886,9 @@ defmodule Holt.Tasks do
 
   def action_evidence_ledger(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, envelope} <- evidence_envelope(ref_or_id, attrs, opts) do
       request =
         case Map.get(attrs, "approval_request") do
@@ -1374,9 +969,9 @@ defmodule Holt.Tasks do
 
   def start_agent_work(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, mode} <- enum_value(attrs, "mode", @agent_modes, "work"),
          {:ok, targets} <- resolve_agent_work_targets(root, task, attrs),
          dispatch_plan = agent_work_dispatch_plan(task, targets, attrs, opts),
@@ -1386,26 +981,29 @@ defmodule Holt.Tasks do
   end
 
   def start_agent_work_batch(params, opts \\ []) when is_map(params) do
-    params = string_keys(params)
+    with {:ok, params} <- canonical_attrs(params) do
+      case agent_work_request_items(params) do
+        {:single, item} ->
+          with {:ok, ref} <- task_ref_param(item) do
+            start_agent_work(ref, item, opts)
+          end
 
-    case agent_work_request_items(params) do
-      {:single, item} ->
-        with {:ok, ref} <- task_ref_param(item) do
-          start_agent_work(ref, item, opts)
-        end
+        {:batch, items} ->
+          execute_agent_work_batch(items, opts)
 
-      {:batch, items} ->
-        execute_agent_work_batch(items, opts)
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
   def continue_agent_work(ref_or_id, attrs \\ %{}, opts \\ []) when is_map(attrs) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, previous_work} <- agent_work_to_continue(task, attrs),
-         {:ok, mode} <- enum_value(attrs, "mode", @agent_modes, previous_work["mode"] || "work") do
+         {:ok, mode} <- enum_value(attrs, "mode", @agent_modes, previous_work_mode(previous_work)) do
       work_id = Clock.id("agent_work")
       now = Clock.iso_now()
       iteration = positive_integer(previous_work["iteration"], 1) + 1
@@ -1418,16 +1016,16 @@ defmodule Holt.Tasks do
           previous_work,
           previous_run,
           context_packet,
-          Map.put(attrs, "depth", iteration),
+          Map.put(attrs, "continuation_depth", iteration),
           opts
         )
 
       attrs = Map.put(attrs, "continuation_packet", continuation_packet)
 
       agent_ids =
-        normalize_string_list(
-          Map.get(attrs, "agent_ids", previous_work["agent_ids"] || [@default_agent_id])
-        )
+        attrs
+        |> Map.get("agent_ids", previous_agent_ids(previous_work))
+        |> normalize_string_list()
 
       work =
         %{
@@ -1441,25 +1039,20 @@ defmodule Holt.Tasks do
           "resumed_from_run_id" => previous_work["run_id"],
           "message" => optional_text(attrs, "message"),
           "agent_ids" => agent_ids,
-          "agent_id" => List.first(agent_ids) || previous_work["agent_id"],
+          "agent_id" => List.first(agent_ids),
           "assignee" => previous_work["assignee"],
           "dispatch_id" => previous_work["dispatch_id"],
           "dispatch_plan" => previous_work["dispatch_plan"],
-          "task_graph_id" =>
-            optional_text(attrs, "task_graph_id", optional_text(attrs, "graph_id")) ||
-              previous_work["task_graph_id"],
-          "task_graph_node_id" =>
-            optional_text(attrs, "task_graph_node_id", optional_text(attrs, "node_id")) ||
-              previous_work["task_graph_node_id"],
-          "task_graph_node_key" =>
-            optional_text(attrs, "task_graph_node_key", optional_text(attrs, "node_key")) ||
-              previous_work["task_graph_node_key"],
+          "task_graph_id" => continuation_graph_id(attrs, previous_work),
+          "task_graph_node_id" => continuation_node_id(attrs, previous_work),
+          "task_graph_node_key" => continuation_node_key(attrs, previous_work),
           "source" => optional_text(attrs, "source"),
           "context_packet_id" => context_packet["packet_id"],
           "continuation_packet" => continuation_packet,
           "policy" => work_policy(attrs, opts, previous_work["policy"]),
           "created_at" => now,
-          "started_at" => now
+          "started_at" => now,
+          "last_activity_at" => now
         }
         |> reject_empty()
 
@@ -1498,19 +1091,23 @@ defmodule Holt.Tasks do
 
     run_opts =
       opts
-      |> Keyword.put(:agent, work_agent_label(task, work))
+      |> Keyword.put(:agent_id, work["agent_id"])
       |> Keyword.put(:task_id, task["id"])
       |> Keyword.put(:task_ref, task["ref"])
+      |> Keyword.put(:agent_run_id, work["agent_run_id"])
 
     case Runtime.run(objective, run_opts) do
       {:ok, %{run: run, artifact: artifact} = result} ->
+        completed_at = Clock.iso_now()
+
         final_work =
           work
           |> Map.put("status", agent_work_status(run["status"]))
           |> Map.put("run_id", run["id"])
           |> Map.put("run_dir", run["run_dir"])
           |> maybe_put_artifact(artifact)
-          |> Map.put("completed_at", Clock.iso_now())
+          |> Map.put("completed_at", completed_at)
+          |> Map.put("last_activity_at", completed_at)
 
         classification = AgentRunFailureClassifier.classify(run)
         policy = AgentRunPolicy.for_task(task, final_work)
@@ -1522,7 +1119,7 @@ defmodule Holt.Tasks do
         {:ok, _agent_run} =
           AgentRuns.record_completed(root, task, final_work, run, %{
             "verification_gate" => default_verification_gate(run),
-            "output_summary" => summarize_output(Map.get(result, :output)),
+            "output_summary" => summarize_output(result_output(result)),
             "classification" => classification,
             "policy" => policy,
             "continuation_decision" => decision
@@ -1546,24 +1143,39 @@ defmodule Holt.Tasks do
             })
           end)
 
+        task_graph = selected_task_graph(finished_task_graph, running_task_graph)
+
         base_result =
           result
           |> Map.put(:task, enrich_task(root, final_task))
           |> Map.put(:agent_work, enrich_agent_work(final_work))
           |> Map.put(:continuation_decision, decision)
-          |> Map.put(:task_graph, finished_task_graph || running_task_graph)
-          |> Map.put(:task_graph_gate, graph_gate(finished_task_graph || running_task_graph))
+          |> Map.put(:task_graph, task_graph)
+          |> Map.put(:task_graph_gate, graph_gate(task_graph))
 
-        maybe_auto_continue(root, final_task, final_work, decision, base_result, opts)
+        with {:ok, mob_result, mob_task} <-
+               maybe_start_mob_colleague_reviews(
+                 root,
+                 final_task,
+                 final_work,
+                 run,
+                 base_result,
+                 opts
+               ) do
+          maybe_auto_continue(root, mob_task, final_work, decision, mob_result, opts)
+        end
 
       {:error, %{run: run, reason: reason}} ->
+        completed_at = Clock.iso_now()
+
         final_work =
           work
           |> Map.put("status", agent_work_status(run["status"]))
           |> Map.put("run_id", run["id"])
           |> Map.put("run_dir", run["run_dir"])
           |> Map.put("failure_reason", inspect(reason))
-          |> Map.put("completed_at", Clock.iso_now())
+          |> Map.put("completed_at", completed_at)
+          |> Map.put("last_activity_at", completed_at)
 
         classification = AgentRunFailureClassifier.classify(run, reason)
         policy = AgentRunPolicy.for_task(task, final_work)
@@ -1598,14 +1210,16 @@ defmodule Holt.Tasks do
             })
           end)
 
+        task_graph = selected_task_graph(failed_task_graph, running_task_graph)
+
         error_result = %{
           task: enrich_task(root, final_task),
           run: run,
           reason: reason,
           agent_work: enrich_agent_work(final_work),
           continuation_decision: decision,
-          task_graph: failed_task_graph || running_task_graph,
-          task_graph_gate: graph_gate(failed_task_graph || running_task_graph)
+          task_graph: task_graph,
+          task_graph_gate: graph_gate(task_graph)
         }
 
         case decision["action"] do
@@ -1617,11 +1231,14 @@ defmodule Holt.Tasks do
         end
 
       {:error, reason} ->
+        completed_at = Clock.iso_now()
+
         final_work =
           work
           |> Map.put("status", "failed")
           |> Map.put("failure_reason", inspect(reason))
-          |> Map.put("completed_at", Clock.iso_now())
+          |> Map.put("completed_at", completed_at)
+          |> Map.put("last_activity_at", completed_at)
 
         failed_task_graph = block_work_graph_node(root, final_work, %{}, reason)
 
@@ -1640,22 +1257,24 @@ defmodule Holt.Tasks do
             })
           end)
 
+        task_graph = selected_task_graph(failed_task_graph, running_task_graph)
+
         {:error,
          %{
            task: enrich_task(root, final_task),
            reason: reason,
            agent_work: enrich_agent_work(final_work),
-           task_graph: failed_task_graph || running_task_graph,
-           task_graph_gate: graph_gate(failed_task_graph || running_task_graph)
+           task_graph: task_graph,
+           task_graph_gate: graph_gate(task_graph)
          }}
     end
   end
 
   def route_verification(ref_or_id, attrs, opts \\ []) when is_map(attrs) do
-    attrs = string_keys(attrs)
     root = Paths.workspace_root(opts)
 
-    with {:ok, task} <- get(ref_or_id, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
          {:ok, checks} <- normalize_checks(Map.get(attrs, "checks", [])) do
       contract = evidence_contract_for_task(root, task, attrs)
 
@@ -1679,7 +1298,7 @@ defmodule Holt.Tasks do
 
       report =
         %{
-          "schema_version" => "holtworks_verification_report/v1",
+          "schema_version" => "holt_verification_report/v1",
           "id" => Clock.id("verification"),
           "task_id" => task["id"],
           "task_ref" => task["ref"],
@@ -1744,109 +1363,47 @@ defmodule Holt.Tasks do
     end
   end
 
-  def tasks_path(root), do: Path.join(Paths.tasks_dir(root), "tasks.json")
-  def counter_path(root), do: Path.join(Paths.tasks_dir(root), "counter.json")
-  def specs_index_path(root), do: Path.join(Paths.tasks_dir(root), "specs.json")
-  def agents_path(root), do: Agents.path(root)
-  def agent_events_path(root), do: Agents.events_path(root)
-  def agent_runs_path(root), do: AgentRuns.path(root)
-  def agent_run_events_path(root), do: AgentRuns.events_path(root)
-  def task_graphs_path(root), do: TaskGraphs.path(root)
-  def task_graph_events_path(root), do: TaskGraphs.events_path(root)
+  def tasks_path(root), do: Store.tasks_path(root)
+  def counter_path(root), do: Store.counter_path(root)
+  def specs_index_path(root), do: Store.specs_index_path(root)
+  def agents_path(root), do: Store.agents_path(root)
+  def agent_events_path(root), do: Store.agent_events_path(root)
+  def agent_runs_path(root), do: Store.agent_runs_path(root)
+  def agent_run_events_path(root), do: Store.agent_run_events_path(root)
+  def task_graphs_path(root), do: Store.task_graphs_path(root)
+  def task_graph_events_path(root), do: Store.task_graph_events_path(root)
+  def verifier_calibrations_path(root), do: Store.verifier_calibrations_path(root)
 
-  def verifier_calibrations_path(root),
-    do: Path.join(Paths.tasks_dir(root), "verifier_calibrations.json")
+  defp ensure_store(root), do: Store.ensure(root)
 
-  defp ensure_store(root) do
-    Paths.ensure_workspace(root)
-    File.mkdir_p!(Paths.tasks_dir(root))
-    File.mkdir_p!(Paths.task_specs_dir(root))
-    unless File.exists?(tasks_path(root)), do: JSON.write(tasks_path(root), [])
-    unless File.exists?(specs_index_path(root)), do: JSON.write(specs_index_path(root), [])
-    Agents.ensure_store(root)
-    AgentRuns.ensure_store(root)
-    TaskGraphs.ensure_store(root)
-    TaskMemory.ensure_store(root)
+  defp load_specs(root), do: Store.load_specs(root)
 
-    unless File.exists?(verifier_calibrations_path(root)),
-      do: JSON.write(verifier_calibrations_path(root), [])
+  defp enrich_task(root, task), do: Store.enrich_task(root, task)
 
-    unless File.exists?(counter_path(root)),
-      do: JSON.write(counter_path(root), %{"next_number" => 1})
-
-    :ok
-  end
-
-  defp load_tasks(root), do: JSON.read(tasks_path(root), [])
-  defp load_specs(root), do: JSON.read(specs_index_path(root), [])
-
-  defp enrich_task(root, task) do
-    runs = AgentRuns.list_for_task(task["id"], workspace: root)
-
-    task
-    |> Map.update("assignees", [], &Agents.enrich_assignees(root, &1))
-    |> Map.update("agent_work", [], fn work_items ->
-      Enum.map(work_items, &enrich_agent_work(&1, runs))
-    end)
-  end
-
-  defp enrich_agent_work(work), do: AgentWorkLiveness.enrich(work)
-
-  defp enrich_agent_work(work, runs) do
-    run =
-      Enum.find(runs, fn candidate ->
-        candidate["id"] == work["agent_run_id"] or candidate["work_id"] == work["id"]
-      end)
-
-    work
-    |> maybe_put_agent_run_summary(run)
-    |> AgentWorkLiveness.enrich()
-  end
-
-  defp maybe_put_agent_run_summary(work, nil), do: work
-
-  defp maybe_put_agent_run_summary(work, run) do
-    Map.put(work, "agent_run", %{
-      "id" => run["id"],
-      "status" => run["status"],
-      "lifecycle_state" => run["lifecycle_state"],
-      "runtime_status" => run["runtime_status"],
-      "objective_status" => run["objective_status"],
-      "agent_id" => run["agent_id"],
-      "dispatch_id" => run["dispatch_id"],
-      "source" => run["source"],
-      "previous_run_id" => run["previous_run_id"]
-    })
-  end
+  defp enrich_agent_work(work), do: Store.enrich_agent_work(work)
 
   defp graph_gate(nil), do: nil
   defp graph_gate(graph), do: graph["mission_control"]
 
+  defp selected_task_graph(primary, _secondary) when is_map(primary), do: primary
+  defp selected_task_graph(_primary, secondary), do: secondary
+
   defp agent_run_events_for_task(root, task) do
     root
     |> AgentRuns.event_log()
-    |> Enum.filter(fn event ->
-      event["task_id"] == task["id"] or event["task_ref"] == task["ref"]
-    end)
+    |> Enum.filter(&task_event?(task, &1))
   end
 
-  defp latest_verification_gate(agent_runs) do
-    agent_runs
-    |> Enum.reverse()
-    |> Enum.find_value(fn run ->
-      case run["verification_gate"] do
-        gate when is_map(gate) and gate != %{} -> gate
-        _missing -> nil
-      end
-    end)
+  defp task_event?(task, event) do
+    Enum.any?([event["task_id"] == task["id"], event["task_ref"] == task["ref"]], & &1)
   end
 
   defp action_contract_for_child(ref_or_id, attrs, opts) do
-    case optional_text(attrs, "tool_name", optional_text(attrs, "name")) do
-      tool_name when tool_name in [nil, ""] ->
+    case optional_text(attrs, "action") do
+      action_name when action_name in [nil, ""] ->
         {:ok, %{}}
 
-      _tool_name ->
+      _action_name ->
         action_contract(ref_or_id, attrs, opts)
     end
   end
@@ -1856,11 +1413,362 @@ defmodule Holt.Tasks do
       "task_id" => task["id"],
       "task_ref" => task["ref"],
       "parent_task_id" => task["parent_id"],
-      "agent_id" => optional_text(attrs, "agent_id", optional_text(attrs, "agent")),
-      "run_id" => optional_text(attrs, "run_id", optional_text(attrs, "agent_run_id"))
+      "agent_id" => optional_text(attrs, "agent_id"),
+      "run_id" => optional_text(attrs, "run_id")
     }
     |> reject_empty()
   end
+
+  defp child_agent_contract_result({:error, _reason} = error), do: error
+  defp child_agent_contract_result(contract) when is_map(contract), do: {:ok, contract}
+
+  defp delegation_child_contract(ref_or_id, action_name, attrs, opts) do
+    contract_args =
+      attrs
+      |> Map.put("child_ref", child_ref(action_name, attrs))
+      |> Map.put("target_agent_id", optional_text(attrs, "target_agent_id"))
+      |> Map.put("allowed_actions", normalize_string_list(attrs["allowed_actions"]))
+      |> reject_empty()
+
+    child_agent_contract(
+      ref_or_id,
+      %{
+        "action" => action_name,
+        "arguments" => contract_args,
+        "agent_id" => opts[:agent_id],
+        "run_id" => opts[:agent_run_id],
+        "source" => action_name
+      },
+      opts
+    )
+  end
+
+  defp child_ref("invoke_agent", attrs), do: optional_text(attrs, "target_agent_id")
+  defp child_ref("delegate_to_agent", attrs), do: optional_text(attrs, "role")
+  defp child_ref(_action_name, attrs), do: optional_text(attrs, "child_ref")
+
+  defp create_delegated_task(ref_or_id, action_name, attrs, opts) do
+    root = Paths.workspace_root(opts)
+
+    with {:ok, parent_task} <- get(ref_or_id, opts),
+         {:ok, assignee} <- delegated_task_assignee(root, action_name, attrs, opts) do
+      create(delegated_task_attrs(parent_task, action_name, attrs, assignee), opts)
+    end
+  end
+
+  defp delegated_task_attrs(parent_task, action_name, attrs, assignee) do
+    %{
+      "title" => delegated_task_title(parent_task, action_name, attrs),
+      "description" => delegated_task_description(parent_task, action_name, attrs),
+      "status" => "todo",
+      "kind" => "task",
+      "priority" => parent_task["priority"],
+      "estimate" => parent_task["estimate"],
+      "origin" => action_name,
+      "parent_id" => parent_task["id"],
+      "assignees" => [assignee],
+      "labels" => delegated_task_labels(parent_task),
+      "agent_policy" => normalize_agent_policy(Map.get(attrs, "policy", %{}))
+    }
+    |> reject_empty()
+  end
+
+  defp delegated_task_title(parent_task, action_name, attrs) do
+    case optional_text(attrs, "task_title") do
+      value when value in [nil, ""] ->
+        default_delegated_task_title(parent_task, action_name, attrs)
+
+      value ->
+        value
+    end
+  end
+
+  defp default_delegated_task_title(parent_task, "invoke_agent", attrs) do
+    agent_id = optional_text(attrs, "target_agent_id", optional_text(attrs, "agent_id", "agent"))
+    "Invoke #{agent_id} for #{parent_task["ref"]}"
+  end
+
+  defp default_delegated_task_title(parent_task, "delegate_to_agent", attrs) do
+    role = optional_text(attrs, "work_role", optional_text(attrs, "role", "agent"))
+    "Delegate #{role} work for #{parent_task["ref"]}"
+  end
+
+  defp default_delegated_task_title(parent_task, _action_name, _attrs) do
+    "Delegated work for #{parent_task["ref"]}"
+  end
+
+  defp delegated_task_description(parent_task, action_name, attrs) do
+    [
+      "Parent task: #{parent_task["ref"]} #{parent_task["title"]}",
+      "Delegation action: #{action_name}",
+      text_section("Instructions", optional_text(attrs, "instructions")),
+      text_section("Validation contract", optional_text(attrs, "validation_contract")),
+      text_section("Target skill", optional_text(attrs, "target_skill"))
+    ]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp delegated_task_labels(parent_task) do
+    parent_labels =
+      parent_task
+      |> Map.get("labels", [])
+      |> Enum.filter(&is_map/1)
+
+    delegated_label = %{"name" => "delegated-agent-work", "color" => "#7c3aed"}
+
+    if Enum.any?(parent_labels, &(&1["name"] == delegated_label["name"])) do
+      parent_labels
+    else
+      parent_labels ++ [delegated_label]
+    end
+  end
+
+  defp delegated_task_assignee(root, action_name, attrs, opts) do
+    with {:ok, agent_id} <- delegated_task_agent_id(action_name, attrs, opts) do
+      assignee =
+        root
+        |> Agents.assignees_for_ids([agent_id])
+        |> List.first()
+        |> Map.put("work_role", delegated_task_work_role(action_name, attrs))
+
+      {:ok, assignee}
+    end
+  end
+
+  defp delegated_task_agent_id("invoke_agent", attrs, _opts) do
+    required_text(attrs, "target_agent_id")
+  end
+
+  defp delegated_task_agent_id("delegate_to_agent", attrs, opts) do
+    {:ok, delegated_target_agent_id(attrs, opts)}
+  end
+
+  defp delegated_task_agent_id(_action_name, _attrs, _opts), do: {:ok, @default_agent_id}
+
+  defp current_agent_id(opts) do
+    case opts[:agent_id] do
+      agent_id when is_binary(agent_id) and agent_id != "" -> agent_id
+      _missing -> nil
+    end
+  end
+
+  defp delegated_target_agent_id(attrs, opts) do
+    case optional_text(attrs, "target_agent_id") do
+      value when value in [nil, ""] ->
+        case current_agent_id(opts) do
+          agent_id when is_binary(agent_id) and agent_id != "" -> agent_id
+          _missing -> @default_agent_id
+        end
+
+      value ->
+        value
+    end
+  end
+
+  defp delegated_task_work_role(action_name, attrs) do
+    case optional_text(attrs, "work_role") do
+      value when value in [nil, ""] -> ChildAgentContract.work_role(attrs, action_name)
+      value -> value
+    end
+  end
+
+  defp delegated_work_agent_id(child_task) do
+    child_task
+    |> Map.get("assignees", [])
+    |> normalize_assignees()
+    |> List.first()
+    |> case do
+      %{"id" => id} when is_binary(id) and id != "" -> id
+      %{"agent_id" => agent_id} when is_binary(agent_id) and agent_id != "" -> agent_id
+      _missing -> @default_agent_id
+    end
+  end
+
+  defp child_completion_status(run, work) do
+    case run["status"] do
+      value when value in [nil, ""] -> work["status"]
+      value -> value
+    end
+  end
+
+  defp delegated_agent_work_attrs(attrs, action_name, child_contract, request_id, child_task) do
+    target_agent_id = delegated_work_agent_id(child_task)
+
+    %{
+      "message" => delegated_agent_message(action_name, attrs, child_contract),
+      "mode" => optional_text(attrs, "mode", "work"),
+      "source" => action_name,
+      "request_id" => request_id,
+      "agent_id" => target_agent_id,
+      "max_agents_per_event" => 1,
+      "child_agent_contract" => child_contract,
+      "target_skill" => optional_text(attrs, "target_skill"),
+      "work_role" => optional_text(attrs, "work_role"),
+      "validation_contract" => optional_text(attrs, "validation_contract"),
+      "allowed_actions" => normalize_string_list(attrs["allowed_actions"]),
+      "input_artifacts" => normalize_string_list(attrs["input_artifacts"]),
+      "expected_output_artifacts" => normalize_string_list(attrs["expected_output_artifacts"]),
+      "handoff_requirements" => normalize_string_list(attrs["handoff_requirements"]),
+      "max_autonomy" => optional_text(attrs, "max_autonomy")
+    }
+    |> put_request_id(action_name, request_id)
+    |> reject_empty()
+  end
+
+  defp put_request_id(work_attrs, "delegate_to_agent", request_id),
+    do: Map.put(work_attrs, "delegation_id", request_id)
+
+  defp put_request_id(work_attrs, "invoke_agent", request_id),
+    do: Map.put(work_attrs, "invocation_id", request_id)
+
+  defp put_request_id(work_attrs, _action_name, _request_id), do: work_attrs
+
+  defp delegated_agent_message(action_name, attrs, child_contract) do
+    [
+      "Child agent action: #{action_name}",
+      text_section("Role", optional_text(attrs, "work_role", optional_text(attrs, "role"))),
+      text_section("Target agent", optional_text(attrs, "target_agent_id")),
+      text_section("Target skill", optional_text(attrs, "target_skill")),
+      text_section("System prompt", optional_text(attrs, "system_prompt")),
+      text_section("Instructions", optional_text(attrs, "instructions")),
+      text_section("Validation contract", optional_text(attrs, "validation_contract")),
+      text_section("Allowed actions", normalize_string_list(attrs["allowed_actions"])),
+      text_section("Child contract", Jason.encode!(child_contract, pretty: true))
+    ]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp text_section(_title, value) when value in [nil, "", []], do: nil
+
+  defp text_section(title, values) when is_list(values),
+    do: "#{title}: " <> Enum.join(values, ", ")
+
+  defp text_section(title, value), do: "#{title}:\n#{value}"
+
+  defp start_delegated_agent_work(work_attrs, ref_or_id, action_name, opts) do
+    start_agent_work(ref_or_id, work_attrs, Keyword.put(opts, :source, action_name))
+  end
+
+  defp delegated_agent_result(
+         {:ok, result},
+         schema_version,
+         id_key,
+         id,
+         attrs,
+         child_contract,
+         child_task,
+         root,
+         opts
+       ) do
+    maybe_record_parent_child_completion(root, opts, result)
+
+    {:ok,
+     %{
+       "schema_version" => schema_version,
+       id_key => id,
+       "status" => "completed",
+       "role" => optional_text(attrs, "role"),
+       "work_role" => optional_text(attrs, "work_role"),
+       "agent_id" => optional_text(attrs, "target_agent_id"),
+       "target_skill" => optional_text(attrs, "target_skill"),
+       "validation_contract" => optional_text(attrs, "validation_contract"),
+       "child_agent_contract" => child_contract,
+       "created_task" => child_task,
+       "delegated_task" => result_task(result),
+       "agent_work" => result_work(result),
+       "agent_run" => result_run(result),
+       "task" => result_task(result),
+       "output" => result_output(result),
+       "started" => optional_result(result, :started),
+       "dispatch_plan" => optional_result(result, :dispatch_plan),
+       "task_graph" => optional_result(result, :task_graph),
+       "task_graph_gate" => optional_result(result, :task_graph_gate),
+       "created_at" => Clock.iso_now()
+     }
+     |> reject_empty()}
+  end
+
+  defp delegated_agent_result(
+         {:error, reason},
+         _schema_version,
+         _id_key,
+         _id,
+         _attrs,
+         _child_contract,
+         _child_task,
+         _root,
+         _opts
+       ),
+       do: {:error, delegated_agent_failure_reason(reason)}
+
+  defp delegated_agent_failure_reason(%{reason: reason}), do: reason
+  defp delegated_agent_failure_reason(%{"reason" => reason}), do: reason
+  defp delegated_agent_failure_reason(reason), do: reason
+
+  defp maybe_record_parent_child_contract(root, opts, child_contract) do
+    case opts[:agent_run_id] do
+      run_id when is_binary(run_id) and run_id != "" ->
+        case AgentRuns.record_child_agent_contract(root, run_id, child_contract) do
+          {:ok, _run, _event} -> :ok
+          {:duplicate, _run, _event} -> :ok
+          {:error, _reason} -> :ok
+        end
+
+      _missing ->
+        :ok
+    end
+  end
+
+  defp maybe_record_parent_child_completion(root, opts, result) do
+    work = result_work(result)
+    run = result_run(result)
+
+    attrs =
+      %{
+        "child_agent_id" => work["agent_id"],
+        "child_agent_work_id" => work["id"],
+        "child_run_id" => run["id"],
+        "status" => child_completion_status(run, work),
+        "message" => "Child task-agent work completed."
+      }
+      |> reject_empty()
+
+    maybe_emit_parent_child_completion(opts, attrs)
+
+    case opts[:agent_run_id] do
+      run_id when is_binary(run_id) and run_id != "" ->
+        case AgentRuns.record_child_agent_completion(root, run_id, attrs) do
+          {:ok, _run, _event} -> :ok
+          {:duplicate, _run, _event} -> :ok
+          {:error, _reason} -> :ok
+        end
+
+      _missing ->
+        :ok
+    end
+  end
+
+  defp maybe_emit_parent_child_completion(opts, attrs) do
+    case opts[:runtime_event_callback] do
+      callback when is_function(callback, 1) ->
+        attrs
+        |> Map.put("type", "child_agent.completed")
+        |> Map.put("agent_run_id", opts[:agent_run_id])
+        |> reject_empty()
+        |> callback.()
+
+      _missing ->
+        :ok
+    end
+  end
+
+  defp ensure_task_agent_invokable(%{"status" => "active", "lifecycle_state" => "active"}),
+    do: :ok
+
+  defp ensure_task_agent_invokable(%{"status" => "active"}), do: :ok
+  defp ensure_task_agent_invokable(_profile), do: {:error, :agent_not_invokable}
 
   defp evidence_contract_for_task(root, task, attrs) do
     specs =
@@ -1876,7 +1784,7 @@ defmodule Holt.Tasks do
   end
 
   defp verifier_route_graph(root, task, attrs) do
-    case optional_text(attrs, "graph_id", optional_text(attrs, "task_graph_id")) do
+    case optional_text(attrs, "graph_id") do
       graph_id when graph_id not in [nil, ""] ->
         TaskGraphs.get(root, graph_id)
 
@@ -1892,7 +1800,7 @@ defmodule Holt.Tasks do
   end
 
   defp maybe_plan_graph(root, task, attrs) do
-    case optional_text(attrs, "graph_id", optional_text(attrs, "task_graph_id")) do
+    case optional_text(attrs, "graph_id") do
       graph_id when graph_id not in [nil, ""] ->
         TaskGraphs.get(root, graph_id)
 
@@ -1902,11 +1810,19 @@ defmodule Holt.Tasks do
   end
 
   defp calibration_assignment(ref_or_id, attrs, opts) do
-    case Map.get(attrs, "verifier_assignment") || Map.get(attrs, "assignment") do
-      assignment when is_map(assignment) ->
-        {:ok, string_keys(assignment)}
+    cond do
+      Map.has_key?(attrs, "assignment") ->
+        {:error, {:unsupported_argument, "assignment"}}
 
-      _missing ->
+      is_map(Map.get(attrs, "verifier_assignment")) ->
+        assignment = Map.get(attrs, "verifier_assignment")
+
+        case canonical_map?(assignment) do
+          true -> {:ok, assignment}
+          false -> {:error, :invalid_verifier_assignment}
+        end
+
+      true ->
         verifier_assignment(ref_or_id, attrs, opts)
     end
   end
@@ -1915,7 +1831,7 @@ defmodule Holt.Tasks do
     source =
       case Map.get(attrs, "available_agents") do
         agents when is_list(agents) and agents != [] -> agents
-        _missing -> task["assignees"] || []
+        _missing -> Map.get(task, "assignees", [])
       end
 
     source
@@ -1965,23 +1881,32 @@ defmodule Holt.Tasks do
     end)
   end
 
-  defp route_task_tool_session(ref_or_id, attrs, opts) do
-    case Map.get(attrs, "task_tool_session") || Map.get(attrs, "session") do
-      session when is_map(session) ->
-        {:ok, TaskToolSession.build(session)}
+  defp route_action_session(ref_or_id, attrs, opts) do
+    case {Map.fetch(attrs, "action_session"), Map.fetch(attrs, "session")} do
+      {{:ok, _session}, {:ok, _legacy_session}} ->
+        {:error, :unsupported_session_argument}
 
-      _missing ->
-        task_tool_session(ref_or_id, attrs, opts)
+      {{:ok, session}, :error} when is_map(session) ->
+        {:ok, ActionSession.build(session)}
+
+      {{:ok, _session}, :error} ->
+        {:error, :invalid_action_session}
+
+      {:error, {:ok, _legacy_session}} ->
+        {:error, :unsupported_session_argument}
+
+      {:error, :error} ->
+        action_session(ref_or_id, attrs, opts)
     end
   end
 
   defp action_runtime_attrs(ref_or_id, attrs, opts) do
     with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, route} <- route_task_tool(ref_or_id, attrs, opts),
+         {:ok, route} <- route_action(ref_or_id, attrs, opts),
          {:ok, plan} <- plan_contract(ref_or_id, attrs, opts) do
       gate =
         PlanGate.evaluate(%{
-          "task_tool_route" => route,
+          "action_route" => route,
           "action_contract" => route["action_contract"],
           "plan_contract" => plan
         })
@@ -1989,7 +1914,7 @@ defmodule Holt.Tasks do
       preflight =
         ActionPreflight.evaluate(
           attrs
-          |> Map.put("task_tool_route", route)
+          |> Map.put("action_route", route)
           |> Map.put("action_contract", route["action_contract"])
           |> Map.put("plan_contract", plan)
           |> Map.put("plan_gate", gate)
@@ -1999,7 +1924,7 @@ defmodule Holt.Tasks do
        attrs
        |> Map.put("task", task)
        |> Map.put("context", action_runtime_context(task, attrs))
-       |> Map.put("task_tool_route", route)
+       |> Map.put("action_route", route)
        |> Map.put("action_contract", route["action_contract"])
        |> Map.put("plan_contract", plan)
        |> Map.put("plan_gate", gate)
@@ -2008,9 +1933,12 @@ defmodule Holt.Tasks do
   end
 
   defp evidence_envelope(ref_or_id, attrs, opts) do
-    case Map.get(attrs, "action_runtime_envelope") || Map.get(attrs, "envelope") do
+    case Map.get(attrs, "action_runtime_envelope") do
       envelope when is_map(envelope) ->
-        {:ok, string_keys(envelope)}
+        case canonical_map?(envelope) do
+          true -> {:ok, envelope}
+          false -> {:error, :invalid_action_runtime_envelope}
+        end
 
       _missing ->
         with {:ok, proposed} <- action_runtime_envelope(ref_or_id, attrs, opts) do
@@ -2026,7 +1954,7 @@ defmodule Holt.Tasks do
 
   defp completion_attrs?(attrs) do
     Enum.any?(
-      ~w(result status result_status execution_observation observed_changes observed_state_changes),
+      ~w(result result_status execution_observation observed_changes observed_state_changes),
       &Map.has_key?(attrs, &1)
     )
   end
@@ -2039,7 +1967,7 @@ defmodule Holt.Tasks do
   defp maybe_put_result_from_status(%{"result" => _result} = attrs), do: attrs
 
   defp maybe_put_result_from_status(attrs) do
-    status = Map.get(attrs, "result_status") || Map.get(attrs, "status")
+    status = Map.get(attrs, "result_status")
 
     if status in [nil, ""] do
       attrs
@@ -2061,7 +1989,7 @@ defmodule Holt.Tasks do
   defp maybe_record_approval_memory(_root, %{"status" => "not_required"}), do: :ok
 
   defp maybe_record_approval_memory(root, request) when is_map(request) do
-    case get(request["task_id"] || request["task_ref"], workspace: root) do
+    case get(request["task_id"], workspace: root) do
       {:ok, task} ->
         TaskMemory.record_artifact(root, task, %{
           "kind" => "human_approval_request",
@@ -2070,7 +1998,7 @@ defmodule Holt.Tasks do
           "source" => "action_approval_request",
           "metadata" => %{
             "approval_request_id" => request["approval_request_id"],
-            "tool_name" => request["tool_name"],
+            "action_name" => request["action_name"],
             "status" => request["status"]
           }
         })
@@ -2092,7 +2020,7 @@ defmodule Holt.Tasks do
       "source" => "action_evidence_ledger",
       "metadata" => %{
         "ledger_id" => ledger["ledger_id"],
-        "tool_name" => ledger["source_tool_name"]
+        "action_name" => ledger["source_action_name"]
       }
     })
 
@@ -2168,27 +2096,25 @@ defmodule Holt.Tasks do
   end
 
   defp envelope_task_ref(envelope) do
-    get_in(envelope, ["action_contract", "target_refs", "task_ref"]) ||
-      get_in(envelope, ["state_snapshot", "task_state", "task_ref"])
+    get_in(envelope, ["action_contract", "target_refs", "task_ref"])
   end
 
   defp envelope_task_id(envelope) do
-    get_in(envelope, ["action_contract", "target_refs", "task_id"]) ||
-      get_in(envelope, ["state_snapshot", "task_state", "task_id"])
+    get_in(envelope, ["action_contract", "target_refs", "task_id"])
   end
 
   defp capability_attrs(ref_or_id, attrs, opts) do
     root = Paths.workspace_root(opts)
-    attrs = string_keys(attrs)
 
-    with {:ok, task} <- get(ref_or_id, opts),
-         {:ok, session} <- route_task_tool_session(ref_or_id, attrs, opts),
+    with {:ok, attrs} <- canonical_attrs(attrs),
+         {:ok, task} <- get(ref_or_id, opts),
+         {:ok, session} <- route_action_session(ref_or_id, attrs, opts),
          {:ok, plan} <- plan_contract(ref_or_id, attrs, opts) do
       {:ok,
        attrs
        |> Map.put("task", task)
        |> Map.put("workspace", root)
-       |> Map.put("task_tool_session", session)
+       |> Map.put("action_session", session)
        |> Map.put("plan_contract", plan)
        |> Map.put("evidence_contract", evidence_contract_for_task(root, task, attrs))
        |> Map.put("available_agents", available_capability_agents(task, attrs))}
@@ -2196,8 +2122,6 @@ defmodule Holt.Tasks do
   end
 
   defp available_capability_agents(task, attrs) do
-    attrs = string_keys(attrs || %{})
-
     case Map.get(attrs, "available_agents") do
       agents when is_list(agents) and agents != [] ->
         agents
@@ -2206,7 +2130,7 @@ defmodule Holt.Tasks do
         normalize_string_list(agents)
 
       _missing ->
-        task["assignees"] || []
+        Map.get(task, "assignees", [])
     end
   end
 
@@ -2216,9 +2140,9 @@ defmodule Holt.Tasks do
       "task_id" => task["id"],
       "task_ref" => task["ref"],
       "parent_task_id" => task["parent_id"],
-      "agent_id" => optional_text(attrs, "agent_id", optional_text(attrs, "agent", "default")),
+      "agent_id" => optional_text(attrs, "agent_id", "default"),
       "agent_ref" => optional_text(attrs, "agent_ref"),
-      "run_id" => optional_text(attrs, "run_id", optional_text(attrs, "agent_run_id")),
+      "run_id" => optional_text(attrs, "run_id"),
       "work_role" => optional_text(attrs, "work_role"),
       "approval_status" => optional_text(attrs, "approval_status"),
       "approval_already_granted" => Map.get(attrs, "approval_already_granted"),
@@ -2231,8 +2155,7 @@ defmodule Holt.Tasks do
   end
 
   defp task_memory_context_attrs(root, task, attrs, opts) do
-    content_limit =
-      positive_integer(option(opts, :content_limit) || attrs["content_limit"], 1_600)
+    content_limit = positive_integer(memory_content_limit(attrs, opts), 1_600)
 
     specs =
       root
@@ -2244,7 +2167,14 @@ defmodule Holt.Tasks do
     attrs
     |> Map.put("specs", specs)
     |> Map.put("agent_runs", AgentRuns.list_for_task(task["id"], workspace: root))
-    |> Map.put_new("policy", task["agent_policy"] || %{})
+    |> Map.put_new("policy", Map.get(task, "agent_policy", %{}))
+  end
+
+  defp memory_content_limit(attrs, opts) do
+    case Map.get(attrs, "content_limit") do
+      value when value in [nil, ""] -> option(opts, :content_limit)
+      value -> value
+    end
   end
 
   defp task_memory_context_packet(root, task, attrs, opts) do
@@ -2254,7 +2184,7 @@ defmodule Holt.Tasks do
 
       {:error, _reason} ->
         %{
-          "schema_version" => "holtworks_task_memory_context_packet/v1",
+          "schema_version" => "holt_task_memory_context_packet/v1",
           "packet_id" => Clock.id("task_memory_packet"),
           "task_id" => task["id"],
           "task_ref" => task["ref"],
@@ -2266,29 +2196,79 @@ defmodule Holt.Tasks do
   defp agent_run_for_work(root, task_id, work) do
     task_id
     |> AgentRuns.list_for_task(workspace: root)
-    |> Enum.find(fn run ->
-      run["id"] == work["agent_run_id"] or run["work_id"] == work["id"] or
+    |> Enum.find(&run_matches_work?(&1, work))
+  end
+
+  defp run_matches_work?(run, work) do
+    Enum.any?(
+      [
+        run["id"] == work["agent_run_id"],
+        run["work_id"] == work["id"],
         run["run_id"] == work["run_id"]
-    end)
+      ],
+      & &1
+    )
   end
 
   defp build_continuation_packet(task, previous_work, previous_run, context_packet, attrs, opts) do
-    ContinuationPacket.build(%{
-      "task" => task,
-      "agent_work" => previous_work,
-      "agent_run" => previous_run || %{},
+    agent_run =
+      case previous_run do
+        run when is_map(run) -> run
+        _missing -> %{}
+      end
+
+    %{
+      "task" => continuation_task(task),
+      "agent_work" => continuation_agent_work(previous_work),
+      "agent_run" => continuation_agent_run(agent_run),
       "context_packet" => context_packet,
-      "depth" => attrs["depth"] || attrs["continuation_depth"],
-      "agent_id" =>
-        optional_text(attrs, "agent_id") || List.first(normalize_string_list(attrs["agent_ids"])) ||
-          previous_work["agent_id"],
-      "source" =>
-        optional_text(attrs, "source", option(opts, :source) || "task_agent_continuation"),
+      "continuation_depth" => attrs["continuation_depth"],
+      "source" => continuation_source(attrs, opts),
       "resources" => %{
         "workspace_required" => true,
-        "task_memory_artifact_refs" => context_packet["artifact_refs"] || []
+        "task_memory_artifact_refs" => Map.get(context_packet, "artifact_refs", [])
       }
-    })
+    }
+    |> reject_empty()
+    |> ContinuationPacket.build()
+  end
+
+  defp continuation_task(task) do
+    %{
+      "id" => task["id"],
+      "ref" => task["ref"]
+    }
+    |> reject_empty()
+  end
+
+  defp continuation_agent_work(work) do
+    %{
+      "id" => work["id"],
+      "run_id" => work["run_id"],
+      "agent_id" => work["agent_id"],
+      "agent_ref" => work["agent_ref"]
+    }
+    |> reject_empty()
+  end
+
+  defp continuation_agent_run(run) do
+    %{
+      "id" => run["id"]
+    }
+    |> reject_empty()
+  end
+
+  defp continuation_source(attrs, opts) do
+    case optional_text(attrs, "source") do
+      nil ->
+        case option(opts, :source) do
+          nil -> "task_agent_continuation"
+          source -> source
+        end
+
+      source ->
+        source
+    end
   end
 
   defp mark_work_graph_node_running(root, work) do
@@ -2320,7 +2300,7 @@ defmodule Holt.Tasks do
                "agent_work_id" => work["id"],
                "agent_run_id" => work["agent_run_id"],
                "run_id" => run["id"],
-               "summary" => summarize_output(Map.get(result, :output)),
+               "summary" => summarize_output(result_output(result)),
                "metadata" => %{
                  "runtime_status" => run["status"],
                  "run_dir" => run["run_dir"]
@@ -2339,7 +2319,7 @@ defmodule Holt.Tasks do
 
       {graph_id, node_ref} ->
         case TaskGraphs.block_node(root, graph_id, node_ref, %{
-               "code" => work["blocker_code"] || "agent_work_failed",
+               "code" => blocker_code(work),
                "message" => inspect(reason),
                "agent_id" => work["agent_id"],
                "agent_work_id" => work["id"],
@@ -2358,12 +2338,33 @@ defmodule Holt.Tasks do
 
   defp work_graph_node_context(work) do
     graph_id = work["task_graph_id"]
-    node_ref = work["task_graph_node_id"] || work["task_graph_node_key"] || "work"
+    node_ref = work_graph_node_ref(work)
 
     if graph_id in [nil, ""] do
       nil
     else
       {graph_id, node_ref}
+    end
+  end
+
+  defp blocker_code(work) do
+    case work["blocker_code"] do
+      value when value in [nil, ""] -> "agent_work_failed"
+      value -> value
+    end
+  end
+
+  defp work_graph_node_ref(work) do
+    case work["task_graph_node_id"] do
+      value when value in [nil, ""] -> task_graph_node_key(work)
+      value -> value
+    end
+  end
+
+  defp task_graph_node_key(work) do
+    case work["task_graph_node_key"] do
+      value when value in [nil, ""] -> "work"
+      value -> value
     end
   end
 
@@ -2404,7 +2405,7 @@ defmodule Holt.Tasks do
       {:ok, continuation} ->
         {:ok,
          result
-         |> Map.put(:task, continuation[:task])
+         |> Map.put(:task, result_task(continuation))
          |> Map.put(:auto_continuation, continuation)}
 
       {:error, continuation_error} ->
@@ -2429,8 +2430,176 @@ defmodule Holt.Tasks do
 
   defp maybe_auto_continue(_root, _task, _work, _decision, result, _opts), do: {:ok, result}
 
+  defp maybe_start_mob_colleague_observation(root, scheduled, opts) do
+    case Map.get(scheduled, "observation_start_request") do
+      %{"flow_id" => flow_id, "observation_task_ref" => ref, "agent_work_attrs" => attrs} =
+          request ->
+        case start_agent_work(ref, attrs, opts) do
+          {:ok, observation_result} ->
+            case MobColleagueFlow.mark_observation_agent_work_started(
+                   root,
+                   scheduled["task"],
+                   flow_id,
+                   observation_result
+                 ) do
+              {:ok, updated_task} ->
+                {:ok,
+                 scheduled
+                 |> Map.put("task", enrich_task(root, updated_task))
+                 |> Map.put("observation_agent_work", result_work(observation_result))
+                 |> Map.put("observation_run", result_run(observation_result))
+                 |> Map.put(
+                   "observation_start",
+                   mob_colleague_start_summary("observation", request, observation_result)
+                 )}
+
+              {:error, reason} ->
+                {:ok, Map.put(scheduled, "observation_start_error", inspect(reason))}
+            end
+
+          {:error, reason} ->
+            case MobColleagueFlow.mark_observation_agent_work_failed(
+                   root,
+                   scheduled["task"],
+                   flow_id,
+                   reason
+                 ) do
+              {:ok, updated_task} ->
+                {:ok,
+                 scheduled
+                 |> Map.put("task", enrich_task(root, updated_task))
+                 |> Map.put("observation_start_error", inspect(reason))}
+
+              {:error, _update_reason} ->
+                {:ok, Map.put(scheduled, "observation_start_error", inspect(reason))}
+            end
+        end
+
+      _missing ->
+        {:ok, scheduled}
+    end
+  end
+
+  defp maybe_start_mob_colleague_reviews(root, task, work, run, result, opts) do
+    case MobColleagueFlow.trigger_after_work(root, task, work, run, opts) do
+      {:ok, %{flow_results: [], task: updated_task}} ->
+        {:ok, result, updated_task}
+
+      {:ok, %{task: updated_task, flow_results: flow_results, start_requests: start_requests}} ->
+        {final_task, starts, errors} =
+          start_mob_colleague_review_work(root, updated_task, start_requests, opts)
+
+        result =
+          result
+          |> Map.put(:task, enrich_task(root, final_task))
+          |> Map.put(:mob_colleague_flows, flow_results)
+          |> maybe_put_result(:mob_colleague_review_starts, starts)
+          |> maybe_put_result(:mob_colleague_review_errors, errors)
+
+        {:ok, result, final_task}
+    end
+  end
+
+  defp start_mob_colleague_review_work(root, task, start_requests, opts) do
+    Enum.reduce(start_requests, {task, [], []}, fn request, {current_task, starts, errors} ->
+      flow_id = request["flow_id"]
+      ref = request["review_task_ref"]
+      attrs = map_value(request["agent_work_attrs"])
+
+      case start_agent_work(ref, attrs, opts) do
+        {:ok, review_result} ->
+          case MobColleagueFlow.mark_review_agent_work_started(
+                 root,
+                 current_task,
+                 flow_id,
+                 review_result
+               ) do
+            {:ok, updated_task} ->
+              {updated_task,
+               starts ++ [mob_colleague_start_summary("review", request, review_result)], errors}
+
+            {:error, reason} ->
+              {current_task, starts,
+               errors ++ [mob_colleague_start_error("review", request, reason)]}
+          end
+
+        {:error, reason} ->
+          next_task =
+            case MobColleagueFlow.mark_review_agent_work_failed(
+                   root,
+                   current_task,
+                   flow_id,
+                   reason
+                 ) do
+              {:ok, updated_task} -> updated_task
+              {:error, _update_reason} -> current_task
+            end
+
+          {next_task, starts, errors ++ [mob_colleague_start_error("review", request, reason)]}
+      end
+    end)
+  end
+
+  defp mob_colleague_start_summary(kind, request, result) do
+    work = result_work(result)
+    run = result_run(result)
+
+    %{
+      "kind" => kind,
+      "flow_id" => request["flow_id"],
+      "task_ref" => mob_colleague_request_task_ref(kind, request),
+      "agent_work_id" => work["id"],
+      "agent_work_status" => work["status"],
+      "run_id" => run["id"],
+      "run_status" => run["status"]
+    }
+    |> reject_empty()
+  end
+
+  defp mob_colleague_start_error(kind, request, reason) do
+    %{
+      "kind" => kind,
+      "flow_id" => request["flow_id"],
+      "task_ref" => mob_colleague_request_task_ref(kind, request),
+      "reason" => inspect(reason)
+    }
+  end
+
+  defp mob_colleague_request_task_ref("review", request), do: request["review_task_ref"]
+  defp mob_colleague_request_task_ref(_kind, request), do: request["observation_task_ref"]
+
+  defp maybe_put_result(result, _key, value) when value in [nil, "", [], %{}], do: result
+  defp maybe_put_result(result, key, value), do: Map.put(result, key, value)
+
+  defp result_task(%{task: task}) when is_map(task), do: task
+
+  defp result_task(result),
+    do: raise(ArgumentError, "task result missing :task: #{inspect(result)}")
+
+  defp result_work(%{agent_work: work}) when is_map(work), do: work
+
+  defp result_work(result),
+    do: raise(ArgumentError, "task result missing :agent_work: #{inspect(result)}")
+
+  defp result_run(%{run: run}) when is_map(run), do: run
+
+  defp result_run(result),
+    do: raise(ArgumentError, "task result missing :run: #{inspect(result)}")
+
+  defp result_output(%{output: output}), do: output
+
+  defp result_output(result),
+    do: raise(ArgumentError, "task result missing :output: #{inspect(result)}")
+
+  defp optional_result(result, key) when is_map(result) do
+    case Map.fetch(result, key) do
+      {:ok, value} -> value
+      :error -> nil
+    end
+  end
+
   defp evaluate_watchdog_run(root, run, opts) do
-    now = option(opts, :now) || Clock.now()
+    now = watchdog_now(opts)
     snapshot = AgentRuns.watchdog_snapshot(root, run)
 
     cond do
@@ -2494,8 +2663,8 @@ defmodule Holt.Tasks do
         "agent_id" => run["agent_id"],
         "action" => "recovery_queued",
         "reason" => reason,
-        "recovery_agent_work_id" => recovery_result[:agent_work]["id"],
-        "recovery_run_id" => recovery_result[:run]["id"]
+        "recovery_agent_work_id" => result_work(recovery_result)["id"],
+        "recovery_run_id" => result_run(recovery_result)["id"]
       }
       |> reject_empty()
     else
@@ -2567,8 +2736,8 @@ defmodule Holt.Tasks do
           {:ok,
            %{
              "action" => "wake_continuation_started",
-             "continuation_agent_work_id" => continuation[:agent_work]["id"],
-             "continuation_run_id" => continuation[:run]["id"]
+             "continuation_agent_work_id" => result_work(continuation)["id"],
+             "continuation_run_id" => result_run(continuation)["id"]
            }}
 
         {:error, continuation_error} ->
@@ -2581,19 +2750,19 @@ defmodule Holt.Tasks do
 
   defp process_wake_packet(task, run, event, payload, reason) do
     %{
-      "schema_version" => "holtworks_agent_process_wake/v1",
+      "schema_version" => "holt_agent_process_wake/v1",
       "source" => @process_wake_source,
       "reason" => reason,
       "previous_agent_run_id" => run["id"],
       "previous_runtime_run_id" => run["run_id"],
       "previous_agent_work_id" => run["work_id"],
-      "task_id" => run["task_id"] || task["id"],
-      "task_ref" => run["task_ref"] || task["ref"],
-      "task_title" => run["task_title"] || task["title"],
+      "task_id" => task["id"],
+      "task_ref" => task["ref"],
+      "task_title" => task["title"],
       "task_status" => task["status"],
       "agent_id" => run["agent_id"],
       "process_event_id" => event["id"],
-      "process_event_kind" => event["type"] || event["kind"],
+      "process_event_kind" => event["type"],
       "process" => payload,
       "created_at" => Clock.iso_now()
     }
@@ -2680,15 +2849,15 @@ defmodule Holt.Tasks do
 
   defp watchdog_recovery_packet(task, run, reason, snapshot) do
     %{
-      "schema_version" => "holtworks_agent_run_watchdog_recovery/v1",
+      "schema_version" => "holt_agent_run_watchdog_recovery/v1",
       "source" => @watchdog_recovery_source,
       "reason" => reason,
       "previous_agent_run_id" => run["id"],
       "previous_runtime_run_id" => run["run_id"],
       "previous_agent_work_id" => run["work_id"],
-      "task_id" => run["task_id"] || task["id"],
-      "task_ref" => run["task_ref"] || task["ref"],
-      "task_title" => run["task_title"] || task["title"],
+      "task_id" => task["id"],
+      "task_ref" => task["ref"],
+      "task_title" => task["title"],
       "task_status" => task["status"],
       "agent_id" => run["agent_id"],
       "objective_status" => snapshot["objective_status"],
@@ -2720,6 +2889,13 @@ defmodule Holt.Tasks do
     Continue from the next verified step. Use the packet's objective status, latest events, and saved artifacts as source-of-truth. Verify with task artifacts and route verification before finishing.
     """
     |> String.trim()
+  end
+
+  defp watchdog_now(opts) do
+    case option(opts, :now) do
+      nil -> Clock.now()
+      now -> now
+    end
   end
 
   defp watchdog_candidate?(run) do
@@ -2873,7 +3049,7 @@ defmodule Holt.Tasks do
       case execute_agent_work(root, current_task, work, objective, opts) do
         {:ok, result} ->
           entry = started_agent_entry(target, result)
-          next_task = Map.get(result, :task, current_task)
+          next_task = result_task(result)
           {:cont, {:ok, started ++ [entry], results ++ [result], next_task}}
 
         {:error, reason} ->
@@ -2953,22 +3129,28 @@ defmodule Holt.Tasks do
       "assignee" => target,
       "dispatch_id" => dispatch_plan["dispatch_id"],
       "dispatch_plan" => dispatch_plan,
-      "task_graph_id" => optional_text(attrs, "task_graph_id", optional_text(attrs, "graph_id")),
-      "task_graph_node_id" =>
-        optional_text(attrs, "task_graph_node_id", optional_text(attrs, "node_id")),
-      "task_graph_node_key" =>
-        optional_text(attrs, "task_graph_node_key", optional_text(attrs, "node_key")),
+      "task_graph_id" => optional_text(attrs, "graph_id"),
+      "task_graph_node_id" => optional_text(attrs, "node_id"),
+      "task_graph_node_key" => optional_text(attrs, "node_key"),
       "source" => optional_text(attrs, "source"),
+      "child_agent_contract" => map_value(attrs["child_agent_contract"]),
+      "delegation_id" => optional_text(attrs, "delegation_id"),
+      "invocation_id" => optional_text(attrs, "invocation_id"),
+      "target_skill" => optional_text(attrs, "target_skill"),
+      "work_role" => optional_text(attrs, "work_role", target["work_role"]),
+      "validation_contract" => optional_text(attrs, "validation_contract"),
+      "allowed_actions" => normalize_string_list(attrs["allowed_actions"]),
       "policy" => work_policy(attrs, opts, %{}),
       "created_at" => now,
-      "started_at" => now
+      "started_at" => now,
+      "last_activity_at" => now
     }
     |> reject_empty()
   end
 
   defp started_agent_entry(target, result) do
-    work = Map.get(result, :agent_work, %{})
-    run = Map.get(result, :run, %{})
+    work = result_work(result)
+    run = result_run(result)
 
     %{
       "agent_id" => target["id"],
@@ -2991,28 +3173,38 @@ defmodule Holt.Tasks do
     %{"label" => label, "reason" => inspect(reason)}
   end
 
-  defp agent_work_batch_failure({:ok, result}) do
-    task = Map.get(result, :task, %{})
-
+  defp agent_work_batch_failure({:ok, %{task: task}}) do
     %{
-      "label" => task["ref"] || "task request",
+      "label" => agent_work_result_label(task),
       "reason" => "no_agent_work_started"
     }
   end
 
+  defp agent_work_batch_failure({:ok, _result}) do
+    %{"label" => "task request", "reason" => "no_agent_work_started"}
+  end
+
+  defp agent_work_result_label(task) do
+    case task["ref"] do
+      value when value in [nil, ""] -> "task request"
+      value -> value
+    end
+  end
+
   defp agent_work_request_items(params) do
-    items = agent_work_item_list(params["tasks"] || params["tickets"])
-    ids = normalize_string_list(params["task_ids"] || params["ticket_ids"])
-
     cond do
-      items != [] ->
-        {:batch, Enum.map(items, &merge_agent_work_item_defaults(params, &1))}
+      Map.has_key?(params, "tickets") ->
+        {:error, {:unsupported_argument, "tickets"}}
 
-      ids != [] ->
-        {:batch,
-         Enum.map(ids, fn id ->
-           merge_agent_work_item_defaults(params, %{"task_id" => id})
-         end)}
+      Map.has_key?(params, "task_ids") ->
+        {:error, {:unsupported_argument, "task_ids"}}
+
+      Map.has_key?(params, "ticket_ids") ->
+        {:error, {:unsupported_argument, "ticket_ids"}}
+
+      agent_work_item_list(params["tasks"]) != [] ->
+        items = agent_work_item_list(params["tasks"])
+        {:batch, Enum.map(items, &merge_agent_work_item_defaults(params, &1))}
 
       true ->
         {:single, params}
@@ -3051,17 +3243,11 @@ defmodule Holt.Tasks do
         "request_id"
       ])
 
-    Map.merge(defaults, string_keys(item))
+    Map.merge(defaults, item)
   end
-
-  defp agent_work_item_label(%{"task_id" => id}) when is_binary(id) and id != "",
-    do: "task #{id}"
 
   defp agent_work_item_label(%{"ref" => ref}) when is_binary(ref) and ref != "",
     do: "task #{ref}"
-
-  defp agent_work_item_label(%{"id" => id}) when is_binary(id) and id != "",
-    do: "task #{id}"
 
   defp agent_work_item_label(_item), do: "task request"
 
@@ -3165,9 +3351,16 @@ defmodule Holt.Tasks do
     |> assignee_search_values()
     |> Enum.map(&normalize_search_text/1)
     |> Enum.any?(fn value ->
-      value == needle or (needle != "" and :binary.match(value, needle) != :nomatch)
+      assignee_search_match?(value, needle)
     end)
   end
+
+  defp assignee_search_match?(value, needle) do
+    Enum.any?([value == needle, substring_match?(value, needle)], & &1)
+  end
+
+  defp substring_match?(_value, ""), do: false
+  defp substring_match?(value, needle), do: :binary.match(value, needle) != :nomatch
 
   defp assignee_search_values(assignee) do
     [
@@ -3190,23 +3383,25 @@ defmodule Holt.Tasks do
   defp strip_handle_prefix(<<"@", rest::binary>>), do: rest
   defp strip_handle_prefix(value), do: value
 
-  defp assignee_id(%{} = assignee), do: assignee["id"] || assignee["agent_id"]
+  defp assignee_id(%{} = assignee), do: assignee["agent_id"]
   defp assignee_id(_assignee), do: nil
 
   defp assignee_display_name(%{} = assignee) do
-    assignee["display_name"] || assignee["name"] || assignee["agent_name"] ||
-      assignee_id(assignee)
+    case assignee["display_name"] do
+      value when value in [nil, ""] -> assignee_id(assignee)
+      value -> value
+    end
   end
 
   defp assignee_display_name(_assignee), do: nil
 
   defp merge_assignees(left, right) do
-    (left || [])
-    |> Enum.concat(right || [])
+    left
+    |> Enum.concat(right)
     |> Enum.reduce([], fn assignee, acc ->
       id = assignee_id(assignee)
 
-      if id in [nil, ""] or Enum.any?(acc, &(assignee_id(&1) == id)) do
+      if invalid_or_duplicate_assignee?(id, acc) do
         acc
       else
         acc ++ [assignee]
@@ -3214,21 +3409,67 @@ defmodule Holt.Tasks do
     end)
   end
 
+  defp invalid_or_duplicate_assignee?(id, assignees) do
+    Enum.any?([id in [nil, ""], Enum.any?(assignees, &(assignee_id(&1) == id))], & &1)
+  end
+
   defp agent_work_dispatch_plan(task, targets, attrs, opts) do
     active_ids = active_agent_work_ids(task)
 
     AgentDispatch.plan(
       attrs
+      |> Map.take(
+        ~w(max_agents_per_event group_token_budget work_graph_id machine_db_id enabled_action_groups cooldown_seconds forced_decision_after_turns)
+      )
       |> Map.put("task", task)
-      |> Map.put("task_id", task["id"])
-      |> Map.put("task_ref", task["ref"])
-      |> Map.put("event_kind", "start_agent_work")
-      |> Map.put_new("source", option(opts, :source) || "task_tool")
-      |> Map.put_new("max_agents_per_event", option(opts, :max_agents_per_event))
-      |> Map.put_new("group_token_budget", option(opts, :group_token_budget))
-      |> Map.put("candidate_agents", targets)
+      |> Map.put("event", dispatch_event(attrs, opts))
+      |> put_default_dispatch_value("max_agents_per_event", option(opts, :max_agents_per_event))
+      |> put_default_dispatch_value("group_token_budget", option(opts, :group_token_budget))
+      |> Map.put("candidate_agents", Enum.map(targets, &agent_work_candidate/1))
       |> Map.put("active_agent_ids", active_ids)
+      |> reject_empty()
     )
+  end
+
+  defp dispatch_event(attrs, opts) do
+    %{
+      "event_kind" => "start_agent_work",
+      "source" => dispatch_source(opts),
+      "request_id" => attrs["request_id"]
+    }
+    |> reject_empty()
+  end
+
+  defp dispatch_source(opts) do
+    case option(opts, :source) do
+      value when value in [nil, ""] -> "action"
+      value -> value
+    end
+  end
+
+  defp put_default_dispatch_value(attrs, key, value) do
+    case Map.has_key?(attrs, key) do
+      true -> attrs
+      false -> Map.put(attrs, key, value)
+    end
+  end
+
+  defp agent_work_candidate(assignee) do
+    %{
+      "agent_id" => assignee["id"],
+      "agent_ref" => assignee["agent_ref"],
+      "agent_handle" => assignee["agent_handle"],
+      "display_name" => assignee["display_name"],
+      "kind" => assignee["kind"],
+      "work_role" => assignee["work_role"],
+      "status" => assignee["status"],
+      "lifecycle_state" => assignee["lifecycle_state"],
+      "skills" => assignee["skills"],
+      "model" => assignee["model"],
+      "provider" => assignee["provider"],
+      "agent_card" => assignee["agent_card"]
+    }
+    |> reject_empty()
   end
 
   defp select_dispatched_agent_targets(task, targets, dispatch_plan) do
@@ -3241,7 +3482,7 @@ defmodule Holt.Tasks do
         %{
           "task_ref" => task["ref"],
           "dispatch_id" => dispatch_plan["dispatch_id"],
-          "suppressed_agents" => dispatch_plan["suppressed_agents"] || []
+          "suppressed_agents" => Map.get(dispatch_plan, "suppressed_agents", [])
         }}}
     else
       {:ok, dispatched}
@@ -3252,29 +3493,35 @@ defmodule Holt.Tasks do
     task
     |> Map.get("agent_work", [])
     |> Enum.filter(fn work -> work["status"] in ["queued", "running"] end)
-    |> Enum.map(&(&1["agent_id"] || List.first(&1["agent_ids"] || [])))
+    |> Enum.map(& &1["agent_id"])
     |> Enum.filter(&is_binary/1)
   end
 
   defp task_ref_param(params) do
-    required_any_param(params, ["ref", "task_ref", "task_id", "id"])
-  end
+    cond do
+      Map.has_key?(params, "task_ref") ->
+        {:error, {:unsupported_argument, "task_ref"}}
 
-  defp required_any_param(params, keys) do
-    Enum.find_value(keys, fn key ->
-      case Map.get(params, key) do
-        value when is_binary(value) and value != "" -> {:ok, value}
-        value when is_integer(value) -> {:ok, value}
-        _value -> nil
-      end
-    end) || {:error, {:missing_required, Enum.join(keys, "|")}}
-  end
+      Map.has_key?(params, "task_id") ->
+        {:error, {:unsupported_argument, "task_id"}}
 
-  defp work_agent_label(task, work) do
-    case work["agent_id"] do
-      nil -> "task:" <> task["ref"]
-      "" -> "task:" <> task["ref"]
-      agent_id -> "task:" <> task["ref"] <> ":" <> agent_id
+      Map.has_key?(params, "id") ->
+        {:error, {:unsupported_argument, "id"}}
+
+      true ->
+        case Map.get(params, "ref") do
+          value when is_binary(value) ->
+            case String.trim(value) do
+              "" -> {:error, {:missing_required, "ref"}}
+              ref -> {:ok, ref}
+            end
+
+          nil ->
+            {:error, {:missing_required, "ref"}}
+
+          _value ->
+            {:error, {:invalid_argument, "ref"}}
+        end
     end
   end
 
@@ -3282,614 +3529,65 @@ defmodule Holt.Tasks do
     "Auto-continue from run #{work["run_id"]} at continuation depth #{decision["depth"]}."
   end
 
-  defp store_tasks(tasks, root) do
-    ensure_store(root)
-    JSON.write(tasks_path(root), tasks)
-    :ok
-  end
+  defp update_task(root, ref_or_id, fun), do: Store.update_task(root, ref_or_id, fun)
 
-  defp store_specs(specs, root) do
-    ensure_store(root)
-    JSON.write(specs_index_path(root), specs)
-    :ok
-  end
+  defp required_text(attrs, key), do: Attributes.required_text(attrs, key)
 
-  defp next_number(root) do
-    counter = JSON.read(counter_path(root), %{"next_number" => 1})
-    number = Map.get(counter, "next_number", 1)
-    JSON.write(counter_path(root), %{"next_number" => number + 1})
-    {:ok, number}
-  end
+  defp optional_text(attrs, key, default \\ nil),
+    do: Attributes.optional_text(attrs, key, default)
 
-  defp task_ref(number), do: "HW-" <> String.pad_leading(Integer.to_string(number), 2, "0")
+  defp enum_value(attrs, key, allowed, default),
+    do: Attributes.enum_value(attrs, key, allowed, default)
 
-  defp task_ref_matches?(task, ref_or_id) do
-    ref = ref_or_id |> to_string() |> String.upcase()
+  defp normalize_string_list(value), do: Attributes.normalize_string_list(value)
 
-    task["id"] == to_string(ref_or_id) or
-      task["ref"] == ref or
-      task["number"] == parse_ref_number(ref)
-  end
+  defp normalize_assignees(value), do: Attributes.normalize_assignees(value)
 
-  defp parse_ref_number(ref) do
-    case :binary.split(ref, "-", [:global]) do
-      ["HW", number] -> parse_integer(number)
-      [number] -> parse_integer(number)
-      _ -> nil
-    end
-  end
+  defp normalize_metadata(value), do: Attributes.normalize_metadata(value)
 
-  defp parse_integer(value) do
-    case Integer.parse(to_string(value)) do
-      {number, ""} -> number
-      _ -> nil
-    end
-  end
-
-  defp filter_status(tasks, status) when status in [nil, "", "all"], do: tasks
-
-  defp filter_status(tasks, status) do
-    Enum.filter(tasks, &(&1["status"] == status))
-  end
-
-  defp update_task(root, ref_or_id, fun) do
-    tasks = load_tasks(root)
-
-    case Enum.find(tasks, &task_ref_matches?(&1, ref_or_id)) do
-      nil ->
-        {:error, :task_not_found}
-
-      task ->
-        updated = fun.(task)
-
-        tasks
-        |> Enum.map(fn candidate ->
-          if candidate["id"] == task["id"], do: updated, else: candidate
-        end)
-        |> store_tasks(root)
-
-        {:ok, updated}
-    end
-  end
-
-  defp update_patch(attrs) do
-    with {:ok, patch} <- maybe_put_required_text(%{}, attrs, "title"),
-         {:ok, patch} <- maybe_put_optional_text(patch, attrs, "description"),
-         {:ok, patch} <- maybe_put_optional_text(patch, attrs, "due_date"),
-         {:ok, patch} <- maybe_put_optional_text(patch, attrs, "scheduled_start_at"),
-         {:ok, patch} <- maybe_put_optional_text(patch, attrs, "parent_id"),
-         {:ok, patch} <- maybe_put_enum(patch, attrs, "status", @statuses),
-         {:ok, patch} <- maybe_put_enum(patch, attrs, "kind", @kinds),
-         {:ok, patch} <- maybe_put_enum(patch, attrs, "priority", @priorities),
-         {:ok, patch} <- maybe_put_estimate(patch, attrs) do
-      patch =
-        patch
-        |> maybe_put_labels(attrs)
-        |> maybe_put_recurrence(attrs)
-        |> maybe_put_assignees(attrs)
-        |> maybe_put_agent_policy(attrs)
-
-      {:ok, patch}
-    end
-  end
-
-  defp maybe_put_required_text(patch, attrs, key) do
-    if Map.has_key?(attrs, key) do
-      case required_text(attrs, key) do
-        {:ok, value} -> {:ok, Map.put(patch, key, value)}
-        error -> error
-      end
-    else
-      {:ok, patch}
-    end
-  end
-
-  defp maybe_put_optional_text(patch, attrs, key) do
-    if Map.has_key?(attrs, key) do
-      {:ok, Map.put(patch, key, optional_text(attrs, key))}
-    else
-      {:ok, patch}
-    end
-  end
-
-  defp maybe_put_enum(patch, attrs, key, allowed) do
-    if Map.has_key?(attrs, key) do
-      case enum_value(attrs, key, allowed, nil) do
-        {:ok, value} -> {:ok, Map.put(patch, key, value)}
-        error -> error
-      end
-    else
-      {:ok, patch}
-    end
-  end
-
-  defp maybe_put_estimate(patch, attrs) do
-    if Map.has_key?(attrs, "estimate") do
-      case estimate_value(Map.get(attrs, "estimate")) do
-        {:ok, value} -> {:ok, Map.put(patch, "estimate", value)}
-        error -> error
-      end
-    else
-      {:ok, patch}
-    end
-  end
-
-  defp maybe_put_labels(patch, attrs) do
-    if Map.has_key?(attrs, "labels") do
-      Map.put(patch, "labels", normalize_labels(Map.get(attrs, "labels")))
-    else
-      patch
-    end
-  end
-
-  defp maybe_put_recurrence(patch, attrs) do
-    if Map.has_key?(attrs, "recurrence") do
-      Map.put(patch, "recurrence", normalize_recurrence(Map.get(attrs, "recurrence")))
-    else
-      patch
-    end
-  end
-
-  defp maybe_put_assignees(patch, attrs) do
-    if Map.has_key?(attrs, "assignees") do
-      Map.put(patch, "assignees", normalize_assignees(Map.get(attrs, "assignees")))
-    else
-      patch
-    end
-  end
-
-  defp maybe_put_agent_policy(patch, attrs) do
-    if Map.has_key?(attrs, "agent_policy") do
-      Map.put(patch, "agent_policy", normalize_agent_policy(Map.get(attrs, "agent_policy")))
-    else
-      patch
-    end
-  end
-
-  defp required_text(attrs, key) do
-    value =
-      attrs
-      |> Map.get(key)
-      |> to_string()
-      |> String.trim()
-
-    if value == "" do
-      {:error, {:missing_required, key}}
-    else
-      {:ok, value}
-    end
-  end
-
-  defp optional_text(attrs, key, default \\ nil) do
-    value = Map.get(attrs, key, default)
-
-    case value do
-      nil ->
-        default
-
-      _ ->
-        text = value |> to_string() |> String.trim()
-        if text == "", do: default, else: text
-    end
-  end
-
-  defp enum_value(attrs, key, allowed, default) do
-    value = optional_text(attrs, key, default)
-
-    cond do
-      value in allowed -> {:ok, value}
-      value in [nil, ""] -> {:error, {:missing_required, key}}
-      true -> {:error, {:invalid_value, key, value, allowed}}
-    end
-  end
-
-  defp estimate_value(nil), do: {:ok, nil}
-  defp estimate_value(""), do: {:ok, nil}
-
-  defp estimate_value(value) when is_integer(value) do
-    if value in @estimates do
-      {:ok, value}
-    else
-      {:error, {:invalid_value, "estimate", value, @estimates}}
-    end
-  end
-
-  defp estimate_value(value) do
-    case Integer.parse(to_string(value)) do
-      {number, ""} -> estimate_value(number)
-      _ -> {:error, {:invalid_value, "estimate", value, @estimates}}
-    end
-  end
-
-  defp normalize_string_list(nil), do: []
-
-  defp normalize_string_list(value) when is_list(value) do
-    value
-    |> Enum.flat_map(&normalize_string_list/1)
-    |> Enum.uniq()
-  end
-
-  defp normalize_string_list(value) do
-    text = value |> to_string() |> String.trim()
-    if text == "", do: [], else: [text]
-  end
-
-  defp normalize_labels(nil), do: []
-
-  defp normalize_labels(value) when is_list(value) do
-    value
-    |> Enum.flat_map(&normalize_labels/1)
-    |> Enum.reduce([], fn label, acc ->
-      if label_exists?(acc, label["name"]), do: acc, else: acc ++ [label]
-    end)
-  end
-
-  defp normalize_labels(%{} = label) do
-    label = string_keys(label)
-    name = optional_text(label, "name")
-
-    if name in [nil, ""] do
-      []
-    else
-      [%{"name" => name, "color" => optional_text(label, "color", "#2563eb")}]
-    end
-  end
-
-  defp normalize_labels(value) do
-    value
-    |> normalize_string_list()
-    |> Enum.map(&%{"name" => &1, "color" => "#2563eb"})
-  end
-
-  defp normalize_links(value) when is_list(value) do
-    value
-    |> Enum.flat_map(&normalize_link/1)
-    |> Enum.uniq_by(&{&1["target_id"], &1["type"]})
-  end
-
-  defp normalize_links(_value), do: []
-
-  defp normalize_link(%{} = link) do
-    link = string_keys(link)
-    type = optional_text(link, "type", "relates_to")
-    target_id = optional_text(link, "target_id")
-
-    cond do
-      type not in @link_types ->
-        []
-
-      target_id in [nil, ""] ->
-        []
-
-      true ->
-        [
-          %{
-            "id" => optional_text(link, "id", Clock.id("link")),
-            "target_id" => target_id,
-            "target_ref" => optional_text(link, "target_ref"),
-            "type" => type
-          }
-          |> reject_empty()
-        ]
-    end
-  end
-
-  defp normalize_link(_value), do: []
-
-  defp dependency_links(attrs) do
-    attrs
-    |> Map.get("depends_on_task_ids", Map.get(attrs, "depends_on_task_id", []))
-    |> normalize_string_list()
-    |> Enum.map(fn target_id ->
-      %{
-        "id" => Clock.id("link"),
-        "target_id" => target_id,
-        "type" => "depends_on"
-      }
-    end)
-  end
-
-  defp normalize_assignees(nil), do: []
-
-  defp normalize_assignees(value) when is_list(value) do
-    value
-    |> Enum.flat_map(&normalize_assignees/1)
-    |> Enum.reduce([], fn assignee, acc ->
-      id = assignee_id(assignee)
-
-      if id in [nil, ""] or Enum.any?(acc, &(assignee_id(&1) == id)) do
-        acc
-      else
-        acc ++ [assignee]
-      end
-    end)
-  end
-
-  defp normalize_assignees(%{} = assignee) do
-    assignee = string_keys(assignee)
-    id = optional_text(assignee, "id") || optional_text(assignee, "agent_id")
-
-    if id in [nil, ""] do
-      []
-    else
-      [
-        %{
-          "id" => id,
-          "kind" => optional_text(assignee, "kind", "agent"),
-          "display_name" =>
-            optional_text(assignee, "display_name") ||
-              optional_text(assignee, "name") ||
-              optional_text(assignee, "agent_name") ||
-              id,
-          "avatar_url" => optional_text(assignee, "avatar_url"),
-          "agent_ref" => optional_text(assignee, "agent_ref"),
-          "agent_handle" => optional_text(assignee, "agent_handle"),
-          "work_role" => optional_text(assignee, "work_role", "worker")
-        }
-        |> reject_empty()
-      ]
-    end
-  end
-
-  defp normalize_assignees(value) do
-    value
-    |> normalize_string_list()
-    |> Enum.map(fn id ->
-      %{"id" => id, "kind" => "agent", "display_name" => id, "work_role" => "worker"}
-    end)
-  end
-
-  defp normalize_recurrence(nil), do: nil
-  defp normalize_recurrence(""), do: nil
-
-  defp normalize_recurrence(%{} = recurrence) do
-    recurrence = string_keys(recurrence)
-    frequency = optional_text(recurrence, "frequency")
-
-    if frequency in ["daily", "weekly", "monthly"] do
-      %{
-        "frequency" => frequency,
-        "interval" => recurrence_interval(Map.get(recurrence, "interval")),
-        "timezone" => optional_text(recurrence, "timezone"),
-        "ends_at" => optional_text(recurrence, "ends_at")
-      }
-      |> reject_empty()
-    else
-      nil
-    end
-  end
-
-  defp normalize_recurrence(_value), do: nil
-
-  defp recurrence_interval(nil), do: 1
-
-  defp recurrence_interval(value) when is_integer(value) and value > 0, do: value
-
-  defp recurrence_interval(value) do
-    case Integer.parse(to_string(value)) do
-      {number, ""} when number > 0 -> number
-      _ -> 1
-    end
-  end
-
-  defp normalize_metadata(%{} = metadata), do: string_keys(metadata)
-  defp normalize_metadata(_metadata), do: %{}
-
-  defp normalize_agent_policy(%{} = policy) do
-    policy
-    |> string_keys()
-    |> Map.take([
-      "auto_continue",
-      "continuation_allowed",
-      "max_continuation_depth",
-      "retry_on_failure",
-      "source"
-    ])
-    |> reject_empty()
-  end
-
-  defp normalize_agent_policy(_policy), do: %{}
+  defp normalize_agent_policy(value), do: Attributes.normalize_agent_policy(value)
 
   defp work_policy(attrs, opts, fallback) do
-    base =
-      attrs
-      |> Map.get("policy", Map.get(attrs, "agent_policy", fallback || %{}))
-      |> normalize_agent_policy()
-
-    base
-    |> maybe_put_policy_value(
-      "auto_continue",
-      Map.get(attrs, "auto_continue", opts[:auto_continue])
-    )
+    attrs
+    |> policy_base(fallback)
+    |> maybe_put_policy_value("auto_continue", policy_value(attrs, opts, "auto_continue"))
     |> maybe_put_policy_value(
       "continuation_allowed",
-      Map.get(attrs, "continuation_allowed", opts[:continuation_allowed])
+      policy_value(attrs, opts, "continuation_allowed")
     )
     |> maybe_put_policy_value(
       "max_continuation_depth",
-      Map.get(attrs, "max_continuation_depth", opts[:max_continuation_depth])
+      policy_value(attrs, opts, "max_continuation_depth")
     )
-    |> maybe_put_policy_value(
-      "retry_on_failure",
-      Map.get(attrs, "retry_on_failure", opts[:retry_on_failure])
-    )
-    |> maybe_put_policy_value("source", Map.get(attrs, "policy_source", opts[:policy_source]))
+    |> maybe_put_policy_value("retry_on_failure", policy_value(attrs, opts, "retry_on_failure"))
+    |> maybe_put_policy_value("source", policy_value(attrs, opts, "policy_source"))
     |> reject_empty()
   end
+
+  defp policy_base(%{"policy" => policy}, _fallback) when is_map(policy),
+    do: normalize_agent_policy(policy)
+
+  defp policy_base(_attrs, fallback),
+    do: fallback |> work_policy_default() |> normalize_agent_policy()
+
+  defp work_policy_default(value) when is_map(value), do: value
+  defp work_policy_default(_value), do: %{}
+
+  defp policy_value(attrs, opts, key) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} -> value
+      :error -> policy_opt(opts, key)
+    end
+  end
+
+  defp policy_opt(opts, "auto_continue"), do: Keyword.get(opts, :auto_continue)
+  defp policy_opt(opts, "continuation_allowed"), do: Keyword.get(opts, :continuation_allowed)
+  defp policy_opt(opts, "max_continuation_depth"), do: Keyword.get(opts, :max_continuation_depth)
+  defp policy_opt(opts, "retry_on_failure"), do: Keyword.get(opts, :retry_on_failure)
+  defp policy_opt(opts, "policy_source"), do: Keyword.get(opts, :policy_source)
 
   defp maybe_put_policy_value(policy, _key, value) when value in [nil, "", []], do: policy
   defp maybe_put_policy_value(policy, key, value), do: Map.put(policy, key, value)
-
-  defp teammate_memory_attrs(attrs) do
-    kind = optional_text(attrs, "kind", "preference_signal")
-    title = optional_text(attrs, "title")
-    observed_pattern = optional_text(attrs, "observed_pattern")
-    summary = optional_text(attrs, "summary")
-    content = optional_text(attrs, "content")
-    memory_scope = optional_text(attrs, "memory_scope", "team")
-    portability = optional_text(attrs, "portability", "org_confidential")
-    source_comment_ids = normalize_string_list(Map.get(attrs, "source_comment_ids", []))
-    source_spec_ids = normalize_string_list(Map.get(attrs, "source_spec_ids", []))
-    source_event_ids = normalize_string_list(Map.get(attrs, "source_event_ids", []))
-
-    cond do
-      kind not in @memory_kinds ->
-        {:error, {:invalid_value, "kind", kind, @memory_kinds}}
-
-      title in [nil, ""] ->
-        {:error, {:missing_required, "title"}}
-
-      observed_pattern in [nil, ""] and summary in [nil, ""] and content in [nil, ""] ->
-        {:error, {:missing_required, "observed_pattern_or_summary_or_content"}}
-
-      memory_scope not in @memory_scopes ->
-        {:error, {:invalid_value, "memory_scope", memory_scope, @memory_scopes}}
-
-      portability not in @portability_values ->
-        {:error, {:invalid_value, "portability", portability, @portability_values}}
-
-      source_comment_ids == [] and source_spec_ids == [] and source_event_ids == [] ->
-        {:error, {:missing_required, "provenance"}}
-
-      true ->
-        metadata =
-          %{
-            "source" => "save_teammate_memory",
-            "observed_pattern" => observed_pattern || summary || content,
-            "summary" => summary,
-            "memory_scope" => memory_scope,
-            "portability" => portability,
-            "retention" => optional_text(attrs, "retention"),
-            "affects_autonomy" => Map.get(attrs, "affects_autonomy", false),
-            "confidence" => Map.get(attrs, "confidence"),
-            "source_comment_ids" => source_comment_ids,
-            "source_spec_ids" => source_spec_ids,
-            "source_event_ids" => source_event_ids
-          }
-          |> reject_empty()
-
-        {:ok,
-         %{
-           "kind" => kind,
-           "title" => title,
-           "content" =>
-             teammate_memory_content(title, observed_pattern, summary, content, metadata),
-           "metadata" => metadata
-         }}
-    end
-  end
-
-  defp teammate_memory_content(title, observed_pattern, summary, content, metadata) do
-    """
-    # #{title}
-
-    Observed pattern:
-    #{observed_pattern || metadata["observed_pattern"] || ""}
-
-    Summary:
-    #{summary || ""}
-
-    Content:
-    #{content || ""}
-
-    Governance:
-    - Memory scope: #{metadata["memory_scope"]}
-    - Portability: #{metadata["portability"]}
-    - Affects autonomy: #{metadata["affects_autonomy"]}
-    """
-  end
-
-  defp teammate_runtime_markdown(task, specs, opts) do
-    comment_limit = positive_integer(option(opts, :comment_limit), 12)
-
-    comments =
-      task
-      |> Map.get("comments", [])
-      |> Enum.take(-comment_limit)
-      |> Enum.map(fn comment ->
-        "- #{comment["created_at"]}: #{comment["body"]}"
-      end)
-      |> case do
-        [] -> "- none"
-        rows -> Enum.join(rows, "\n")
-      end
-
-    spec_rows =
-      specs
-      |> Enum.map(fn spec ->
-        """
-        ## #{spec["kind"]}: #{spec["title"]}
-
-        Spec ID: #{spec["id"]}
-
-        #{spec["content"] || ""}
-        """
-      end)
-      |> case do
-        [] -> "No runtime artifacts saved."
-        rows -> Enum.join(rows, "\n")
-      end
-
-    """
-    # Agent teammate runtime
-
-    Task #{task["ref"]}: #{task["title"]}
-    Status: #{task["status"]}
-    Priority: #{task["priority"] || "none"}
-    Estimate: #{task["estimate"] || "none"}
-
-    Description:
-    #{task["description"] || ""}
-
-    Recent comments:
-    #{comments}
-
-    Runtime artifacts:
-    #{spec_rows}
-    """
-  end
-
-  defp label_exists?(labels, name) do
-    normalized = normalize_label_name(name)
-    Enum.any?(labels, &(normalize_label_name(&1["name"]) == normalized))
-  end
-
-  defp normalize_label_name(name) do
-    name
-    |> to_string()
-    |> String.trim()
-    |> String.downcase()
-  end
-
-  defp ensure_not_self_link(%{"id" => id}, %{"id" => id}), do: {:error, :self_link}
-  defp ensure_not_self_link(_source, _target), do: :ok
-
-  defp ensure_new_link(source, target) do
-    if Enum.any?(source["links"] || [], &(&1["target_id"] == target["id"])) do
-      {:error, :duplicate_link}
-    else
-      :ok
-    end
-  end
-
-  defp find_link(task, link_id) do
-    case Enum.find(task["links"] || [], &(&1["id"] == link_id)) do
-      nil -> {:error, :link_not_found}
-      link -> {:ok, link}
-    end
-  end
-
-  defp find_comment(task, comment_id) do
-    case Enum.find(task["comments"] || [], &(&1["id"] == comment_id)) do
-      nil -> {:error, :comment_not_found}
-      comment -> {:ok, comment}
-    end
-  end
-
-  defp filter_spec_kind(specs, kind) when kind in [nil, "", "all"], do: specs
-  defp filter_spec_kind(specs, kind), do: Enum.filter(specs, &(&1["kind"] == kind))
-
-  defp maybe_include_spec_content(spec, _root, false, _content_limit), do: spec
 
   defp maybe_include_spec_content(spec, root, true, content_limit) do
     limit = positive_integer(content_limit, 12_000)
@@ -3898,49 +3596,32 @@ defmodule Holt.Tasks do
     Map.put(spec, "content", content)
   end
 
-  defp positive_integer(value, _default) when is_integer(value) and value > 0, do: value
-
-  defp positive_integer(value, default) do
-    case Integer.parse(to_string(value)) do
-      {number, ""} when number > 0 -> number
-      _ -> default
-    end
-  end
-
-  defp ensure_spec_task_scope(_spec, task_ref, _opts) when task_ref in [nil, ""], do: :ok
-
-  defp ensure_spec_task_scope(spec, task_ref, opts) do
-    with {:ok, task} <- get(task_ref, opts) do
-      if spec["task_id"] == task["id"] do
-        :ok
-      else
-        {:error, :spec_task_mismatch}
-      end
-    end
-  end
+  defp positive_integer(value, default), do: Attributes.positive_integer(value, default)
 
   defp normalize_checks(checks) when is_list(checks) do
     checks
-    |> Enum.reduce_while({:ok, []}, fn check, {:ok, acc} ->
-      check = string_keys(check)
+    |> Enum.reduce_while({:ok, []}, fn
+      check, {:ok, acc} when is_map(check) ->
+        with {:ok, name} <- required_text(check, "name"),
+             {:ok, check_type} <- required_text(check, "check_type"),
+             {:ok, status} <- enum_value(check, "status", @verification_statuses, nil) do
+          normalized =
+            %{
+              "name" => name,
+              "status" => status,
+              "check_type" => check_type,
+              "evidence" => optional_text(check, "evidence"),
+              "command" => optional_text(check, "command")
+            }
+            |> reject_empty()
 
-      with {:ok, name} <- required_text(check, "name"),
-           {:ok, status} <- enum_value(check, "status", @verification_statuses, nil) do
-        normalized =
-          %{
-            "name" => name,
-            "status" => status,
-            "check_type" =>
-              optional_text(check, "check_type", optional_text(check, "type", name)),
-            "evidence" => optional_text(check, "evidence"),
-            "command" => optional_text(check, "command")
-          }
-          |> reject_empty()
+          {:cont, {:ok, [normalized | acc]}}
+        else
+          error -> {:halt, error}
+        end
 
-        {:cont, {:ok, [normalized | acc]}}
-      else
-        error -> {:halt, error}
-      end
+      _check, {:ok, _acc} ->
+        {:halt, {:error, :invalid_check}}
     end)
     |> case do
       {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
@@ -3989,7 +3670,7 @@ defmodule Holt.Tasks do
     |> String.trim()
   end
 
-  defp truthy?(value), do: value in [true, "true", "1", 1, nil]
+  defp truthy?(value), do: Attributes.truthy?(value)
 
   defp task_objective(task, attrs) do
     message =
@@ -4003,10 +3684,16 @@ defmodule Holt.Tasks do
     Kind: #{task["kind"]}
 
     Description:
-    #{task["description"] || ""}
+    #{task_description(task)}
 
     Operator message:
     #{message}
+
+    Recent task comments:
+    #{task_objective_comments(task)}
+
+    Mob colleague guidance:
+    #{task_objective_mob_colleague_guidance(task)}
     """
   end
 
@@ -4032,25 +3719,76 @@ defmodule Holt.Tasks do
     Kind: #{task["kind"]}
 
     Description:
-    #{task["description"] || ""}
+    #{task_description(task)}
 
     Continuation instruction:
     #{message}
+
+    Recent task comments:
+    #{task_objective_comments(task)}
+
+    Mob colleague guidance:
+    #{task_objective_mob_colleague_guidance(task)}
 
     Continuation packet:
     #{packet}
     """
   end
 
+  defp task_objective_comments(task) do
+    task
+    |> Map.get("comments", [])
+    |> Enum.take(-8)
+    |> Enum.map(fn comment ->
+      author = comment_author(comment)
+      body = comment_body(comment)
+      "- #{author}: #{String.slice(to_string(body), 0, 500)}"
+    end)
+    |> case do
+      [] -> "- none"
+      rows -> Enum.join(rows, "\n")
+    end
+  end
+
+  defp task_description(task) do
+    case task["description"] do
+      value when value in [nil, ""] -> ""
+      value -> value
+    end
+  end
+
+  defp comment_author(comment) do
+    case comment["author"] do
+      value when value in [nil, ""] -> "unknown"
+      value -> value
+    end
+  end
+
+  defp comment_body(comment) do
+    case comment["body"] do
+      value when value in [nil, ""] -> ""
+      value -> value
+    end
+  end
+
+  defp task_objective_mob_colleague_guidance(task) do
+    task
+    |> Map.get("mob_colleague_flows", [])
+    |> Enum.filter(&is_map/1)
+    |> Enum.filter(&(&1["status"] in ["armed", "observing", "review_task_created"]))
+    |> Enum.map(fn flow ->
+      "- #{flow["colleague_agent_id"]}: treat task comments as live review input; call get_task and load_teammate_runtime before finalizing so new colleague feedback can redirect the work."
+    end)
+    |> case do
+      [] -> "- none"
+      rows -> Enum.join(rows, "\n")
+    end
+  end
+
   defp agent_work_to_continue(task, attrs) do
-    work_id =
-      optional_text(attrs, "previous_agent_work_id") || optional_text(attrs, "agent_work_id")
-
-    run_id =
-      optional_text(attrs, "previous_run_id") || optional_text(attrs, "previous_agent_run_id")
-
-    agent_id =
-      optional_text(attrs, "agent_id") || List.first(normalize_string_list(attrs["agent_ids"]))
+    work_id = optional_text(attrs, "previous_agent_work_id")
+    run_id = optional_text(attrs, "previous_run_id")
+    agent_id = optional_text(attrs, "agent_id")
 
     cond do
       work_id not in [nil, ""] ->
@@ -4059,7 +3797,7 @@ defmodule Holt.Tasks do
       run_id not in [nil, ""] ->
         find_agent_work_with_run(
           task,
-          &(&1["run_id"] == run_id or &1["agent_run_id"] == run_id),
+          &agent_work_run?(&1, run_id),
           :agent_work_not_found
         )
 
@@ -4069,6 +3807,45 @@ defmodule Holt.Tasks do
       true ->
         latest_agent_work_with_run(task)
     end
+  end
+
+  defp previous_work_mode(work) do
+    case work["mode"] do
+      mode when mode in @agent_modes -> mode
+      _missing -> "work"
+    end
+  end
+
+  defp previous_agent_ids(work) do
+    case work["agent_ids"] do
+      ids when is_list(ids) and ids != [] -> ids
+      _missing -> [@default_agent_id]
+    end
+  end
+
+  defp continuation_graph_id(attrs, previous_work) do
+    case optional_text(attrs, "graph_id") do
+      value when value in [nil, ""] -> previous_work["task_graph_id"]
+      value -> value
+    end
+  end
+
+  defp continuation_node_id(attrs, previous_work) do
+    case optional_text(attrs, "node_id") do
+      value when value in [nil, ""] -> previous_work["task_graph_node_id"]
+      value -> value
+    end
+  end
+
+  defp continuation_node_key(attrs, previous_work) do
+    case optional_text(attrs, "node_key") do
+      value when value in [nil, ""] -> previous_work["task_graph_node_key"]
+      value -> value
+    end
+  end
+
+  defp agent_work_run?(work, run_id) do
+    Enum.any?([work["run_id"] == run_id, work["agent_run_id"] == run_id], & &1)
   end
 
   defp latest_agent_work_with_run(task, agent_id \\ nil) do
@@ -4098,7 +3875,7 @@ defmodule Holt.Tasks do
   defp agent_work_for_agent?(work, ""), do: agent_work_for_agent?(work, nil)
 
   defp agent_work_for_agent?(work, agent_id) do
-    work["agent_id"] == agent_id or agent_id in (work["agent_ids"] || [])
+    Enum.any?([work["agent_id"] == agent_id, agent_id in Map.get(work, "agent_ids", [])], & &1)
   end
 
   defp valid_prior_work?(%{"run_id" => run_id}) when is_binary(run_id) and run_id != "", do: true
@@ -4112,26 +3889,26 @@ defmodule Holt.Tasks do
 
   defp default_verification_gate(run) do
     %{
-      "schema_version" => "holtworks_verification_gate/v1",
+      "schema_version" => "holt_verification_gate/v1",
       "status" => "required",
       "required" => true,
       "satisfied" => false,
       "reason" => "verification_required",
       "run_status" => run["status"],
-      "tool" => "tasks/verify"
+      "action" => "tasks/verify"
     }
   end
 
   defp failure_verification_gate(run, reason) do
     %{
-      "schema_version" => "holtworks_verification_gate/v1",
+      "schema_version" => "holt_verification_gate/v1",
       "status" => "blocked",
       "required" => true,
       "satisfied" => false,
       "reason" => "run_not_successful",
       "run_status" => run["status"],
       "failure_reason" => inspect(reason),
-      "tool" => "tasks/verify"
+      "action" => "tasks/verify"
     }
   end
 
@@ -4160,8 +3937,6 @@ defmodule Holt.Tasks do
   defp maybe_put_artifact(work, artifact) do
     Map.put(work, "artifact", artifact)
   end
-
-  defp default_spec_title(kind, task), do: task["ref"] <> " " <> kind
 
   defp verification_markdown(task, report) do
     check_rows =
@@ -4199,9 +3974,34 @@ defmodule Holt.Tasks do
   end
 
   defp option(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+  defp option(opts, key) when is_map(opts), do: Map.get(opts, key)
+  defp option(_opts, _key), do: nil
 
-  defp option(opts, key) when is_map(opts),
-    do: Map.get(opts, key) || Map.get(opts, to_string(key))
+  defp map_value(value) when is_map(value) do
+    case canonical_map?(value) do
+      true -> value
+      false -> %{}
+    end
+  end
+
+  defp map_value(_value), do: %{}
+
+  defp canonical_attrs(attrs) do
+    if canonical_map?(attrs), do: {:ok, attrs}, else: {:error, :invalid_attrs}
+  end
+
+  defp canonical_map?(value) when is_map(value) do
+    Enum.all?(value, fn
+      {key, nested} when is_binary(key) -> canonical_value?(nested)
+      _entry -> false
+    end)
+  end
+
+  defp canonical_map?(_value), do: false
+
+  defp canonical_value?(value) when is_map(value), do: canonical_map?(value)
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
 
   defp append_activity(task, type, data) do
     event = activity(type, data)
@@ -4214,15 +4014,5 @@ defmodule Holt.Tasks do
     |> Map.put_new("at", Clock.iso_now())
   end
 
-  defp string_keys(map) when is_map(map) do
-    Map.new(map, fn {key, value} -> {to_string(key), value} end)
-  end
-
-  defp string_keys(value), do: value
-
-  defp reject_empty(map) do
-    map
-    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
-    |> Map.new()
-  end
+  defp reject_empty(map), do: Attributes.reject_empty(map)
 end

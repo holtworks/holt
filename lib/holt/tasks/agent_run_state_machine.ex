@@ -30,47 +30,49 @@ defmodule Holt.Tasks.AgentRunStateMachine do
   def queued, do: "queued"
   def running, do: "running"
 
-  def terminal?(state), do: normalize_state(state) in @terminal_states
+  def terminal?(state), do: state in @terminal_states
 
   def transition(current_state, next_state) do
-    current = normalize_nullable_state(current_state)
-    next = normalize_state(next_state)
-
-    if next in Map.get(@allowed_transitions, current, []) do
-      {:ok, next}
-    else
-      {:error, {:invalid_agent_run_transition, current, next}}
+    with {:ok, current} <- nullable_state(current_state),
+         {:ok, next} <- state(next_state) do
+      if next in Map.fetch!(@allowed_transitions, current) do
+        {:ok, next}
+      else
+        {:error, {:invalid_agent_run_transition, current, next}}
+      end
     end
   end
 
   def complete(attrs) when is_map(attrs) do
-    status = value(attrs, "status")
-    verification_gate = value(attrs, "verification_gate") || %{}
-    decision = value(attrs, "continuation_decision") || value(attrs, "decision") || %{}
+    status = text_field(attrs, "status")
+    verification_gate = map_field(attrs, "verification_gate")
+    decision = map_field(attrs, "continuation_decision")
+    decision_action = text_field(decision, "action")
+    gate_status = text_field(verification_gate, "status")
 
     cond do
       status == "canceled" ->
         "canceled"
 
-      decision_action(decision) == "continue" ->
+      decision_action == "continue" ->
         "needs_continuation"
 
-      decision_action(decision) == "suppress" ->
+      decision_action == "suppress" ->
         "blocked"
 
       status in ["failed", "blocked"] ->
         "blocked"
 
-      verification_status(verification_gate) in ["submitted", "not_required"] ->
+      gate_status in ["submitted", "not_required"] ->
         "completed"
 
-      verification_status(verification_gate) == "blocked" ->
+      gate_status == "blocked" ->
         "blocked"
 
-      verification_status(verification_gate) == "required" ->
+      gate_status == "required" ->
         "awaiting_verification"
 
-      decision_action(decision) == "stop" ->
+      decision_action == "stop" ->
         "completed"
 
       status == "success" ->
@@ -83,36 +85,30 @@ defmodule Holt.Tasks.AgentRunStateMachine do
 
   def complete(_attrs), do: "completed"
 
-  def normalize_state(state) when state in @states, do: state
-  def normalize_state(_state), do: "queued"
+  defp nullable_state(nil), do: {:ok, nil}
+  defp nullable_state(state), do: state(state)
 
-  defp normalize_nullable_state(nil), do: nil
-  defp normalize_nullable_state(state), do: normalize_state(state)
+  defp state(state) when state in @states, do: {:ok, state}
+  defp state(state), do: {:error, {:invalid_agent_run_state, state}}
 
-  defp verification_status(gate) when is_map(gate), do: value(gate, "status")
-  defp verification_status(_gate), do: nil
-
-  defp decision_action(%{"action" => action}), do: action
-  defp decision_action(%{action: action}), do: action
-  defp decision_action(:ignore), do: "ignore"
-  defp decision_action({:continue, _data}), do: "continue"
-  defp decision_action({:suppress, _data}), do: "suppress"
-  defp decision_action({:stop, _data}), do: "stop"
-  defp decision_action(_decision), do: nil
-
-  defp value(map, key) when is_map(map) do
-    cond do
-      Map.has_key?(map, key) -> Map.get(map, key)
-      Map.has_key?(map, atom_key(key)) -> Map.get(map, atom_key(key))
-      true -> nil
+  defp map_field(map, key) do
+    case Map.get(map, key) do
+      value when is_map(value) -> canonical_map(value)
+      _value -> %{}
     end
   end
 
-  defp value(_map, _key), do: nil
+  defp canonical_map(value) when is_map(value) do
+    case Enum.all?(value, fn {key, _nested} -> is_binary(key) end) do
+      true -> value
+      false -> %{}
+    end
+  end
 
-  defp atom_key("status"), do: :status
-  defp atom_key("verification_gate"), do: :verification_gate
-  defp atom_key("continuation_decision"), do: :continuation_decision
-  defp atom_key("decision"), do: :decision
-  defp atom_key(_key), do: :unknown
+  defp text_field(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) -> String.trim(value)
+      _value -> nil
+    end
+  end
 end

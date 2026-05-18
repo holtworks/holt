@@ -11,7 +11,7 @@ defmodule Holt.Approvals do
 
     record =
       request
-      |> Map.put("schema_version", "holtworks_approval/v1")
+      |> Map.put("schema_version", "holt_approval/v1")
       |> Map.put("id", id)
       |> Map.put("status", "pending")
       |> Map.put("created_at", Clock.iso_now())
@@ -60,7 +60,7 @@ defmodule Holt.Approvals do
 
   defp prompt(record) do
     IO.puts("")
-    IO.puts("Holt wants to use: #{record["tool"]}")
+    IO.puts("Holt wants to use: #{record["action"]}")
     IO.puts("Risk: #{record["risk"]}")
     IO.puts("Reason: #{record["reason"]}")
 

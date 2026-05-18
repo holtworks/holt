@@ -21,7 +21,7 @@ defmodule Holt.Clock do
   end
 
   def timestamp_slug do
-    now()
-    |> Calendar.strftime("%Y%m%dT%H%M%S")
+    DateTime.utc_now()
+    |> Calendar.strftime("%Y%m%dT%H%M%S%f")
   end
 end

@@ -1,7 +1,12 @@
 mod backend;
+mod commands;
+mod history;
 mod inline;
+mod keymap;
 mod terminal;
+#[allow(dead_code)]
 mod tui;
+mod tui_frame;
 mod turn;
 mod ui;
 
@@ -55,7 +60,18 @@ fn run(args: Vec<String>) -> Result<i32> {
 fn backend_command(command: &str) -> bool {
     matches!(
         command,
-        "doctor" | "onboard" | "run" | "resume" | "status" | "logs" | "llm"
+        "diff"
+            | "doctor"
+            | "fork"
+            | "goal"
+            | "model"
+            | "onboard"
+            | "run"
+            | "runs"
+            | "resume"
+            | "status"
+            | "logs"
+            | "llm"
     )
 }
 
@@ -69,24 +85,27 @@ fn retired_command(command: &str) -> bool {
 fn chat(args: Vec<String>) -> Result<i32> {
     let session = tui::ChatArgs::parse(args);
 
+    if let Some(error) = session.parse_error() {
+        eprintln!("holt: {error}");
+        return Ok(64);
+    }
+
     if let Some(args) = session.one_shot_chat_run_args() {
-        return inline::run_once(args);
+        return inline::run_once(args, session.workspace_root());
     }
 
-    if session.plain {
-        return inline::run(session);
+    match chat_frontend(&session, terminal::interactive()) {
+        ChatFrontend::Inline => inline::run(session),
     }
+}
 
-    if session.force_tui && !terminal::interactive() {
-        eprintln!("holt: --fullscreen requires an interactive terminal");
-        return Ok(1);
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChatFrontend {
+    Inline,
+}
 
-    if session.force_tui {
-        return tui::run(session);
-    }
-
-    inline::run(session)
+fn chat_frontend(_session: &tui::ChatArgs, _interactive: bool) -> ChatFrontend {
+    ChatFrontend::Inline
 }
 
 fn print_help() {
@@ -94,35 +113,47 @@ fn print_help() {
         "Holt {VERSION}
 
 Usage:
-  holt                                    Start an interactive session
+  holt                                    Start an interactive terminal session
   holt \"task\"                             Ask Holt once
   holt --yes \"task\"                       Let Holt work without stopping for routine approvals
+  holt --permission-mode review \"task\"     Ask before write or command actions
+  holt --permission-mode auto \"task\"       Approve write and command actions automatically
+  holt --permission-mode deny \"task\"       Deny write and command actions automatically
   holt --workspace path                   Start in a specific workspace
-  holt --fullscreen                       Use a focused full-screen session
-  holt --plain                            Use a simple line-by-line session
   holt help                               Show this help
   holt version                            Print the installed version
   holt doctor [--json]                    Check local setup
+  holt model [--json]                     Show configured model provider
+  holt diff [--json]                      Show workspace changes
   holt onboard [--yes]                    Set up Holt in this workspace
   holt run [--yes] \"task\"                 Run a task and exit
+  holt goal [--yes] \"goal\"                Start or update a goal and exit
+  holt runs [--json]                      Show recent runs
   holt resume [--yes] [run_id]            Resume prior work
+  holt fork [--yes] [run_id] [task]       Fork prior work into a new run
   holt status [--json]                    Show workspace status
-  holt logs [--json]                      Show recent activity
+  holt logs [--json] [run_id]             Show latest or selected run activity
 
 Plain text after `holt` is treated as your request. Use slash commands inside
-the interactive session for status, recent runs, logs, and help.
+the interactive session for build/goal mode, status, recent runs, logs, and help.
 "
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_command, retired_command};
+    use super::{backend_command, chat_frontend, retired_command, ChatFrontend};
+    use crate::tui::ChatArgs;
 
     #[test]
     fn known_product_commands_are_routed_to_command_handler() {
         assert!(backend_command("run"));
+        assert!(backend_command("runs"));
+        assert!(backend_command("diff"));
         assert!(backend_command("doctor"));
+        assert!(backend_command("fork"));
+        assert!(backend_command("goal"));
+        assert!(backend_command("model"));
         assert!(backend_command("llm"));
         assert!(!backend_command("review"));
     }
@@ -132,5 +163,37 @@ mod tests {
         assert!(retired_command("tasks"));
         assert!(retired_command("actions"));
         assert!(!backend_command("tasks"));
+    }
+
+    #[test]
+    fn interactive_chat_defaults_to_terminal_frontend() {
+        let session = ChatArgs::parse(vec![]);
+
+        assert_eq!(chat_frontend(&session, true), ChatFrontend::Inline);
+        assert_eq!(chat_frontend(&session, false), ChatFrontend::Inline);
+    }
+
+    #[test]
+    fn frontend_flags_are_rejected() {
+        let session = ChatArgs::parse(vec!["--plain".to_string()]);
+
+        assert_eq!(
+            session.parse_error(),
+            Some("unsupported flag --plain: Holt uses the terminal session by default")
+        );
+
+        let session = ChatArgs::parse(vec!["--fullscreen".to_string()]);
+
+        assert_eq!(
+            session.parse_error(),
+            Some("unsupported flag --fullscreen: Holt uses the terminal session by default")
+        );
+
+        let session = ChatArgs::parse(vec!["--tui".to_string()]);
+
+        assert_eq!(
+            session.parse_error(),
+            Some("unsupported flag --tui: Holt uses the terminal session by default")
+        );
     }
 }

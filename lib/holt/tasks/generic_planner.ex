@@ -4,16 +4,16 @@ defmodule Holt.Tasks.GenericPlanner do
   """
 
   alias Holt.Clock
-  alias Holt.Tasks.{ActionContract, RuntimeContracts}
+  alias Holt.Tasks.ActionContract
 
-  @schema_version "holtworks_generic_work_graph/v1"
+  @schema_version "holt_generic_work_graph/v1"
 
-  @phase_tools %{
+  @phase_actions %{
     "research" => ~w(
       list_tasks get_task load_teammate_runtime list_task_specs get_task_spec
-      read_task_memory_artifact list_files read_file search_files search_memory
+      read_task_memory_artifact list read search recall
       list_user_memories search_user_memory recall_project_memory read_project_memory
-      search_web fetch_url
+      search_web fetch
       work_graph work_graph_schedule agent_dispatch_plan team_orchestration
     ),
     "propose" => ~w(
@@ -24,7 +24,7 @@ defmodule Holt.Tasks.GenericPlanner do
     ),
     "act" => ~w(
       update_task add_comment save_task_spec save_teammate_memory start_agent_work
-      continue_agent_work write_file append_file run_command action_runtime_envelope
+      continue_agent_work write append run action_runtime_envelope
     ),
     "verify" => ~w(
       get_task list_task_specs get_task_spec read_task_memory_artifact route_verification_review
@@ -41,15 +41,55 @@ defmodule Holt.Tasks.GenericPlanner do
   def build(attrs \\ %{})
 
   def build(attrs) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    steps = plan_steps(attrs)
-    task = RuntimeContracts.normalize_map(RuntimeContracts.value(attrs, "task"))
-    plan_contract = RuntimeContracts.normalize_map(RuntimeContracts.value(attrs, "plan_contract"))
+    case input(attrs) do
+      {:ok, input} -> build_canonical(input)
+      {:error, reason} -> rejected_plan(attrs, reason)
+    end
+  end
+
+  def build(_attrs), do: rejected_plan(%{}, "invalid_attrs")
+
+  def plan_steps(attrs \\ %{})
+
+  def plan_steps(attrs) when is_map(attrs) do
+    case input(attrs) do
+      {:ok, input} -> plan_steps_for_input(input)
+      {:error, reason} -> raise ArgumentError, "invalid generic planner attrs: #{reason}"
+    end
+  end
+
+  def plan_steps(_attrs), do: raise(ArgumentError, "invalid generic planner attrs: invalid_attrs")
+
+  defp input(attrs) do
+    with :ok <- canonical_attrs(attrs),
+         {:ok, task} <- optional_map_field(attrs, "task", "invalid_task"),
+         {:ok, plan_contract} <-
+           optional_map_field(attrs, "plan_contract", "invalid_plan_contract"),
+         {:ok, workflow_constraints} <-
+           optional_map_field(attrs, "workflow_constraints", "invalid_workflow_constraints"),
+         {:ok, evidence_contract} <-
+           optional_map_field(attrs, "evidence_contract", "invalid_evidence_contract"),
+         {:ok, allowed_actions} <- plan_contract_allowed_actions(plan_contract) do
+      {:ok,
+       %{
+         task: task,
+         plan_contract: plan_contract,
+         workflow_constraints: workflow_constraints,
+         evidence_contract: evidence_contract,
+         allowed_actions: allowed_actions
+       }}
+    end
+  end
+
+  defp build_canonical(input) do
+    steps = plan_steps_for_input(input)
+    task = input.task
+    plan_contract = input.plan_contract
 
     %{
       "schema_version" => @schema_version,
       "graph_id" =>
-        RuntimeContracts.stable_id("generic_plan", [
+        stable_id("generic_plan", [
           task["id"],
           plan_contract["plan_id"],
           steps
@@ -68,54 +108,35 @@ defmodule Holt.Tasks.GenericPlanner do
       },
       "generated_at" => Clock.iso_now()
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
-  def build(_attrs), do: build(%{})
+  defp rejected_plan(attrs, reason) do
+    %{
+      "schema_version" => @schema_version,
+      "graph_id" => stable_id("generic_plan", [reason, attrs]),
+      "status" => "rejected",
+      "reason" => reason,
+      "generated_at" => Clock.iso_now()
+    }
+  end
 
-  def plan_steps(attrs \\ %{})
+  defp plan_steps_for_input(input) do
+    input.workflow_constraints
+    |> phase_specs(input.evidence_contract)
+    |> Enum.map(&plan_step(&1, input.allowed_actions))
+  end
 
-  def plan_steps(attrs) when is_map(attrs) do
-    attrs = RuntimeContracts.string_keys(attrs)
-    allowed_tools = allowed_tools(attrs)
-
-    workflow_constraints =
-      RuntimeContracts.normalize_map(RuntimeContracts.value(attrs, "workflow_constraints"))
-
-    evidence_contract =
-      RuntimeContracts.normalize_map(RuntimeContracts.value(attrs, "evidence_contract"))
-
-    phase_specs(workflow_constraints, evidence_contract)
-    |> Enum.map(fn spec ->
-      tools =
-        spec
-        |> RuntimeContracts.value("allowed_tools")
-        |> RuntimeContracts.normalize_string_list()
-        |> filter_allowed_tools(allowed_tools)
-
+  defp plan_step(spec, allowed_actions) do
+    actions =
       spec
-      |> Map.put("allowed_tools", tools)
-      |> Map.put("allowed_effect_scopes", effect_scopes_for_tools(tools))
-      |> RuntimeContracts.reject_empty()
-    end)
-  end
+      |> Map.fetch!("allowed_actions")
+      |> filter_allowed_actions(allowed_actions)
 
-  def plan_steps(_attrs), do: plan_steps(%{})
-
-  defp allowed_tools(attrs) do
-    explicit =
-      RuntimeContracts.normalize_string_list(RuntimeContracts.value(attrs, "allowed_tools"))
-
-    plan = RuntimeContracts.normalize_map(RuntimeContracts.value(attrs, "plan_contract"))
-
-    plan_tools =
-      RuntimeContracts.normalize_string_list(RuntimeContracts.value(plan, "allowed_tools"))
-
-    cond do
-      explicit != [] -> explicit
-      plan_tools != [] -> plan_tools
-      true -> []
-    end
+    spec
+    |> Map.put("allowed_actions", actions)
+    |> Map.put("allowed_effect_scopes", effect_scopes_for_actions(actions))
+    |> compact()
   end
 
   defp phase_specs(workflow_constraints, evidence_contract) do
@@ -124,7 +145,7 @@ defmodule Holt.Tasks.GenericPlanner do
         "research",
         1,
         "Understand the task, constraints, current state, and reusable memory before acting.",
-        @phase_tools["research"],
+        @phase_actions["research"],
         ["assigned_task", "parent_context", "runtime_memory", "source_artifacts"],
         ["context_summary", "constraints", "known_risks"],
         ["objective and boundaries are loaded", "current facts are checked when needed"],
@@ -135,7 +156,7 @@ defmodule Holt.Tasks.GenericPlanner do
         "propose",
         2,
         "Choose the smallest useful next action and state how it will be verified.",
-        @phase_tools["propose"],
+        @phase_actions["propose"],
         ["context_summary", "constraints", "known_risks"],
         ["action_proposal", "verification_plan", "delegation_plan"],
         ["action is scoped", "verification criteria are explicit"],
@@ -145,11 +166,11 @@ defmodule Holt.Tasks.GenericPlanner do
       phase(
         "act",
         3,
-        "Execute the approved scoped action through the allowed task tool surface.",
-        @phase_tools["act"],
+        "Execute the approved scoped action through the allowed task action surface.",
+        @phase_actions["act"],
         ["action_proposal", "policy_decision", "recovery_contract"],
-        ["tool_result", "changed_state", "handoff_artifact"],
-        ["tool result is observed", "durable changes stay inside target policy"],
+        ["action_result", "changed_state", "handoff_artifact"],
+        ["action result is observed", "durable changes stay inside target policy"],
         workflow_constraints,
         evidence_contract
       ),
@@ -157,8 +178,8 @@ defmodule Holt.Tasks.GenericPlanner do
         "verify",
         4,
         "Compare predicted effects with observations and route structured verification.",
-        @phase_tools["verify"],
-        ["tool_result", "prediction", "observation", "evidence_contract"],
+        @phase_actions["verify"],
+        ["action_result", "prediction", "observation", "evidence_contract"],
         ["verification_report", "outcome_calibration", "finish_or_repair_decision"],
         ["evidence contract is satisfied or a concrete gap is named"],
         workflow_constraints,
@@ -168,7 +189,7 @@ defmodule Holt.Tasks.GenericPlanner do
         "repair",
         5,
         "Recover from failed verification, policy rejection, or prediction mismatch.",
-        @phase_tools["repair"],
+        @phase_actions["repair"],
         ["failed_verification", "prediction_error", "rollback_plan"],
         ["repair_action", "updated_lesson", "new_verification_plan"],
         ["failure mode is addressed before retry", "lesson is persisted for the pattern"],
@@ -182,7 +203,7 @@ defmodule Holt.Tasks.GenericPlanner do
          phase,
          order,
          objective,
-         tools,
+         actions,
          inputs,
          outputs,
          success_criteria,
@@ -195,7 +216,7 @@ defmodule Holt.Tasks.GenericPlanner do
       "node_type" => phase,
       "order" => order,
       "objective" => objective,
-      "allowed_tools" => tools,
+      "allowed_actions" => actions,
       "inputs" => inputs,
       "expected_outputs" => outputs,
       "success_criteria" => success_criteria,
@@ -206,10 +227,10 @@ defmodule Holt.Tasks.GenericPlanner do
 
   defp phase_constraints("research", workflow_constraints, _evidence_contract) do
     %{
-      "workflow" => RuntimeContracts.value(workflow_constraints, "workflow"),
+      "workflow" => workflow_constraints["workflow"],
       "required_context" => ["task", "runtime_memory", "plan_contract"]
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp phase_constraints("propose", _workflow_constraints, _evidence_contract) do
@@ -223,26 +244,26 @@ defmodule Holt.Tasks.GenericPlanner do
   defp phase_constraints("act", workflow_constraints, _evidence_contract) do
     %{
       "target_policy" => "current_task_or_explicit_workspace_target",
-      "directory" => RuntimeContracts.value(workflow_constraints, "directory"),
-      "acceptance_criteria" => RuntimeContracts.value(workflow_constraints, "acceptance_criteria")
+      "directory" => workflow_constraints["directory"],
+      "acceptance_criteria" => workflow_constraints["acceptance_criteria"]
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp phase_constraints("verify", workflow_constraints, evidence_contract) do
     %{
-      "test_commands" => RuntimeContracts.value(workflow_constraints, "test_commands"),
+      "test_commands" => workflow_constraints["test_commands"],
       "evidence_contract" => evidence_contract,
-      "finish_condition" => RuntimeContracts.value(workflow_constraints, "finish_condition")
+      "finish_condition" => workflow_constraints["finish_condition"]
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp phase_constraints("repair", _workflow_constraints, _evidence_contract) do
     %{
       "triggered_by" => [
         "policy_rejection",
-        "failed_tool_result",
+        "failed_action_result",
         "prediction_mismatch",
         "verification_gap"
       ],
@@ -267,7 +288,7 @@ defmodule Holt.Tasks.GenericPlanner do
       "label" => titleize_phase(step["phase"]),
       "status" => if(step["phase"] == "research", do: "scheduled", else: "pending"),
       "objective" => step["objective"],
-      "allowed_tools" => step["allowed_tools"],
+      "allowed_actions" => step["allowed_actions"],
       "allowed_effect_scopes" => step["allowed_effect_scopes"],
       "inputs" => step["inputs"],
       "expected_outputs" => step["expected_outputs"],
@@ -275,7 +296,7 @@ defmodule Holt.Tasks.GenericPlanner do
       "constraints" => step["constraints"],
       "failure_policy" => step["failure_policy"]
     }
-    |> RuntimeContracts.reject_empty()
+    |> compact()
   end
 
   defp titleize_phase("research"), do: "Research"
@@ -303,13 +324,78 @@ defmodule Holt.Tasks.GenericPlanner do
     }
   end
 
-  defp filter_allowed_tools(tools, []), do: tools
-  defp filter_allowed_tools(tools, allowed), do: Enum.filter(tools, &(&1 in allowed))
+  defp filter_allowed_actions(actions, []), do: actions
+  defp filter_allowed_actions(actions, allowed), do: Enum.filter(actions, &(&1 in allowed))
 
-  defp effect_scopes_for_tools(tools) do
-    tools
+  defp effect_scopes_for_actions(actions) do
+    actions
     |> Enum.map(&ActionContract.effect_scope/1)
     |> Enum.reject(&(&1 in [nil, "", "unknown"]))
     |> Enum.uniq()
+  end
+
+  defp plan_contract_allowed_actions(plan_contract) do
+    case Map.fetch(plan_contract, "allowed_actions") do
+      {:ok, actions} -> string_list(actions, "invalid_plan_contract")
+      :error -> {:ok, []}
+    end
+  end
+
+  defp optional_map_field(attrs, key, reason) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} when is_map(value) -> canonical_map(value, reason)
+      {:ok, _value} -> {:error, reason}
+      :error -> {:ok, %{}}
+    end
+  end
+
+  defp string_list(values, reason) when is_list(values) do
+    if Enum.all?(values, &(is_binary(&1) and String.trim(&1) != "")) do
+      {:ok, values}
+    else
+      {:error, reason}
+    end
+  end
+
+  defp string_list(_values, reason), do: {:error, reason}
+
+  defp canonical_attrs(attrs) do
+    if Enum.all?(attrs, fn {key, _value} -> is_binary(key) end) do
+      :ok
+    else
+      {:error, "invalid_attrs"}
+    end
+  end
+
+  defp canonical_map(map, reason), do: canonical_keyed_map(map, reason)
+
+  defp canonical_keyed_map(map, reason) do
+    if canonical_map?(map), do: {:ok, map}, else: {:error, reason}
+  end
+
+  defp canonical_map?(map) when is_map(map) do
+    Enum.all?(map, fn
+      {key, value} when is_binary(key) -> canonical_value?(value)
+      {_key, _value} -> false
+    end)
+  end
+
+  defp canonical_value?(value) when is_map(value), do: canonical_map?(value)
+  defp canonical_value?(value) when is_list(value), do: Enum.all?(value, &canonical_value?/1)
+  defp canonical_value?(_value), do: true
+
+  defp compact(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", [], %{}] end)
+    |> Map.new()
+  end
+
+  defp stable_id(prefix, parts) do
+    digest =
+      :crypto.hash(:sha256, :erlang.term_to_binary(parts))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    "#{prefix}_#{digest}"
   end
 end

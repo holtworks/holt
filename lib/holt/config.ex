@@ -31,7 +31,7 @@ defmodule Holt.Config do
 
   def default_config do
     %{
-      "schema_version" => "holtworks_config/v1",
+      "schema_version" => "holt_config/v1",
       "safety_mode" => "approval_required",
       "default_agent" => "default",
       "gateway" => %{
@@ -44,7 +44,7 @@ defmodule Holt.Config do
 
   def default_providers do
     %{
-      "schema_version" => "holtworks_providers/v1",
+      "schema_version" => "holt_providers/v1",
       "default_provider" => "local",
       "providers" => %{
         "local" => %{
@@ -58,7 +58,7 @@ defmodule Holt.Config do
         },
         "openrouter" => %{
           "type" => "openrouter",
-          "model" => "openai/gpt-4o-mini",
+          "model" => "moonshotai/kimi-k2.6",
           "api_key_env" => "OPENROUTER_API_KEY",
           "base_url" => "https://openrouter.ai/api/v1",
           "http_referer" => "https://holtworks.ai",
